@@ -11,7 +11,9 @@
 #   ai say   [name] <text>   type text into it and submit (Enter)
 #   ai keys  [name] <args>   send raw tmux keys (e.g. Escape, C-c, /model)
 #   ai screen[name]          print the current TUI screen
-#   ai ask   [name] <text>   say + wait for idle + print what changed
+#   ai ask   [name] <text>   say, wait for the turn to finish, print its result
+#   ai wait  [name]          block until the agent is idle or needs input
+#   ai result[name]          print the last completed turn's text (from the log)
 #   ai approve[name] [1|2|3] answer a tool-permission prompt (default 2)
 #   ai attach[name]          print the command to attach another viewer
 #   ai down  [name]          quit claude + kill the session
@@ -69,6 +71,7 @@ OSA
   winid="${meta%%|*}"; tty="${meta##*|}"
   printf '%s' "$winid" > "$STATE/win-$name"
   printf '%s' "$tty"   > "$STATE/tty-$name"
+  printf '%s' "$id"    > "$STATE/sid-$name"   # for jsonl-based completion tracking
   echo "[ai] opened a Terminal.app window (id=$winid, $tty) showing the live TUI."
   echo "[ai] drive it:  ai say $name \"hello\"   |   watch screen:  ai screen $name"
 }
@@ -111,49 +114,98 @@ screen() {
   tmux capture-pane -t "$s" -p
 }
 
-# Busy = claude shows a live status line with a running timer, e.g.
-#   "✻ Computing… (4s · ↓ 160 tokens · thought for 3s)".
-# Done = that line is gone (replaced by a static past-tense "✻ Cooked for 13s")
-# and the input box is empty. This is a real state marker — far better than
-# diffing the whole screen.
-_busy() { tmux capture-pane -t "$(S "$1")" -p | grep -qE '\([0-9]+s · '; }
+# --- State signals --------------------------------------------------------
+# Completion is read from the agent's STRUCTURED LOG, not the screen: the screen
+# is a viewport snapshot (scrollback-limited, racy between tool calls), whereas
+# the jsonl is the authoritative append-only event stream. A finished turn lands
+# an assistant record with `stop_reason: end_turn`.
+#
+# Permission pauses, however, leave NO trace in the jsonl (the pending tool_use
+# isn't even flushed while it waits), so "needs input" can ONLY be read from the
+# TUI. Hence the split below: log for done, screen for needs-input.
 
-# Paused waiting for a tool-permission decision ("Do you want to proceed?").
-_permission() { tmux capture-pane -t "$(S "$1")" -p | grep -qE 'Do you want to proceed\?|❯ 1\. Yes'; }
+_log() {  # path to this agent's session jsonl, via the id we recorded at `up`
+  local sid; sid="$(cat "$STATE/sid-$1" 2>/dev/null)"; [ -z "$sid" ] && return 1
+  find "$HOME/.claude/projects" -type f -name "$sid.jsonl" 2>/dev/null | head -1
+}
+# Count completed turns. grep (not jq) so a half-written final line can't break
+# it. Capture via $() because `grep -c` EXITS 1 on zero matches — an &&/|| chain
+# would then emit a second "0" and yield the multiline "0\n0" that breaks -gt.
+_endturns() {
+  local f n; f="$(_log "$1")" || { echo 0; return; }
+  [ -f "$f" ] || { echo 0; return; }
+  n="$(grep -c '"stop_reason":"end_turn"' "$f" 2>/dev/null)"
+  echo "${n:-0}"
+}
+# Actively generating: a live "(Ns · …)" timer on screen.
+_busy()      { tmux capture-pane -t "$(S "$1")" -p | grep -qE '\([0-9]+s · '; }
+# Paused on a tool-permission decision.
+_permission(){ tmux capture-pane -t "$(S "$1")" -p | grep -qE 'Do you want to proceed\?|❯ 1\. Yes'; }
 
-# Wait for the generation timer to appear, then disappear. Pure busy-signal —
-# NO whole-screen diffing (the footer/tips/token counter change constantly and
-# would make a "screen stable" heuristic wait out the full timeout). Returns as
-# soon as the agent stops working OR pauses on a permission prompt.
-_wait_idle() {
-  local name="$1" i
-  for i in $(seq 1 16);  do _busy "$name" && break; _permission "$name" && break; sleep 0.5; done  # start
-  for i in $(seq 1 360); do _busy "$name" || break; sleep 0.5; done                                # finish
-  sleep 0.3
+# Block until the in-flight turn ends, the agent pauses for input, or timeout.
+# DONE requires BOTH a new end_turn in the log AND the timer gone — so a spurious
+# early end_turn (e.g. a thinking block) followed by more tool calls won't fool
+# it. Echoes DONE | NEEDS_INPUT | TIMEOUT.
+_wait_turn() {
+  local name="$1" base="$2" to="${3:-300}" i
+  for ((i=0; i<to*2; i++)); do
+    _permission "$name" && { echo NEEDS_INPUT; return; }
+    if [ "$(_endturns "$name")" -gt "$base" ] && ! _busy "$name"; then echo DONE; return; fi
+    sleep 0.5
+  done
+  echo TIMEOUT
 }
 
-# say, then wait for idle, then print the final screen. Surfaces permission
-# prompts instead of hanging or returning silently.
+# Print the text of the most recent completed turn, straight from the log — no
+# scraping, no scrollback limit. `fromjson?` tolerates a partial trailing line.
+result() {
+  local f; f="$(_log "$1")" && [ -f "$f" ] || { echo "[ai] no log for '$1' (not spawned by this skill?)"; return 1; }
+  jq -sRr 'split("\n") | map(fromjson? // empty)
+           | map(select(.type=="assistant" and .message.stop_reason=="end_turn")
+                 | [.message.content[]? | select(.type=="text") | .text] | join("\n"))
+           | map(select(length>0)) | (last // "(no text in last turn)")' "$f" 2>/dev/null
+}
+
+# Block until the agent is idle/paused now (ad-hoc, when you don't have a
+# baseline). Echoes DONE | NEEDS_INPUT | TIMEOUT.
+wait_() {
+  local name="${1:-claude}" to="${2:-300}" i settle=0
+  tmux has-session -t "$(S "$name")" 2>/dev/null || { echo "[ai] no agent '$name'"; return 1; }
+  for ((i=0; i<to*2; i++)); do
+    _permission "$name" && { echo NEEDS_INPUT; return; }
+    if _busy "$name"; then settle=0; else settle=$((settle+1)); [ "$settle" -ge 4 ] && { echo DONE; return; }; fi
+    sleep 0.5
+  done
+  echo TIMEOUT
+}
+
+# say, then wait for THIS turn to finish, then print its result from the log.
+# Surfaces a permission pause instead of hanging or guessing "done".
 ask() {
   local name="${1:-claude}"; shift || true
+  local base; base="$(_endturns "$name")"
   say "$name" "$@" || return 1
-  _wait_idle "$name"
-  _permission "$name" && echo "[ai] ⚠ '$name' paused on a permission prompt — approve: ai approve $name [1|2|3]"
-  echo "----- screen of '$name' -----"
-  tmux capture-pane -t "$(S "$name")" -p
+  case "$(_wait_turn "$name" "$base" "${AI_TIMEOUT:-300}")" in
+    DONE)        result "$name" ;;
+    NEEDS_INPUT) echo "[ai] ⚠ '$name' paused on a permission prompt — approve: ai approve $name [1|2|3]"
+                 tmux capture-pane -t "$(S "$name")" -p | grep -vE '^[[:space:]]*$' | tail -8 ;;
+    TIMEOUT)     echo "[ai] ⚠ '$name' still working past ${AI_TIMEOUT:-300}s — check: ai result $name / ai screen $name" ;;
+  esac
 }
 
-# Answer a permission prompt (default 2 = yes & don't ask again), then wait idle
-# and print. Re-surfaces if another prompt follows.
+# Answer a permission prompt (default 2 = allow & don't ask again), then wait for
+# the resumed turn to finish and print its result.
 approve() {
   local name="${1:-claude}" choice="${2:-2}" s; s="$(S "$name")"
   tmux has-session -t "$s" 2>/dev/null || { echo "[ai] no agent '$name'"; return 1; }
-  tmux send-keys -t "$s" -l "$choice"
-  tmux send-keys -t "$s" Enter
-  _wait_idle "$name"
-  _permission "$name" && echo "[ai] ⚠ another permission prompt — ai approve $name"
-  echo "----- screen of '$name' -----"
-  tmux capture-pane -t "$s" -p
+  local base; base="$(_endturns "$name")"
+  tmux send-keys -t "$s" -l "$choice"; tmux send-keys -t "$s" Enter
+  sleep 1   # let the prompt dismiss before we re-check state (else we'd read the stale prompt as NEEDS_INPUT)
+  case "$(_wait_turn "$name" "$base" "${AI_TIMEOUT:-300}")" in
+    DONE)        result "$name" ;;
+    NEEDS_INPUT) echo "[ai] ⚠ another permission prompt for '$name' — ai approve $name" ;;
+    TIMEOUT)     echo "[ai] ⚠ '$name' still working — ai result $name" ;;
+  esac
 }
 
 attach() { echo "tmux attach -t $(S "${1:-claude}")"; }
@@ -185,6 +237,7 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   up) up "$@" ;;  say) say "$@" ;;  keys) keys "$@" ;;
   screen) screen "$@" ;;  ask) ask "$@" ;;  approve) approve "$@" ;;  attach) attach "$@" ;;
+  wait) wait_ "$@" ;;  result) result "$@" ;;
   down) down "$@" ;;  list) list ;;
   *) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
 esac
