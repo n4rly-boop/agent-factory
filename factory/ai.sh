@@ -15,6 +15,7 @@
 #   ai wait  [name]          block until the agent is idle or needs input
 #   ai result[name]          print the last completed turn's text (from the log)
 #   ai approve[name] [1|2|3] answer a tool-permission prompt (default 2)
+#   ai revive[name] [id]     relaunch a killed agent with its memory (resume its session)
 #   ai attach[name]          print the command to attach another viewer
 #   ai down  [name]          quit claude + kill the session
 #   ai list                  list running interactive agents
@@ -210,6 +211,22 @@ approve() {
 
 attach() { echo "tmux attach -t $(S "${1:-claude}")"; }
 
+# Relaunch a previously-`down`ed agent WITH its full memory, by resuming its
+# recorded session. `down` keeps the log; only `afctl purge` deletes it — so
+# revive works any time the log still exists. Resolves the session id from (in
+# order) an explicit arg, the sid state file, or the last manifest entry.
+revive() {
+  local name="${1:-claude}" sid="${2:-}"
+  [ -z "$sid" ] && sid="$(cat "$STATE/sid-$name" 2>/dev/null)"
+  [ -z "$sid" ] && sid="$(grep -P "\t$name\t" "$MANIFEST" 2>/dev/null | cut -f4 | tail -1)"
+  [ -z "$sid" ] && { echo "[ai] no recorded session for '$name' — nothing to revive"; return 1; }
+  [ -z "$(find "$HOME/.claude/projects" -type f -name "$sid.jsonl" 2>/dev/null | head -1)" ] \
+    && { echo "[ai] session $sid log is gone (purged?) — can't revive '$name'"; return 1; }
+  echo "[ai] reviving '$name' from session $sid"
+  FLAGS="--resume $sid $FLAGS"   # up() detects --resume and reuses this id
+  up "$name"
+}
+
 down() {
   local name="${1:-claude}" s; s="$(S "$name")"
   tmux kill-session -t "$s" 2>/dev/null || true
@@ -237,7 +254,7 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   up) up "$@" ;;  say) say "$@" ;;  keys) keys "$@" ;;
   screen) screen "$@" ;;  ask) ask "$@" ;;  approve) approve "$@" ;;  attach) attach "$@" ;;
-  wait) wait_ "$@" ;;  result) result "$@" ;;
+  wait) wait_ "$@" ;;  result) result "$@" ;;  revive) revive "$@" ;;
   down) down "$@" ;;  list) list ;;
   *) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
 esac
