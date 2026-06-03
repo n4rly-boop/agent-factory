@@ -12,6 +12,7 @@
 #   ai keys  [name] <args>   send raw tmux keys (e.g. Escape, C-c, /model)
 #   ai screen[name]          print the current TUI screen
 #   ai ask   [name] <text>   say + wait for idle + print what changed
+#   ai approve[name] [1|2|3] answer a tool-permission prompt (default 2)
 #   ai attach[name]          print the command to attach another viewer
 #   ai down  [name]          quit claude + kill the session
 #   ai list                  list running interactive agents
@@ -86,10 +87,14 @@ say() {
     tmux send-keys -t "$s" Enter         # submit
     sleep 0.5
     # Verify against the LIVE input box only — the last `❯` line in the capture.
-    # (Submitted prompts also appear as `❯ ...` in scrollback history; ignore those.)
+    # Success = the box no longer holds OUR message. An empty box OR a greyed
+    # autosuggestion (which differs from our text) both count as submitted; only
+    # our exact message still sitting there means a popup ate the Enter.
+    # (Submitted prompts also appear as `❯ ...` in scrollback history; the
+    # tail -1 isolates the live box, ignoring those.)
     pending="$(tmux capture-pane -t "$s" -p | grep '❯' | tail -1 | sed 's/.*❯[[:space:]]*//')"
-    [ -z "$pending" ] && { echo "[ai] sent to '$name': $msg"; return 0; }
-    echo "[ai] input box still holds text (popup?), retrying…"
+    [ "$pending" != "$msg" ] && { echo "[ai] sent to '$name': $msg"; return 0; }
+    echo "[ai] input box still holds our text (popup?), retrying…"
   done
   echo "[ai] WARN: '$name' may not have submitted — check: ai screen $name"; return 1
 }
@@ -113,17 +118,42 @@ screen() {
 # diffing the whole screen.
 _busy() { tmux capture-pane -t "$(S "$1")" -p | grep -qE '\([0-9]+s · '; }
 
-# say, then wait for the generation timer to appear and then disappear, then
-# print the final screen. Bounded.
+# Paused waiting for a tool-permission decision ("Do you want to proceed?").
+_permission() { tmux capture-pane -t "$(S "$1")" -p | grep -qE 'Do you want to proceed\?|❯ 1\. Yes'; }
+
+# Wait for the generation timer to appear, then disappear. Pure busy-signal —
+# NO whole-screen diffing (the footer/tips/token counter change constantly and
+# would make a "screen stable" heuristic wait out the full timeout). Returns as
+# soon as the agent stops working OR pauses on a permission prompt.
+_wait_idle() {
+  local name="$1" i
+  for i in $(seq 1 16);  do _busy "$name" && break; _permission "$name" && break; sleep 0.5; done  # start
+  for i in $(seq 1 360); do _busy "$name" || break; sleep 0.5; done                                # finish
+  sleep 0.3
+}
+
+# say, then wait for idle, then print the final screen. Surfaces permission
+# prompts instead of hanging or returning silently.
 ask() {
   local name="${1:-claude}"; shift || true
   say "$name" "$@" || return 1
-  local i
-  for i in $(seq 1 16); do _busy "$name" && break; sleep 0.5; done   # wait for it to start (fast answers may skip)
-  for i in $(seq 1 360); do _busy "$name" || break; sleep 0.5; done   # wait for it to finish (~180s cap)
-  sleep 0.3
+  _wait_idle "$name"
+  _permission "$name" && echo "[ai] ⚠ '$name' paused on a permission prompt — approve: ai approve $name [1|2|3]"
   echo "----- screen of '$name' -----"
   tmux capture-pane -t "$(S "$name")" -p
+}
+
+# Answer a permission prompt (default 2 = yes & don't ask again), then wait idle
+# and print. Re-surfaces if another prompt follows.
+approve() {
+  local name="${1:-claude}" choice="${2:-2}" s; s="$(S "$name")"
+  tmux has-session -t "$s" 2>/dev/null || { echo "[ai] no agent '$name'"; return 1; }
+  tmux send-keys -t "$s" -l "$choice"
+  tmux send-keys -t "$s" Enter
+  _wait_idle "$name"
+  _permission "$name" && echo "[ai] ⚠ another permission prompt — ai approve $name"
+  echo "----- screen of '$name' -----"
+  tmux capture-pane -t "$s" -p
 }
 
 attach() { echo "tmux attach -t $(S "${1:-claude}")"; }
@@ -154,7 +184,7 @@ list() { tmux ls 2>/dev/null | grep '^ai-' || echo "[ai] none"; }
 cmd="${1:-}"; shift || true
 case "$cmd" in
   up) up "$@" ;;  say) say "$@" ;;  keys) keys "$@" ;;
-  screen) screen "$@" ;;  ask) ask "$@" ;;  attach) attach "$@" ;;
+  screen) screen "$@" ;;  ask) ask "$@" ;;  approve) approve "$@" ;;  attach) attach "$@" ;;
   down) down "$@" ;;  list) list ;;
   *) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
 esac
