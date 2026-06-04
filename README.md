@@ -40,6 +40,9 @@ up [name]            launch interactive Claude TUI in a Terminal window
 say [name] "text"    type text + submit (don't wait)
 ask [name] "text"    say + wait until the agent finishes + print its screen
 approve [name] [1|2|3]answer a tool-permission prompt (default 2 = allow & don't ask)
+ctx [name]           estimated context size (tokens)
+compact [name]       run /compact to shrink context (idle only; your call past ~200k)
+remote [name]        (re)launch with Remote Control — drive it from the Claude web/app
 screen [name]        dump the current TUI screen
 keys [name] <keys>   send raw tmux keys (Escape, C-c, …)
 attach [name]        print the tmux attach command for another viewer
@@ -64,6 +67,13 @@ list                 list running interactive agents
 - **Permission prompts** pause the agent; `ask` surfaces them and `approve`
   answers them. Launch with `AI_CLAUDE_FLAGS="--dangerously-skip-permissions"`
   to let an agent run fully unattended.
+- **Slash commands work** — the agent is a real TUI, so `say <name> "/model"` etc.
+  run them. Two are wired in for timing: `compact` (a judgment call you make once
+  context grows past ~200k, only if it won't drop needed info and the agent will
+  keep being used; `ask` reports the size, the command refuses mid-turn, no
+  auto-trigger unless you lower `AI_COMPACT_AT` from its 1m default) and `remote`
+  (relaunch with `--remote-control`, resuming the session, so the human drives it
+  from the Claude web app/phone).
 - **One writer at a time.** The agent shares its tmux session with the window;
   if a human types while the controller drives, keystrokes interleave. To watch
   only, attach read-only: `tmux attach -r -t ai-<name>`.

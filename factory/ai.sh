@@ -15,10 +15,20 @@
 #   ai wait  [name]          block until the agent is idle or needs input
 #   ai result[name]          print the last completed turn's text (from the log)
 #   ai approve[name] [1|2|3] answer a tool-permission prompt (default 2)
+#   ai ctx   [name]          print the agent's estimated context size (tokens)
+#   ai compact[name]         run /compact in the agent (only when idle — safe point)
+#   ai remote[name]          (re)launch with Remote Control so you drive it from the Claude web/app
 #   ai revive[name] [id]     relaunch a killed agent with its memory (resume its session)
 #   ai attach[name]          print the command to attach another viewer
 #   ai down  [name]          quit claude + kill the session
 #   ai list                  list running interactive agents
+#
+# Compaction is a JUDGMENT call, not an automatic trigger. After a turn, `ask`
+# reports the agent's context size; YOU decide to `ai compact <name>` when it's
+# grown large (rule of thumb: past ~200k tokens) AND compacting won't drop info
+# the agent still needs AND the agent will keep being used. The auto-threshold
+# $AI_COMPACT_AT defaults to 1000000 (effectively off) — set it lower only if you
+# want a hard safety net regardless of judgment.
 set -uo pipefail
 
 S() { echo "ai-${1:-claude}"; }                  # tmux session name
@@ -138,6 +148,17 @@ _endturns() {
   n="$(grep -c '"stop_reason":"end_turn"' "$f" 2>/dev/null)"
   echo "${n:-0}"
 }
+# Estimate current context size in tokens: the full prompt the model last saw =
+# input + cache-read + cache-creation tokens of the most recent assistant record.
+# (output tokens aren't part of the next prompt; the cached buckets are.) Echoes 0
+# if no usage yet. This is what we threshold for auto-compaction.
+_ctx() {
+  local f; f="$(_log "$1")" && [ -f "$f" ] || { echo 0; return; }
+  jq -sRr 'split("\n") | map(fromjson? // empty)
+           | map(select(.type=="assistant" and .message.usage)) | (last.message.usage // {})
+           | ((.input_tokens//0)+(.cache_read_input_tokens//0)+(.cache_creation_input_tokens//0))' \
+     "$f" 2>/dev/null || echo 0
+}
 # Actively generating: a live "(Ns · …)" timer on screen.
 _busy()      { tmux capture-pane -t "$(S "$1")" -p | grep -qE '\([0-9]+s · '; }
 # Paused on a tool-permission decision.
@@ -187,11 +208,67 @@ ask() {
   local base; base="$(_endturns "$name")"
   say "$name" "$@" || return 1
   case "$(_wait_turn "$name" "$base" "${AI_TIMEOUT:-300}")" in
-    DONE)        result "$name" ;;
+    DONE)        result "$name"; _maybe_autocompact "$name" ;;
     NEEDS_INPUT) echo "[ai] ⚠ '$name' paused on a permission prompt — approve: ai approve $name [1|2|3]"
                  tmux capture-pane -t "$(S "$name")" -p | grep -vE '^[[:space:]]*$' | tail -8 ;;
     TIMEOUT)     echo "[ai] ⚠ '$name' still working past ${AI_TIMEOUT:-300}s — check: ai result $name / ai screen $name" ;;
   esac
+}
+
+# Print the agent's estimated context size in tokens.
+ctx() { echo "[ai] '$1' context ≈ $(_ctx "${1:-claude}") tokens"; }
+
+# Run /compact in the agent to shrink its context. SAFE ONLY between turns: it
+# refuses while the agent is generating (would interrupt) or paused on a
+# permission prompt (the keystrokes would answer the prompt, not compact).
+# /compact preserves a summary, so no task context is lost — only raw history.
+compact() {
+  local name="${1:-claude}" s; s="$(S "$name")"
+  tmux has-session -t "$s" 2>/dev/null || { echo "[ai] no agent '$name'"; return 1; }
+  _busy "$name"       && { echo "[ai] '$name' is mid-turn — refusing to compact (would interrupt). retry when idle."; return 1; }
+  _permission "$name" && { echo "[ai] '$name' is on a permission prompt — answer it first (ai approve $name)."; return 1; }
+  local before; before="$(_ctx "$name")"
+  echo "[ai] compacting '$name' (ctx ≈ ${before} tok)…"
+  say "$name" "/compact" || return 1
+  wait_ "$name" "${AI_TIMEOUT:-300}" >/dev/null   # compaction runs the busy timer; wait it out
+  echo "[ai] '$name' compacted (was ≈ ${before} tok, now ≈ $(_ctx "$name") tok)."
+}
+
+# Called after a turn finishes (the natural safe point). Reports context size so
+# the driver can DECIDE whether to compact (the judgment call). Only auto-runs
+# /compact if context passes the hard net $AI_COMPACT_AT (default 1000000 =
+# effectively off; lower it for an unconditional safety net). We only get here
+# when the agent is idle, so neither the report nor a compact interrupts work.
+_maybe_autocompact() {
+  local c; c="$(_ctx "$1")"; [ "${c:-0}" -gt 0 ] || return
+  if [ "$c" -gt 200000 ]; then
+    echo "[ai] context ≈ ${c} tok (>200k) — consider 'ai compact $1' if it won't drop needed info and '$1' will keep being used."
+  fi
+  local at="${AI_COMPACT_AT:-1000000}"; [ "$at" = 0 ] && return
+  if [ "$c" -gt "$at" ]; then
+    echo "[ai] context ≈ ${c} tok > hard net ${at} — auto-compacting '$1'…"
+    compact "$1"
+  fi
+}
+
+# (Re)launch the named agent with Claude Code's Remote Control enabled, so the
+# human can monitor and drive it from the Claude web app / phone. Reuses the
+# agent's recorded session (so memory survives the relaunch) when its log still
+# exists; otherwise starts fresh. Requires being signed in to claude.ai.
+remote() {
+  local name="${1:-claude}" sid="${2:-}"
+  [ -z "$sid" ] && sid="$(cat "$STATE/sid-$name" 2>/dev/null)"
+  [ -z "$sid" ] && sid="$(grep -P "\t$name\t" "$MANIFEST" 2>/dev/null | cut -f4 | tail -1)"
+  tmux has-session -t "$(S "$name")" 2>/dev/null && down "$name"   # close the old window/session first
+  if [ -n "$sid" ] && [ -n "$(find "$HOME/.claude/projects" -type f -name "$sid.jsonl" 2>/dev/null | head -1)" ]; then
+    echo "[ai] launching '$name' with Remote Control, resuming session $sid"
+    FLAGS="--resume $sid --remote-control $name $FLAGS"
+  else
+    echo "[ai] launching fresh '$name' with Remote Control"
+    FLAGS="--remote-control $name $FLAGS"
+  fi
+  up "$name"
+  echo "[ai] Remote Control on — open the Claude web app / phone to drive '$name' (sign-in required)."
 }
 
 # Answer a permission prompt (default 2 = allow & don't ask again), then wait for
@@ -254,7 +331,8 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   up) up "$@" ;;  say) say "$@" ;;  keys) keys "$@" ;;
   screen) screen "$@" ;;  ask) ask "$@" ;;  approve) approve "$@" ;;  attach) attach "$@" ;;
+  ctx) ctx "$@" ;;  compact) compact "$@" ;;  remote) remote "$@" ;;
   wait) wait_ "$@" ;;  result) result "$@" ;;  revive) revive "$@" ;;
   down) down "$@" ;;  list) list ;;
-  *) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
 esac
