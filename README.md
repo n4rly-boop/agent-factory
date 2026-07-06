@@ -43,6 +43,8 @@ approve [name] [1|2|3]answer a tool-permission prompt (default 2 = allow & don't
 ctx [name]           estimated context size (tokens)
 compact [name]       run /compact to shrink context (idle only; your call past ~200k)
 remote [name]        (re)launch with Remote Control — drive it from the Claude web/app
+revive [name] [id]   relaunch a downed agent with its memory (resumes its session)
+revivable            list downed agents (surviving log) you can revive by name
 screen [name]        dump the current TUI screen
 keys [name] <keys>   send raw tmux keys (Escape, C-c, …)
 attach [name]        print the tmux attach command for another viewer
@@ -64,9 +66,10 @@ list                 list running interactive agents
 - **`ask` knows when the agent is done** by watching its live generation timer
   (`✻ Computing… (4s · …)`) appear then vanish — not by diffing the whole screen
   (the footer/token-counter churn would never settle).
-- **Permission prompts** pause the agent; `ask` surfaces them and `approve`
-  answers them. Launch with `AI_CLAUDE_FLAGS="--dangerously-skip-permissions"`
-  to let an agent run fully unattended.
+- **Spawned agents skip permission prompts by default.** `up`/`revive`/`remote`
+  add `--dangerously-skip-permissions` so an unattended agent doesn't stall on
+  the first tool gate. Set `AI_SKIP_PERMS=0` (or pass your own `--permission-mode`)
+  to restore prompting; then `ask` surfaces the pause and `approve` answers it.
 - **Slash commands work** — the agent is a real TUI, so `say <name> "/model"` etc.
   run them. Two are wired in for timing: `compact` (a judgment call you make once
   context grows past ~200k, only if it won't drop needed info and the agent will
@@ -79,7 +82,11 @@ list                 list running interactive agents
   only, attach read-only: `tmux attach -r -t ai-<name>`.
 - **Clean teardown.** `down` closes the window by killing its tty process, not
   AppleScript `close` (which pops a modal "terminate?" sheet that can't be
-  dismissed headlessly).
+  dismissed headlessly). Re-`up`/`revive` of the same name closes that name's old
+  window first, so relaunching never leaves an orphaned bare-shell window behind.
+- **Resume chooser handled.** Resuming a large/old session, claude pauses on
+  `1. Resume from summary / 2. Resume full session as-is`; `revive` auto-answers
+  it (default 2 = full memory; `AI_RESUME_MODE=1` for the summary).
 - **Filterable logs.** Every spawned agent's `--session-id` is recorded in
   `~/.claude/agent-factory/manifest.tsv`, so `afctl purge` removes exactly the
   factory logs and never your manual sessions.
