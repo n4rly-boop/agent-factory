@@ -7,7 +7,7 @@
 # TUI. The controlling agent drives it with `tmux send-keys` and reads with
 # `tmux capture-pane` — no FIFOs, no headless mode. The actual interactive app.
 #
-#   ai up    [name]          launch interactive claude + open Terminal window
+#   ai up    [name] [-w]     launch interactive claude (detached tmux; -w/--window opens a Terminal window)
 #   ai say   [name] <text>   type text into it and submit (Enter)
 #   ai keys  [name] <args>   send raw tmux keys (e.g. Escape, C-c, /model)
 #   ai screen[name]          print the current TUI screen
@@ -84,7 +84,19 @@ _answer_resume() {
 }
 
 up() {
-  local name="${1:-claude}" s; s="$(S "$name")"
+  # Parse args: a name plus an optional -w/--window flag (any order). By default
+  # the agent runs in a DETACHED tmux session only — no Terminal window pops up.
+  # Pass -w/--window (or set AI_WINDOW=1) to also open a visible Terminal.app
+  # window attached to it.
+  local name="" want_win="${AI_WINDOW:-0}" a
+  for a in "$@"; do
+    case "$a" in
+      -w|--window) want_win=1 ;;
+      *) [ -z "$name" ] && name="$a" ;;
+    esac
+  done
+  name="${name:-claude}"
+  local s; s="$(S "$name")"
   tmux kill-session -t "$s" 2>/dev/null || true
   _closewin "$name"   # close any prior window for this name so we don't orphan it as a bare shell
   # Give the agent a known identity so its session log is filterable later:
@@ -132,8 +144,11 @@ up() {
   # headlessly; killing the backing process closes the window with no prompt).
   mkdir -p "$STATE"
   printf '%s' "$id" > "$STATE/sid-$name"   # always: jsonl-based completion tracking needs this
-  local meta err winid tty tmpf; tmpf="$(mktemp)"
-  meta=$(osascript 2>"$tmpf" <<OSA
+  # Only open a visible Terminal window when asked (-w/--window or AI_WINDOW=1).
+  # By default the agent lives in the detached tmux session; watch with attach.
+  if [ "$want_win" = 1 ]; then
+    local meta err winid tty tmpf; tmpf="$(mktemp)"
+    meta=$(osascript 2>"$tmpf" <<OSA
 tell application "Terminal"
   activate
   set tb to do script "tmux attach -t $s"
@@ -142,20 +157,25 @@ tell application "Terminal"
 end tell
 OSA
 )
-  err="$(cat "$tmpf" 2>/dev/null)"; rm -f "$tmpf"
-  if [ -n "$meta" ] && [[ "$meta" == *"|"* ]] && [ -n "${meta%%|*}" ]; then
-    winid="${meta%%|*}"; tty="${meta##*|}"
-    printf '%s' "$winid" > "$STATE/win-$name"
-    printf '%s' "$tty"   > "$STATE/tty-$name"
-    echo "[ai] opened a Terminal.app window (id=$winid, $tty) showing the live TUI."
+    err="$(cat "$tmpf" 2>/dev/null)"; rm -f "$tmpf"
+    if [ -n "$meta" ] && [[ "$meta" == *"|"* ]] && [ -n "${meta%%|*}" ]; then
+      winid="${meta%%|*}"; tty="${meta##*|}"
+      printf '%s' "$winid" > "$STATE/win-$name"
+      printf '%s' "$tty"   > "$STATE/tty-$name"
+      echo "[ai] opened a Terminal.app window (id=$winid, $tty) showing the live TUI."
+    else
+      # osascript blocked (e.g. Apple Events not authorized, -1743) or no window —
+      # agent is alive in tmux regardless; tell the human how to watch it.
+      rm -f "$STATE/win-$name" "$STATE/tty-$name"
+      echo "[ai] ⚠ couldn't open a Terminal window${err:+ ($err)}."
+      echo "[ai]   likely macOS Automation permission: System Settings ▸ Privacy & Security ▸"
+      echo "[ai]   Automation ▸ allow your terminal app to control \"Terminal\". Until then it's headless."
+      echo "[ai]   watch it live:  tmux attach -t $s"
+    fi
   else
-    # osascript blocked (e.g. Apple Events not authorized, -1743) or no window —
-    # agent is alive in tmux regardless; tell the human how to watch it.
-    rm -f "$STATE/win-$name" "$STATE/tty-$name"
-    echo "[ai] ⚠ couldn't open a Terminal window${err:+ ($err)}."
-    echo "[ai]   likely macOS Automation permission: System Settings ▸ Privacy & Security ▸"
-    echo "[ai]   Automation ▸ allow your terminal app to control \"Terminal\". Until then it's headless."
-    echo "[ai]   watch it live:  tmux attach -t $s"
+    rm -f "$STATE/win-$name" "$STATE/tty-$name"   # no window for this run
+    echo "[ai] running detached (no window) — watch it live:  tmux attach -t $s"
+    echo "[ai]   want a window? relaunch with:  ai up $name --window"
   fi
   # If resuming, clear the "summary vs full" chooser so the agent is ready to drive.
   [[ "$launchflags" == *"--resume"* ]] && _answer_resume "$name"
