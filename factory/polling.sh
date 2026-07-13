@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# polling — put an agent on a timer. Every N seconds it gets the same message.
+# polling — put an agent on a timer. Every N MINUTES it gets the same message.
 #
-#   polling start <agent> <interval> <message> [--times N] [--kind K]
+#   polling start <agent> <minutes> <message> [--times N] [--kind K]
 #   polling stop  [agent]        # no agent = $AF_AGENT, i.e. an agent switching ITSELF off
 #   polling list                 # every timer on this line
 #   polling status <agent>
+#
+# The interval is MINUTES, everywhere — the argument, the state file, every message this
+# script prints, and the hint the agent gets. Seconds exist only inside the sleep. A tool
+# whose flag says one unit and whose docs say another is how someone eventually types
+# `polling start orc 20` meaning twenty minutes and gets a tick every twenty seconds.
 #
 # WHY IT DELIVERS BY MAIL AND NOT BY TYPING. The obvious build is `sleep N; ai say
 # <agent> "<msg>"` in a loop. That types into a live TUI on a timer, with no idea what
@@ -27,7 +32,7 @@
 #    agent still working on the last one. The mailbox grows, and the agent spends its
 #    life reading its own alarm clock. So: a tick is SKIPPED while the previous one is
 #    still unread. The timer cannot build a backlog — one outstanding message, ever.
-#    (And the interval floor is 60s. A poller is not a busy-wait.)
+#    (And the floor is 1 minute. A poller is not a busy-wait.)
 #
 # 3. NOBODY REMEMBERS IT EXISTS. A forgotten timer burns tokens forever. `--times N`
 #    exists for that, `polling list` shows every live one, and the agent itself can run
@@ -42,7 +47,7 @@ SLUG="${AF_SLUG:-$(basename "$CWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-
 [ -z "$SLUG" ] && SLUG="proj"
 STATE="$ROOT/.ai/$SLUG"
 POLLDIR="$STATE/poll"
-MIN_INTERVAL="${AI_POLL_MIN:-60}"
+MIN_MINUTES="${AI_POLL_MIN:-1}"        # minutes, like everything else the user types
 
 _d()    { printf '%s/%s' "$POLLDIR" "$1"; }
 _sid()  { cat "$STATE/sid-$1" 2>/dev/null; }
@@ -57,7 +62,7 @@ _running() {                       # a timer is running iff its pid is
 }
 
 start() {
-  local agent="${1:-}" interval="${2:-}" ; shift 2 2>/dev/null || true
+  local agent="${1:-}" mins="${2:-}" ; shift 2 2>/dev/null || true
   local times=0 kind="fyi" msg=""
   while [ "${1:-}" ]; do
     case "$1" in
@@ -67,33 +72,36 @@ start() {
     esac
   done
 
-  [ -z "$agent" ] || [ -z "$interval" ] || [ -z "$msg" ] && {
-    echo "[poll] usage: polling start <agent> <interval-seconds> <message> [--times N] [--kind K]" >&2
+  [ -z "$agent" ] || [ -z "$mins" ] || [ -z "$msg" ] && {
+    echo "[poll] usage: polling start <agent> <minutes> <message> [--times N] [--kind K]" >&2
     return 1
   }
-  case "$interval" in
-    ''|*[!0-9]*) echo "[poll] interval must be whole seconds, got '$interval'" >&2; return 1 ;;
+  # `5m` is what a human types when the unit is minutes. Take it; do not make them
+  # discover by silence that it parsed as garbage.
+  mins="${mins%m}"; mins="${mins%min}"
+  case "$mins" in
+    ''|*[!0-9]*) echo "[poll] interval is in MINUTES and must be a whole number, got '$mins'" >&2; return 1 ;;
   esac
   # A tick faster than a turn is not a poll, it is a denial of service against your own
   # agent: every message lands on an agent still answering the last one.
-  if [ "$interval" -lt "$MIN_INTERVAL" ]; then
-    echo "[poll] interval $interval s is below the floor of ${MIN_INTERVAL}s — an agent cannot" >&2
-    echo "[poll]   finish a turn that fast, so the ticks would pile up behind it." >&2
-    echo "[poll]   Deliberate? AI_POLL_MIN=$interval polling start …" >&2
+  if [ "$mins" -lt "$MIN_MINUTES" ]; then
+    echo "[poll] $mins min is below the floor of ${MIN_MINUTES} min — an agent cannot finish a" >&2
+    echo "[poll]   turn that fast, so the ticks would pile up behind it." >&2
+    echo "[poll]   Deliberate? AI_POLL_MIN=$mins polling start …" >&2
     return 1
   fi
   _alive "$agent" || { echo "[poll] '$agent' has no tmux session — nothing to poll." >&2; return 1; }
   local sid; sid="$(_sid "$agent")"
   [ -z "$sid" ] && { echo "[poll] no recorded session for '$agent' — refusing to poll an agent I cannot identify." >&2; return 1; }
   if _running "$agent"; then
-    echo "[poll] '$agent' already has a timer (every $(cat "$(_d "$agent")/interval" 2>/dev/null)s). Stop it first: polling stop $agent" >&2
+    echo "[poll] '$agent' already has a timer (every $(cat "$(_d "$agent")/minutes" 2>/dev/null) min). Stop it first: polling stop $agent" >&2
     return 1
   fi
 
   local d; d="$(_d "$agent")"
   mkdir -p "$d"
   printf '%s' "$msg"      > "$d/msg"       # raw bytes: a message is data, never eval'd
-  printf '%s' "$interval" > "$d/interval"
+  printf '%s' "$mins"     > "$d/minutes"   # MINUTES on disk too — no unit changes hands
   printf '%s' "$kind"     > "$d/kind"
   # The tick is FROM whoever set the timer — not from some fictional "poll" agent.
   # A poll-shaped sender has no pane and no reader, so the agent's answer ("pong 1")
@@ -110,7 +118,7 @@ start() {
   nohup env AF_ROOT="$ROOT" AF_SLUG="$SLUG" AF_CWD="$CWD" \
         bash "$HERE/polling.sh" _loop "$agent" >"$d/log" 2>&1 &
   printf '%s' "$!" > "$d/pid"
-  local every="every ${interval}s"
+  local every="every ${mins} min"
   [ "$times" != 0 ] && every="$every, $times time(s)"
   echo "[poll] '$agent' → $every: $msg"
   echo "[poll] stop it:  polling stop $agent      (the agent itself: bash \$AF_POLL stop)"
@@ -119,13 +127,14 @@ start() {
 # The loop. Everything it does is guarded, because it runs unattended for hours.
 _loop() {
   local agent="$1" d; d="$(_d "$agent")"
-  local interval msg kind times sent sid from
-  interval="$(cat "$d/interval")"; msg="$(cat "$d/msg")"; kind="$(cat "$d/kind")"
-  times="$(cat "$d/times")";       sid="$(cat "$d/sid")"
+  local mins secs msg kind times sent sid from
+  mins="$(cat "$d/minutes")"; msg="$(cat "$d/msg")"; kind="$(cat "$d/kind")"
+  times="$(cat "$d/times")";  sid="$(cat "$d/sid")"
   from="$(cat "$d/from" 2>/dev/null)"; from="${from:-orchestrator}"
+  secs=$((mins * 60))         # the ONE place minutes become seconds
 
   while :; do
-    sleep "$interval"
+    sleep "$secs"
 
     # Stopped from the outside (or by the agent itself).
     [ -f "$d/pid" ] || { _log "$agent" "stopped"; exit 0; }
@@ -157,7 +166,7 @@ _loop() {
     local body="$msg"
     [ "$sent" = 0 ] && body="$msg
 
-(You are on a timer: this message repeats every ${interval}s. When the wait is over, switch it off yourself: bash \$AF_POLL stop)"
+(You are on a timer: this message repeats every ${mins} min. When the wait is over, switch it off yourself: bash \$AF_POLL stop)"
 
     AF_AGENT="$from" AF_SLUG="$SLUG" AF_ROOT="$ROOT" \
       bash "$MAIL" send --to "$agent" --from "$from" --kind "$kind" "$body" >/dev/null 2>&1
@@ -188,7 +197,7 @@ stop() {
   fi
   kill "$pid" 2>/dev/null
   rm -f "$d/pid"
-  echo "[poll] '$agent' timer stopped (was every $(cat "$d/interval" 2>/dev/null)s, $(cat "$d/sent" 2>/dev/null) tick(s) sent)."
+  echo "[poll] '$agent' timer stopped (was every $(cat "$d/minutes" 2>/dev/null) min, $(cat "$d/sent" 2>/dev/null) tick(s) sent)."
 }
 
 list() {
@@ -202,7 +211,7 @@ list() {
     _running "$a" && st="live"
     local mx; mx="$(cat "$d/times" 2>/dev/null)"; [ "$mx" = 0 ] && mx="∞"
     printf '%-10s %-9s %-7s %-6s %s\n' \
-      "$a" "$(cat "$d/interval" 2>/dev/null)s" \
+      "$a" "$(cat "$d/minutes" 2>/dev/null)m" \
       "$(cat "$d/sent" 2>/dev/null)/$mx" "$st" \
       "$(cut -c1-48 < "$d/msg" 2>/dev/null)"
     any=1
@@ -217,7 +226,7 @@ status() {
   local d; d="$(_d "$agent")"
   [ -d "$d" ] || { echo "[poll] '$agent': no timer."; return 0; }
   _running "$agent" && echo "[poll] '$agent': LIVE" || echo "[poll] '$agent': stopped"
-  echo "  every    : $(cat "$d/interval" 2>/dev/null)s"
+  echo "  every    : $(cat "$d/minutes" 2>/dev/null) min"
   echo "  sent     : $(cat "$d/sent" 2>/dev/null) / $(cat "$d/times" 2>/dev/null | sed 's/^0$/∞/')"
   echo "  kind     : $(cat "$d/kind" 2>/dev/null)"
   echo "  message  : $(cat "$d/msg" 2>/dev/null)"

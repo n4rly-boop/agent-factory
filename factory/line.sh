@@ -167,8 +167,17 @@ PY
 _settings() {
   local slug="$1" name="$2" out="$3"
   mkdir -p "$(dirname "$out")"
+  # statusLine is not decoration: it is the ONLY channel that carries
+  # rate_limits.five_hour.resets_at out of a live session. No CLI reports it. Without it,
+  # limits.sh knows an agent was cut off by the usage limit but not when the limit lifts —
+  # and a rescuer that has to guess the time wakes the agent into the same wall.
+  #
+  # StopFailure/rate_limit fires at the instant a turn is killed by that limit. It cannot
+  # block or retry (Claude Code ignores its output) — it just leaves the marker that tells
+  # limits.sh WHICH agents were cut off mid-work, as opposed to idle and fine.
   cat > "$out" <<JSON
 {
+  "statusLine": { "type": "command", "command": "$HERE/statusline.sh", "padding": 0 },
   "hooks": {
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "$HERE/hooks/role-reminder.sh", "timeout": 5 } ] }
@@ -176,6 +185,10 @@ _settings() {
     "PreToolUse": [
       { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
         "hooks": [ { "type": "command", "command": "$HERE/hooks/delegate-wall.sh", "timeout": 5 } ] }
+    ],
+    "StopFailure": [
+      { "matcher": "rate_limit",
+        "hooks": [ { "type": "command", "command": "$HERE/hooks/limit-hook.sh", "timeout": 5 } ] }
     ]
   }
 }
@@ -232,7 +245,8 @@ _entrypoint() {
 # rather than hand out enforcement that silently isn't there.
 _preflight() {
   local h bad=0
-  for h in "$HERE/hooks/role-reminder.sh" "$HERE/hooks/delegate-wall.sh"; do
+  for h in "$HERE/hooks/role-reminder.sh" "$HERE/hooks/delegate-wall.sh" \
+           "$HERE/hooks/limit-hook.sh" "$HERE/statusline.sh"; do
     [ -f "$h" ] || { echo "[line] FATAL: missing hook $h"; bad=1; continue; }
     [ -x "$h" ] || chmod +x "$h" 2>/dev/null
     [ -x "$h" ] || { echo "[line] FATAL: hook not executable and chmod failed: $h"; bad=1; }
@@ -368,6 +382,13 @@ json.dump({"slug": os.environ["AF_SL"], "blueprint": os.environ["AF_BP"],
   local skipmsg=""; [ "$skipped" -gt 0 ] && skipmsg=", $skipped left alone (already running)"
   echo "[line] $n stations up$skipmsg. attach: tmux attach -t ai-$lslug-<name>"
   echo "[line] talk to the line:  ai post <agent> \"…\"   |   read replies:  ai mail   |   see it all:  ai ledger"
+
+  # Start the limit watcher WITH the line, not after it. The account-wide usage limit kills
+  # every agent and the orchestrator session at the same instant — there is nobody left to
+  # start a rescuer once it lands. It has to already be running, and it has to be something
+  # that spends no tokens. Idempotent: re-running `line up` does not start a second one.
+  AF_SLUG="$lslug" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" AF_CWD="$(pwd)" \
+    bash "$HERE/limits.sh" watch 2>/dev/null | sed 's/^/[line] /'
 }
 
 status() {

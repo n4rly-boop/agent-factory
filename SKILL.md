@@ -400,6 +400,42 @@ nothing, while a stale "outstanding" flag (a crashed agent, a task queued for an
 that never came up) stalled *every* idle turn by 45 seconds. Hand control back; the
 doorbell is how you hear about it.
 
+## Surviving the usage limit — `limits.sh`
+
+```bash
+limits watch     # started automatically by `line up`; safe to re-run
+limits status    # quota, reset time, who got cut off
+limits stop
+```
+
+The 5-hour subscription limit is **account-wide**. It does not stop one agent — it kills
+every agent on the machine *and the orchestrator session driving them*, mid-turn, at the
+same instant. So the thing that resumes them cannot be a Claude: there is no Claude left.
+It has to be a process that spends no tokens and does not care about the limit at all.
+
+That is `limits.sh`: a shell loop that sleeps. Two documented signals, no screen-scraping:
+
+- **`StopFailure` hook** (matcher `rate_limit`, `hooks/limit-hook.sh`) fires at the instant
+  a turn is killed by the limit. It cannot block or retry — Claude Code ignores its output
+  — but it leaves a marker naming which agents were cut off *mid-work*, as opposed to idle
+  and fine.
+- **`statusline.sh`** is the only way `rate_limits.five_hour.resets_at` — the exact epoch
+  the limit lifts — gets out of a live session. No CLI reports it. Every agent drops it on
+  disk; the watcher reads it from there. Without it the watcher knows *who* was cut off but
+  not *when* to wake them, and it will say so rather than guess.
+
+At `resets_at + 45s` it mails each cut-off agent (staggered) telling it what happened and
+to pick the work back up. It re-checks the pane first: the **7-day** cap can hold you down
+long past the 5-hour reset, and waking into that just burns the turn on the same error.
+
+**The killed turn is not recovered.** That API call is gone and its tool call with it. The
+agent keeps its full context, so it can resume — but it must be told, and told what
+happened, or it just sits there. The wake-up message says so, and tells it to ask rather
+than guess if it cannot work out where it was.
+
+Settings changes only take effect at launch: an agent spawned before this existed has no
+limit hook and no statusline. Give it one with `ai down <name> && line up --resume <bp>`.
+
 ## Timers — `polling.sh` (the same message, on a clock)
 
 ```bash
