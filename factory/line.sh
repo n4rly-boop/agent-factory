@@ -10,6 +10,10 @@
 # for.
 #
 #   line up     <blueprint.yml>   generate briefs + settings, spawn every station
+#   line up --resume <bp>         same, but each station comes back ON ITS OLD SESSION
+#                                 (--resume <sid>) — memory kept, constitution applied.
+#                                 The only way to adopt an agent that already has a
+#                                 context: a plain `up` mints a new sid and orphans it.
 #   line status <blueprint.yml>   who's alive, context size, unread mail
 #   line down   <blueprint.yml>   stop every station on the line
 #   line plan   <blueprint.yml>   print the resolved blueprint without spawning
@@ -236,8 +240,27 @@ _preflight() {
   [ "$bad" = 0 ] || { echo "[line] refusing to spawn — enforcement hooks would fail open."; return 1; }
 }
 
+# --resume: bring a station up ON ITS EXISTING SESSION instead of a fresh one.
+#
+# This is the ONLY way to give a constitution to an agent that already has a memory —
+# an agent spawned before specs existed, or one that predates the blueprint. Without it
+# the migration eats itself: `ai revive` refuses (no spec to restore), so the obvious
+# move is `ai down && line up` — and `ai up` mints a NEW session id and overwrites
+# $STATE/sid-<name> with it. The pointer to the 100k of context the agent actually has
+# is gone from state at that moment; the .jsonl survives on disk with nothing naming it.
+# The step that applies the blueprint is the step that loses the memory.
+#
+# With --resume, `line up` passes `--resume <sid>` in AI_CLAUDE_FLAGS; ai.sh's up()
+# detects it, reuses the id rather than minting one, and writes the SAME sid back. The
+# station comes back with its memory, and with the spec/settings/hooks it never had.
+#
+# It resumes only what it can PROVE: a sid in state AND its .jsonl still on disk. A
+# station with neither is spawned fresh and SAID SO — a silent fresh spawn under a flag
+# that promised continuity is how you lose a day's context and only notice tomorrow.
 up() {
-  local bp="${1:?usage: line up <blueprint.yml>}"
+  local resume=0
+  case "${1:-}" in --resume|--adopt) resume=1; shift ;; esac
+  local bp="${1:?usage: line up [--resume] <blueprint.yml>}"
   _preflight || return 1
   # bulk_lines: the advisory threshold, a blueprint key rather than env-only — the hook's
   # comment promised you could set it per line, and there was nowhere to set it.
@@ -295,16 +318,29 @@ print(v if str(v).isdigit() else "")' "$bp" 2>/dev/null)"
     [ "$delegate" = "advised" ] && sys="$sys You are a mini-orchestrator: delegate work that is bulk or mechanical (many items, boilerplate, spec-code, first drafts, big logs) via the delegate-to-local-model skill, or mail the peer who owns the area - then verify what comes back. Small surgical edits you make yourself; delegating a three-line fix costs more than doing it."
     [ "$caveman" = "1" ] && sys="$sys Answer tersely - drop articles, filler and hedging; keep every technical fact exact."
 
+    # --resume: only on a session we can prove is still there. `ai up` reuses the id it
+    # finds in the flags, so the sid file survives the relaunch pointing at the same log.
+    local rflag="" sid=""
+    if [ "$resume" = 1 ]; then
+      sid="$(cat "${AF_ROOT:-/tmp/agent-factory}/.ai/$slug/sid-$name" 2>/dev/null)"
+      if [ -n "$sid" ] && [ -n "$(find "$HOME/.claude/projects" -type f -name "$sid.jsonl" 2>/dev/null | head -1)" ]; then
+        rflag="--resume $sid "
+      elif [ -n "$sid" ]; then
+        printf '[line] %-10s ⚠ session %s recorded but its log is GONE — spawning FRESH (no memory)\n' "$name" "$sid"
+      else
+        printf '[line] %-10s ⚠ no recorded session — spawning FRESH (no memory)\n' "$name"
+      fi
+    fi
     AF_SLUG="$slug" AF_ROLE="$role" AF_PARENT="$parent" AF_PEERS="$peers" \
     AF_DELEGATE="$delegate" AF_BULK_LINES="$BULKN" AF_CAVEMAN="$caveman" AF_WORK="$work" \
     AI_COMPACT_SOFT="${soft:-${AI_COMPACT_SOFT:-200000}}" \
     AI_COMPACT_HARD="${hard:-${AI_COMPACT_HARD:-500000}}" \
-    AI_CLAUDE_FLAGS="--settings $st ${model:+--model $model} --append-system-prompt $(printf '%q' "$sys") ${AI_CLAUDE_FLAGS:-}" \
+    AI_CLAUDE_FLAGS="${rflag}--settings $st ${model:+--model $model} --append-system-prompt $(printf '%q' "$sys") ${AI_CLAUDE_FLAGS:-}" \
     AI_NOTIFY_OFF=1 \
       bash "$AI" up "$name" >/dev/null 2>&1
     if tmux has-session -t "ai-$slug-$name" 2>/dev/null; then
       printf '[line] %-10s %-14s %-8s %s\n' "$name" "$role" "${model:-default}" \
-        "${parent:+← $parent}$dlabel"
+        "${parent:+← $parent}$dlabel${rflag:+  [resumed $sid]}"
       n=$((n+1))
     else
       # `ai up` swallows its own output, so a station that never launched (claude
