@@ -48,31 +48,96 @@ _cursor() { printf '%s/%s.cursor' "$MAILROOT" "$1"; }
 _cap()    { printf '%s/cap-%s'    "$MAILROOT" "$1"; }   # exists => understands the $AF_MAIL doorbell
 _pane()   { printf '%s/pane-%s'   "$MAILROOT" "$1"; }   # explicit tmux target (orchestrator registers here)
 
-_lines()  { [ -f "$1" ] && grep -c '' "$1" 2>/dev/null || echo 0; }
-_read_cursor() { local c; c="$(cat "$(_cursor "$1")" 2>/dev/null)"; echo "${c:-0}"; }
+# `grep -c ''` prints 0 AND EXITS 1 on an empty file, so the obvious
+# `[ -f x ] && grep -c '' x || echo 0` fires BOTH branches and returns the
+# two-line string "0\n0". That poisons every arithmetic comparison downstream —
+# the Stop hook's `-gt 0` throws "integer expression expected" and silently stops
+# delivering mail. Capture, then default.
+_lines() {
+  [ -f "$1" ] || { echo 0; return; }
+  local n; n="$(grep -c '' "$1" 2>/dev/null)"; echo "${n:-0}"
+}
+# A cursor ahead of the mailbox means the box was truncated or rotated under it
+# (AF_ROOT lives in /tmp, which macOS purges) while the cursor survived. Left
+# alone, `unread` goes negative forever and no mail is ever delivered again —
+# silently. Clamp instead.
+_read_cursor() {
+  local c t; c="$(cat "$(_cursor "$1")" 2>/dev/null)"; c="${c:-0}"
+  case "$c" in ''|*[!0-9]*) c=0 ;; esac
+  t="$(_lines "$(_box "$1")")"
+  [ "$c" -gt "$t" ] && c="$t"
+  echo "$c"
+}
+
+# The cursor is a read-modify-write, and the two readers we DESIGNED are racy by
+# construction: the Stop hook runs `mail read` at the turn boundary while the
+# doorbell has typed `!bash $AF_MAIL read` into the same pane. Both fire at once,
+# both deliver the same messages, and the later writer can even rewind the cursor.
+# mkdir is the portable atomic test-and-set (no flock(1) on macOS).
+_lock() {
+  local d="$MAILROOT/.lock-$1" i
+  for ((i=0; i<50; i++)); do
+    mkdir "$d" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  # A stale lock must not wedge the mailbox forever — take it after 5s.
+  rm -rf "$d" 2>/dev/null; mkdir "$d" 2>/dev/null && return 0
+  return 1
+}
+_unlock() { rm -rf "$MAILROOT/.lock-$1" 2>/dev/null; }
 
 # Resolve the tmux target of an agent: an explicitly registered pane wins (that's
-# how a human-launched orchestrator makes itself reachable), else the agent's
-# deterministic session name ai-<slug>-<agent>.
+# how a human-launched orchestrator makes itself reachable), then the legacy
+# per-slug orchestrator registration, else the deterministic session ai-<slug>-<agent>.
 _target() {
   local a="$1" p; p="$(_pane "$a")"
   [ -f "$p" ] && { cat "$p"; return; }
+  if [ "$a" = orchestrator ] && [ -f "$ROOT/.ai/orch-$SLUG" ]; then
+    cat "$ROOT/.ai/orch-$SLUG"; return
+  fi
   printf 'ai-%s-%s' "$SLUG" "$a"
 }
 _alive() { local t; t="$(_target "$1")"; tmux has-session -t "${t%%:*}" 2>/dev/null; }
 # Actively generating: a live "(Ns · …)" timer on screen. Escape is only safe when
 # this is false — mid-turn it would CANCEL the turn instead of closing a popup.
 _busy()  { tmux capture-pane -t "$(_target "$1")" -p 2>/dev/null | grep -qE '\([0-9]+s · '; }
+# Paused on a tool-permission decision. Ringing now would be destructive, not
+# merely useless: Escape REJECTS the pending tool call, and the doorbell text
+# would be typed into a select prompt. ai.sh's compact() already refuses on this
+# state for the same reason; the transport must too.
+_permission(){ tmux capture-pane -t "$(_target "$1")" -p 2>/dev/null | grep -qE 'Do you want to proceed\?|❯ 1\. Yes'; }
 
 # --- send -----------------------------------------------------------------
-# One physical line per message, so appends stay atomic (a single short write to
-# an O_APPEND fd cannot interleave). Bodies over BLOB_AT are spilled to their own
-# file and referenced by path, which keeps the jsonl line small no matter how big
-# the message is — the 4KB regex-laden briefs agents actually send stay atomic.
-BLOB_AT=2000
+# One physical line per message, so appends stay atomic: a write smaller than
+# PIPE_BUF to an O_APPEND fd cannot interleave with another writer's. That budget
+# is in BYTES, not characters — a 2000-char Cyrillic body JSON-encodes to \uXXXX
+# at 6 bytes each (~12KB) and would blow straight past it. So the threshold is
+# measured on the ENCODED line, and anything too long spills to its own blob file
+# with only a short reference left in the jsonl.
+BLOB_AT=2000        # bytes of encoded line we consider safely atomic
+
+# Encode one message as a single JSON line. jq if present, python3 otherwise —
+# this is the transport's only hard dependency and its failure mode is a message
+# that is never appended and never noticed. The old TSV path had no dependency at
+# all; the least we owe it is a second way to succeed.
+_encode() {
+  local id="$1" ts="$2" from="$3" to="$4" kind="$5" key="$6" val="$7"
+  if command -v jq >/dev/null 2>&1; then
+    jq -cn --arg id "$id" --arg ts "$ts" --arg from "$from" --arg to "$to" \
+           --arg kind "$kind" --arg k "$key" --arg v "$val" \
+      '{id:$id, ts:($ts|tonumber), from:$from, to:$to, kind:$kind} + {($k): $v}' 2>/dev/null && return 0
+  fi
+  AF_E_ID="$id" AF_E_TS="$ts" AF_E_FROM="$from" AF_E_TO="$to" AF_E_KIND="$kind" \
+  AF_E_KEY="$key" AF_E_VAL="$val" python3 -c '
+import json, os
+m = {"id": os.environ["AF_E_ID"], "ts": int(os.environ["AF_E_TS"]),
+     "from": os.environ["AF_E_FROM"], "to": os.environ["AF_E_TO"],
+     "kind": os.environ["AF_E_KIND"], os.environ["AF_E_KEY"]: os.environ["AF_E_VAL"]}
+print(json.dumps(m, ensure_ascii=False))' 2>/dev/null
+}
 
 send() {
-  local to="" kind="blocked" from="$SELF" a
+  local to="" kind="" from="$SELF"
   while [ "${1:-}" ]; do
     case "$1" in
       --to)   to="${2:-}";   shift 2 || break ;;
@@ -81,6 +146,7 @@ send() {
       *) break ;;
     esac
   done
+  kind="${kind:-fyi}"
   local body="$*"
   [ -z "$to" ]   && { echo "[mail] usage: mail.sh send --to <agent> [--kind K] <text>"; return 1; }
   [ -z "$body" ] && { echo "[mail] refusing to send an empty message"; return 1; }
@@ -90,37 +156,40 @@ send() {
   ts="$(date +%s)"
   id="m-$ts-$$-$RANDOM"
 
-  # jq builds the JSON so quotes/backslashes/newlines/unicode in the body are
-  # encoded, not guessed at. The body is data; it must never be parsed as syntax.
-  if [ "${#body}" -gt "$BLOB_AT" ]; then
+  line="$(_encode "$id" "$ts" "$from" "$to" "$kind" body "$body")"
+  [ -z "$line" ] && { echo "[mail] FAILED to encode the message (no working jq or python3) — NOT SENT"; return 1; }
+  # Judge atomicity on the encoded bytes, not the source characters.
+  if [ "$(printf '%s' "$line" | wc -c)" -gt "$BLOB_AT" ]; then
     local blob="$MAILROOT/blob/$id.txt"
     printf '%s' "$body" > "$blob"
-    line="$(jq -cn --arg id "$id" --arg ts "$ts" --arg from "$from" --arg to "$to" \
-                   --arg kind "$kind" --arg bf "$blob" \
-              '{id:$id, ts:($ts|tonumber), from:$from, to:$to, kind:$kind, body_file:$bf}')"
-  else
-    line="$(jq -cn --arg id "$id" --arg ts "$ts" --arg from "$from" --arg to "$to" \
-                   --arg kind "$kind" --arg body "$body" \
-              '{id:$id, ts:($ts|tonumber), from:$from, to:$to, kind:$kind, body:$body}')"
+    line="$(_encode "$id" "$ts" "$from" "$to" "$kind" body_file "$blob")"
+    [ -z "$line" ] && { echo "[mail] FAILED to encode the message — NOT SENT"; return 1; }
   fi
-  [ -z "$line" ] && { echo "[mail] jq failed to encode the message — not sent"; return 1; }
   printf '%s\n' "$line" >> "$(_box "$to")"
 
   # Track whether an agent is MID-TASK, so compaction can tell a turn boundary
   # from a task boundary. A turn ends many times inside one task; compacting at
   # the wrong one throws away the working state the agent still needs. The mail
   # protocol already carries the signal — a task goes out, a done/result comes
-  # back — so we just record it instead of inventing a second mechanism.
+  # back — so we record it rather than invent a second mechanism.
+  #
+  # `done`/`result` clears the state of the SENDER only when it is answering the
+  # party that tasked it. Clearing on any done/result would let a side-reply to a
+  # peer mark an agent idle while its real task is still open.
   case "$kind" in
-    task)        printf 'busy' > "$MAILROOT/state-$to" ;;
-    done|result) printf 'idle' > "$MAILROOT/state-$from" ;;
+    task) printf 'busy' > "$MAILROOT/state-$to" ;;
+    done|result)
+      if [ "$(cat "$MAILROOT/tasker-$from" 2>/dev/null)" = "$to" ]; then
+        printf 'idle' > "$MAILROOT/state-$from"
+      fi ;;
   esac
+  [ "$kind" = task ] && printf '%s' "$from" > "$MAILROOT/tasker-$to"
 
   local seq; seq="$(_lines "$(_box "$to")")"
   if ring "$to"; then
     echo "[mail] $from → $to [$kind] #$seq delivered (doorbell rung), id=$id"
   else
-    echo "[mail] $from → $to [$kind] #$seq queued in mailbox (no live pane) — they'll read it on next 'mail read', id=$id"
+    echo "[mail] $from → $to [$kind] #$seq QUEUED — '$to' has no live/idle pane. It will be rung on next 'ai up/revive $to', or read on its next 'mail read'. id=$id"
   fi
 }
 
@@ -128,8 +197,15 @@ send() {
 # Type a fixed command into the recipient's pane. It runs, prints their unread
 # mail into their context, and wakes them. We never type the message itself.
 ring() {
-  local to="$1" tgt; tgt="$(_target "$to")"
+  local to="${1:-}"; [ -z "$to" ] && { echo "[mail] usage: mail.sh ring <agent>"; return 1; }
+  local tgt; tgt="$(_target "$to")"
   _alive "$to" || return 1
+
+  # A pane paused on a permission prompt must NOT be rung. Escape there REJECTS
+  # the pending tool call, and the doorbell text would be typed into a select
+  # prompt. The message stays in the mailbox; the agent reads it after the human
+  # (or `ai approve`) answers.
+  _permission "$to" && return 1
 
   # Escape closes a stray autocomplete popup / leaves sticky shell mode, so the
   # command we type lands in a clean input box. ONLY when idle: mid-turn, Escape
@@ -144,9 +220,23 @@ ring() {
     # agent would be left to GUESS that it should go fetch its mail — which is
     # exactly the model-judgment dependency this channel exists to remove.
     # Still slash-free, so the autocomplete popup stays shut.
-    tmux send-keys -t "$tgt" -l '!bash $AF_MAIL read' 2>/dev/null || return 1
+    local doorbell='!bash $AF_MAIL read'
+    tmux send-keys -t "$tgt" -l "$doorbell" 2>/dev/null || return 1
     sleep 0.2
     tmux send-keys -t "$tgt" Enter 2>/dev/null || return 1
+    sleep 0.4
+    # Verify it actually went in. `send` used to report "delivered" on the strength
+    # of having typed the keys — but a popup can still swallow the Enter, and then
+    # the doorbell sits unsent in the box while the sender believes it rang. The
+    # doorbell is short and unwrapped, so an exact compare against the live input
+    # line is sound here (it would NOT be for a long message; see the note below).
+    if tmux capture-pane -t "$tgt" -p 2>/dev/null | grep -qF "$doorbell"; then
+      tmux send-keys -t "$tgt" Escape 2>/dev/null; sleep 0.2
+      tmux send-keys -t "$tgt" -l "$doorbell" 2>/dev/null
+      sleep 0.2; tmux send-keys -t "$tgt" Enter 2>/dev/null
+      sleep 0.4
+      tmux capture-pane -t "$tgt" -p 2>/dev/null | grep -qF "$doorbell" && return 1
+    fi
   else
     # DEGRADED PATH — for agents spawned before the mail channel existed (no
     # AF_MAIL in their env, so the path-free doorbell is impossible) and for an
@@ -194,9 +284,26 @@ read_() {
       *) break ;;
     esac
   done
+  mkdir -p "$MAILROOT"
+
+  # Read-modify-write of the cursor under a lock. Without it the two readers this
+  # design INTENDS to have — the Stop hook at the turn boundary, and the doorbell
+  # typed into the same pane — both snapshot the same cursor and deliver the same
+  # messages twice, and the later writer can rewind the cursor so they arrive a
+  # third time. "The cursor is the ack" is only true if the ack is atomic.
+  _lock "$who" || { echo "[mail] mailbox of '$who' is locked by another reader — try again"; return 1; }
+
   local box cur tot
   box="$(_box "$who")"; cur="$(_read_cursor "$who")"; tot="$(_lines "$box")"
-  if [ "$tot" -le "$cur" ]; then echo "[mail] no new mail for '$who'"; return 0; fi
+  if [ "$tot" -le "$cur" ]; then _unlock "$who"; echo "[mail] no new mail for '$who'"; return 0; fi
+
+  # Advance the cursor BEFORE printing. If we print first and die (timeout, killed
+  # pane) the cursor never moves and the message is re-delivered forever; moving
+  # first means at-most-once, and an unread message that was truly missed is still
+  # visible in `mail dump`. Re-delivering an escalation on a loop is the worse
+  # failure: it is what the exactly-once claim exists to prevent.
+  [ "$peek" = 1 ] || printf '%s' "$tot" > "$(_cursor "$who")"
+  _unlock "$who"
 
   echo "═══ MAIL for '$who' — $((tot-cur)) new ═══"
   sed -n "$((cur+1)),${tot}p" "$box" | while IFS= read -r line; do
@@ -211,9 +318,7 @@ read_() {
       done
   done
   echo "═══ end of mail ═══"
-  echo "Reply with: bash \$AF_MAIL send --to <agent> --kind <question|result|done|fyi> \"...\""
-
-  [ "$peek" = 1 ] || { mkdir -p "$MAILROOT"; printf '%s' "$tot" > "$(_cursor "$who")"; }
+  echo "Reply with: bash \$AF_MAIL send --to <agent> --kind <question|blocked|result|done|fyi> \"...\""
 }
 
 # How many messages the agent has NOT yet consumed. This is what a sender polls

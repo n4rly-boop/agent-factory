@@ -67,10 +67,27 @@ private settings file wiring two hooks. **Roles are enforced, not requested:**
   standing orders on *every* prompt, for ~25 tokens. A rule stated once in the
   system prompt survives compaction but loses to 200k tokens of recent work for
   attention; a rule restated next to the task does not.
-- **delegate-wall** (`PreToolUse` on Write/Edit) *denies* a mini-orchestrator's
-  direct edits outside its `work/` dir and names the way out. Observed in
-  testing: the agent hit the wall and immediately re-routed to
-  `delegate-to-local-model` on its own. Delegation stops being a preference.
+- **delegate-wall** (`PreToolUse` on Write/Edit/NotebookEdit/**Bash**) *denies* a
+  mini-orchestrator's direct edits outside its `work/` dir and names the way out.
+  Observed in testing: the agent hit the wall and re-routed to
+  `delegate-to-local-model` on its own, and the work still got done. Delegation
+  stops being a preference.
+
+Three things the wall had to learn the hard way, all found by review + a live test:
+
+- **`Bash` is the first thing an agent reaches for after a denied `Write`.**
+  Matching only Write/Edit leaves `echo > file`, `tee`, `sed -i` wide open — the
+  wall was decorative. Bash is now checked for write idioms.
+- **A `Task` subagent inherits the same wall** (verified: it gets the identical
+  block). So "delegate to a subagent" is *not* an escape hatch — an agent told to
+  do that just loops. The wall says so explicitly now, and points at
+  `delegate-to-local-model`, which runs in its own process and genuinely can write.
+- **The agent's own settings file lives under `$AF_ROOT`, which is under `/tmp`** —
+  and `/tmp` was allowlisted so the agent could stage scratch work. That let it
+  overwrite the very file that installs the wall. `$AF_ROOT` is now carved out.
+
+It is **not a sandbox.** It is a routing enforcer against an agent that forgets,
+not a jail against one trying to get out. If you need containment, use permissions.
 
 ⚠️ **A hook that can't execute fails OPEN.** Claude Code reports a hook error and
 runs the tool anyway — so a `delegate-wall` missing its `+x` bit is a wall-shaped

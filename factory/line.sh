@@ -52,10 +52,13 @@ PY="${PYTHON:-python3}"
 _plan() {
   local bp="$1"
   "$PY" - "$bp" <<'PY'
-import sys, yaml, os
+import sys, yaml, os, base64
 bp = yaml.safe_load(open(sys.argv[1])) or {}
 slug = bp.get('slug') or os.path.basename(os.getcwd())
-work = bp.get('work') or './work'
+# The delegate-wall compares Claude's ALWAYS-ABSOLUTE file_path against this, so a
+# relative "./work" would block every agent from writing its own report — and then
+# tell it to write its report. Resolve once, here.
+work = os.path.abspath(bp.get('work') or './work')
 d    = bp.get('defaults') or {}
 agents = bp.get('agents') or {}
 
@@ -88,8 +91,12 @@ for nm, cfg in names:
     # \x1f (unit separator), not tab: tab is an IFS *whitespace* character, so
     # bash collapses runs of them and an empty field (say, an orchestrator with no
     # parent) silently vanishes — shifting every column after it.
-    print('\x1f'.join([slug, work, nm, role, parent, model, delegate, caveman, soft, hard, peers,
-                     brief.replace('\t', '  ').replace('\n', '\\n')]))
+    # base64, because the shell side used to expand the brief with `printf %b`:
+    # that interprets EVERY backslash escape in it. A brief mentioning \d+ or a
+    # Windows path silently mangles, and a \c TRUNCATES the rest of the file.
+    # Briefs are data — they must survive verbatim.
+    b64 = base64.b64encode(brief.encode()).decode()
+    print('\x1f'.join([slug, work, nm, role, parent, model, delegate, caveman, soft, hard, peers, b64]))
 PY
 }
 
@@ -107,7 +114,7 @@ _settings() {
       { "hooks": [ { "type": "command", "command": "$HERE/hooks/role-reminder.sh", "timeout": 5 } ] }
     ],
     "PreToolUse": [
-      { "matcher": "Write|Edit|NotebookEdit",
+      { "matcher": "Write|Edit|NotebookEdit|Bash",
         "hooks": [ { "type": "command", "command": "$HERE/hooks/delegate-wall.sh", "timeout": 5 } ] }
     ]
   }
@@ -127,13 +134,19 @@ _entrypoint() {
     if [ "$delegate" = "required" ]; then
       printf '## How you work — you are a MINI-ORCHESTRATOR\n\n'
       printf 'You do **not** do the work yourself. You dispatch it and verify what comes back:\n\n'
-      printf '1. `delegate-to-local-model` skill — preferred. Free, and keeps the work off your context.\n'
-      printf '2. A subagent via the Task tool — for anything needing judgment.\n\n'
-      printf 'This is enforced, not advised: a hook blocks your Write/Edit outside `%s/`.\n' "$work"
+      printf '1. `delegate-to-local-model` skill — **the** way to get a file written. Free, runs in\n'
+      printf '   its own process, keeps the work off your context.\n'
+      printf '2. Mail a peer agent that owns the area: `bash $AF_MAIL send --to <agent> --kind task "..."`.\n'
+      printf '3. A Task subagent to READ and analyse — never to write (see below).\n\n'
+      printf 'This is enforced, not advised: a hook blocks your Write/Edit/Bash-writes outside `%s/`.\n' "$work"
+      printf 'A Task subagent **inherits the same wall** and is blocked identically — verified. Do not\n'
+      printf 'try to route a write through one; you will just loop.\n\n'
       printf 'Verify everything that comes back. Never trust bulk output unread.\n\n'
     fi
     printf '## Your report\n\nWrite it to `%s/%s.md`. One file, kept current — it is how the line sees your work.\n\n' "$work" "$name"
-    printf '## Your brief\n\n%b\n' "$brief"
+    printf '## Your brief\n\n'
+    printf '%s' "$brief" | base64 --decode 2>/dev/null || printf '%s' "$brief"
+    printf '\n'
   } > "$f"
   echo "$f"
 }
@@ -179,9 +192,16 @@ up() {
     AI_CLAUDE_FLAGS="--settings $st ${model:+--model $model} --append-system-prompt $(printf '%q' "$sys") ${AI_CLAUDE_FLAGS:-}" \
     AI_NOTIFY_OFF=1 \
       bash "$AI" up "$name" >/dev/null 2>&1
-    printf '[line] %-10s %-14s %-8s %s\n' "$name" "$role" "${model:-default}" \
-      "${parent:+← $parent}${delegate:+  [delegate-only]}"
-    n=$((n+1))
+    if tmux has-session -t "ai-$slug-$name" 2>/dev/null; then
+      printf '[line] %-10s %-14s %-8s %s\n' "$name" "$role" "${model:-default}" \
+        "${parent:+← $parent}${delegate:+  [delegate-only]}"
+      n=$((n+1))
+    else
+      # `ai up` swallows its own output, so a station that never launched (claude
+      # not on PATH inside tmux, malformed settings, tmux failure) would otherwise
+      # still be counted and reported as up.
+      printf '[line] %-10s FAILED TO LAUNCH — check: bash %s up %s\n' "$name" "$AI" "$name"
+    fi
   done < <(_plan "$bp")
   echo "[line] $n stations up. attach: tmux attach -t ai-$(_plan "$bp" | head -1 | cut -d$'\x1f' -f1)-<name>"
   echo "[line] talk to the line:  ai post <agent> \"…\"   |   read replies:  ai mail"

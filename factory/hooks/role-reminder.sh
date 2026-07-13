@@ -29,7 +29,7 @@ printf ' Mail: bash $AF_MAIL send --to <agent> --kind <question|blocked|result|d
 
 # The two rules that decay fastest under load, so they are the two we repeat.
 if [ "${AF_DELEGATE:-}" = "required" ]; then
-  printf ' You are a MINI-ORCHESTRATOR: do not do the work yourself — dispatch it to a subagent (Task) or the local model (delegate-to-local-model skill), then verify the result. Your own writes are confined to %s/.' "$work"
+  printf ' You are a MINI-ORCHESTRATOR: do not do the work yourself — dispatch it via the delegate-to-local-model skill (the only route that can WRITE; a Task subagent inherits your wall and cannot), or mail the peer who owns the area. Then verify the result. Your own writes are confined to %s/.' "$work"
 fi
 [ "${AF_CAVEMAN:-}" = "1" ] && printf ' Answer in caveman: drop articles/filler/hedging, keep every technical fact exact.'
 printf '\n'

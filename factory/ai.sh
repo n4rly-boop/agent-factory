@@ -23,6 +23,7 @@
 #   ai mail                  read YOUR mailbox (mail agents sent you) and ack it
 #   ai post  <agent> [--kind K] <text>   send mail to an agent + ring its doorbell
 #   ai mailstat              unread count per mailbox (the ack/retry signal)
+#   ai sweep                 compact idle agents past their threshold; disarm the stop-gate
 #   ai inbox                 old name for `ai mail` (forwards to it)
 #   ai register-self         (run inside the orchestrator's tmux) let agents WAKE you by mail
 #   ai unregister-self       stop agents from waking this session
@@ -219,6 +220,15 @@ OSA
   fi
   # If resuming, clear the "summary vs full" chooser so the agent is ready to drive.
   [[ "$launchflags" == *"--resume"* ]] && _answer_resume "$name"
+  # Mail that arrived while this agent was down would otherwise sit unread forever:
+  # nothing re-rings it, and the agent has no reason to go looking. Ring it now.
+  local pending
+  pending="$(AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" unread --agent "$name" 2>/dev/null)"
+  if [ "${pending:-0}" -gt 0 ]; then
+    sleep 3   # let the TUI finish booting, or the doorbell types into nothing
+    AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" ring "$name" >/dev/null 2>&1 \
+      && echo "[ai] '$name' had $pending unread message(s) — doorbell rung."
+  fi
   echo "[ai] drive it:  ai say $name \"hello\"   |   watch screen:  ai screen $name"
 }
 
@@ -422,7 +432,7 @@ _maybe_autocompact() {
 remote() {
   local name="${1:-claude}" sid="${2:-}"
   [ -z "$sid" ] && sid="$(cat "$STATE/sid-$name" 2>/dev/null)"
-  [ -z "$sid" ] && sid="$(grep -P "\t$name\t" "$MANIFEST" 2>/dev/null | cut -f4 | tail -1)"
+  [ -z "$sid" ] && sid="$(awk -F'\t' -v n="$name" '$3==n{print $4}' "$MANIFEST" 2>/dev/null | tail -1)"
   tmux has-session -t "$(S "$name")" 2>/dev/null && down "$name"   # close the old window/session first
   if [ -n "$sid" ] && [ -n "$(find "$HOME/.claude/projects" -type f -name "$sid.jsonl" 2>/dev/null | head -1)" ]; then
     echo "[ai] launching '$name' with Remote Control, resuming session $sid"
@@ -497,8 +507,44 @@ mail_() { AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" AF_ROOT="${AF_ROO
 post()  {
   local to="${1:-}"; shift || true
   [ -z "$to" ] && { echo "[ai] usage: ai post <agent> [--kind K] <text>"; return 1; }
+  # Default kind is `task`, because that is what posting to an agent MEANS. It is
+  # also the signal that marks the agent busy — without it, `_mid_task` is never
+  # true and compaction happily runs in the middle of a multi-turn task.
+  local kind=task a
+  for a in "$@"; do [ "$a" = --kind ] && kind="" ; done
   AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" \
-    bash "$MAIL" send --to "$to" "$@"
+    bash "$MAIL" send --to "$to" ${kind:+--kind "$kind"} "$@"
+  # Arm the Stop hook: we have just handed out async work, so an idle stop should
+  # wait for the reply instead of handing control back to the human. Disarmed by
+  # `ai sweep`/`ai mail` once nothing is outstanding.
+  mkdir -p "$STATE"; : > "$STATE/await"
+}
+
+# Compaction for a MAIL-DRIVEN fleet. `_maybe_autocompact` only ever ran from
+# `ask`, but a line's agents are driven by mail, not by `ask` — so the context
+# guard never applied to the very fleet it was built for. `sweep` walks every
+# agent with a mailbox and applies the same two thresholds at a safe point.
+sweep() {
+  mkdir -p "$MAILROOT"
+  local box name
+  shopt -s nullglob
+  for box in "$MAILROOT"/*.jsonl; do
+    name="$(basename "$box" .jsonl)"
+    [ "$name" = orchestrator ] && continue
+    tmux has-session -t "$(S "$name")" 2>/dev/null || continue
+    _busy "$name" && continue          # mid-turn: not a safe point, skip
+    _permission "$name" && continue    # waiting on a human: don't touch
+    _maybe_autocompact "$name"
+  done
+  shopt -u nullglob
+  # Nothing outstanding anywhere → let the orchestrator stop for real.
+  local n; n="$(AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" \
+                AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" unread 2>/dev/null)"
+  local anybusy=0 f
+  shopt -s nullglob
+  for f in "$MAILROOT"/state-*; do [ "$(cat "$f" 2>/dev/null)" = busy ] && anybusy=1; done
+  shopt -u nullglob
+  [ "${n:-0}" -eq 0 ] && [ "$anybusy" = 0 ] && rm -f "$STATE/await"
 }
 # Unread count per mailbox — the retry/ack signal. A sender that sees its message
 # still unread after a while can ring again (or conclude the agent is dead).
@@ -521,7 +567,7 @@ mailstat() {
 revive() {
   local name="${1:-claude}" sid="${2:-}"
   [ -z "$sid" ] && sid="$(cat "$STATE/sid-$name" 2>/dev/null)"
-  [ -z "$sid" ] && sid="$(grep -P "\t$name\t" "$MANIFEST" 2>/dev/null | cut -f4 | tail -1)"
+  [ -z "$sid" ] && sid="$(awk -F'\t' -v n="$name" '$3==n{print $4}' "$MANIFEST" 2>/dev/null | tail -1)"
   [ -z "$sid" ] && { echo "[ai] no recorded session for '$name' — see: ai revivable"; return 1; }
   [ -z "$(find "$HOME/.claude/projects" -type f -name "$sid.jsonl" 2>/dev/null | head -1)" ] \
     && { echo "[ai] session $sid log is gone (purged?) — can't revive '$name'"; return 1; }
@@ -552,6 +598,10 @@ revivable() {
 
 down() {
   local name="${1:-claude}" s; s="$(S "$name")"
+  # A `busy` state that outlives its agent silently disables soft compaction for
+  # the next agent to take that name — it inherits the stale flag and never
+  # compacts again.
+  rm -f "$MAILROOT/state-$name" "$MAILROOT/tasker-$name" 2>/dev/null
   tmux kill-session -t "$s" 2>/dev/null || true
   _closewin "$name"
   echo "[ai] '$name' down — session killed, window closed."
@@ -580,7 +630,7 @@ case "$cmd" in
   screen) screen "$@" ;;  ask) ask "$@" ;;  approve) approve "$@" ;;  attach) attach "$@" ;;
   ctx) ctx "$@" ;;  compact) compact "$@" ;;  remote) remote "$@" ;;
   wait) wait_ "$@" ;;  result) result "$@" ;;  inbox) inbox "$@" ;;
-  mail) mail_ "$@" ;;  post) post "$@" ;;  mailstat) mailstat ;;
+  mail) mail_ "$@" ;;  post) post "$@" ;;  mailstat) mailstat ;;  sweep) sweep ;;
   register-self) register_self ;;  unregister-self) unregister_self ;;  slug) echo "$SLUG" ;;
   revive) revive "$@" ;;  revivable) revivable ;;
   down) down "$@" ;;  list) list ;;
