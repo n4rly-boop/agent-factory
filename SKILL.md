@@ -39,7 +39,7 @@ Scripts live in `scripts/` next to this file. Reference them by absolute path:
 
 ## Invoked as `/agent-factory plan …` — run the blueprint wizard
 
-If the skill was invoked with `plan` / `new` / `design` (with or without a goal after
+If the skill was invoked with `plan` (with or without a goal after
 it), or the user asks to design a fleet *with* you rather than hand you a finished
 blueprint: **read `$SKILL/scripts/blueprint-wizard.md` and follow it.** It is an
 interview protocol — you ask, they decide, and a `blueprint.yml` exists only after they
