@@ -540,9 +540,18 @@ sweep() {
   # Nothing outstanding anywhere → let the orchestrator stop for real.
   local n; n="$(AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" \
                 AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" unread 2>/dev/null)"
-  local anybusy=0 f
+  local anybusy=0 f who
   shopt -s nullglob
-  for f in "$MAILROOT"/state-*; do [ "$(cat "$f" 2>/dev/null)" = busy ] && anybusy=1; done
+  for f in "$MAILROOT"/state-*; do
+    [ "$(cat "$f" 2>/dev/null)" = busy ] || continue
+    who="$(basename "$f")"; who="${who#state-}"
+    # A `busy` flag whose agent no longer exists is not work outstanding — it is
+    # garbage. Left counted, one `ai post` to a name that never came up would hold
+    # the orchestrator's every idle turn open for AF_STOP_POLL seconds, forever;
+    # a crashed agent would do the same. Reap it instead.
+    if tmux has-session -t "$(S "$who")" 2>/dev/null; then anybusy=1
+    else rm -f "$f" "$MAILROOT/tasker-$who"; fi
+  done
   shopt -u nullglob
   [ "${n:-0}" -eq 0 ] && [ "$anybusy" = 0 ] && rm -f "$STATE/await"
 }

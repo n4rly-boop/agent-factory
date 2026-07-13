@@ -77,7 +77,13 @@ Three things the wall had to learn the hard way, all found by review + a live te
 
 - **`Bash` is the first thing an agent reaches for after a denied `Write`.**
   Matching only Write/Edit leaves `echo > file`, `tee`, `sed -i` wide open — the
-  wall was decorative. Bash is now checked for write idioms.
+  wall was decorative. Bash commands are now tokenised with `shlex` and only the
+  **write target** is judged (the redirect operand, `of=`, `tee`'s file, `curl -o`,
+  `sed -i`'s file…). Judging *any path in the command* — the first attempt — was
+  wrong in both directions: `echo pwned > ai.sh` passed (a bare filename has no
+  slash, so no path token was found at all) while `grep -rn foo /abs 2>/dev/null`
+  was **blocked** (`2>` read as a write, `/abs` as its target). The false positives
+  are the worse half: an agent told to "delegate" a `grep` just loops.
 - **A `Task` subagent inherits the same wall** (verified: it gets the identical
   block). So "delegate to a subagent" is *not* an escape hatch — an agent told to
   do that just loops. The wall says so explicitly now, and points at

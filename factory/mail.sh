@@ -107,6 +107,19 @@ _busy()  { tmux capture-pane -t "$(_target "$1")" -p 2>/dev/null | grep -qE '\([
 # state for the same reason; the transport must too.
 _permission(){ tmux capture-pane -t "$(_target "$1")" -p 2>/dev/null | grep -qE 'Do you want to proceed\?|❯ 1\. Yes'; }
 
+# Is $2 still sitting UNSENT in the pane's live input box?
+# Only the last prompt line counts. Submitted text also appears in the scrollback
+# transcript, so searching the whole pane would match forever and report every
+# message as unsent. The box renders as "❯ text" in normal mode and "! text" in
+# shell mode (note the space after the bang — an exact-match check written
+# without it silently never fires).
+_pending() {
+  local tgt="$1" want="$2" live
+  live="$(tmux capture-pane -t "$tgt" -p 2>/dev/null | grep -E '^[[:space:]]*[❯!]' | tail -1 \
+          | sed 's/^[[:space:]]*[❯!][[:space:]]*//')"
+  [ "$live" = "$want" ]
+}
+
 # --- send -----------------------------------------------------------------
 # One physical line per message, so appends stay atomic: a write smaller than
 # PIPE_BUF to an O_APPEND fd cannot interleave with another writer's. That budget
@@ -220,23 +233,30 @@ ring() {
     # agent would be left to GUESS that it should go fetch its mail — which is
     # exactly the model-judgment dependency this channel exists to remove.
     # Still slash-free, so the autocomplete popup stays shut.
-    local doorbell='!bash $AF_MAIL read'
-    tmux send-keys -t "$tgt" -l "$doorbell" 2>/dev/null || return 1
-    sleep 0.2
-    tmux send-keys -t "$tgt" Enter 2>/dev/null || return 1
-    sleep 0.4
-    # Verify it actually went in. `send` used to report "delivered" on the strength
-    # of having typed the keys — but a popup can still swallow the Enter, and then
-    # the doorbell sits unsent in the box while the sender believes it rang. The
-    # doorbell is short and unwrapped, so an exact compare against the live input
-    # line is sound here (it would NOT be for a long message; see the note below).
-    if tmux capture-pane -t "$tgt" -p 2>/dev/null | grep -qF "$doorbell"; then
+    local doorbell='!bash $AF_MAIL read' body='bash $AF_MAIL read'
+    local try
+    for try in 1 2; do
+      tmux send-keys -t "$tgt" -l "$doorbell" 2>/dev/null || return 1
+      sleep 0.2
+      tmux send-keys -t "$tgt" Enter 2>/dev/null || return 1
+      sleep 0.5
+      # Verify it actually SUBMITTED. `send` used to claim "delivered" purely on
+      # the strength of having typed the keys, while a popup could still swallow
+      # the Enter.
+      #
+      # This must look at the LIVE INPUT LINE only, not the whole pane: the pane
+      # also holds the transcript of previous rings, so a substring search over it
+      # matches forever and reports "unsent" every time. (An earlier attempt did
+      # exactly that, and was additionally dead code — the TUI renders shell mode
+      # as "! bash …", with a space, so a grep for "!bash …" never matched at all
+      # and the check silently always passed.) Isolate the last prompt line and
+      # compare its contents, tolerating either rendering.
+      _pending "$tgt" "$body" || return 0
+      # Still sitting in the box → a popup ate the Enter. Escape CLEARS the line
+      # (it does not merely close the popup), so retype from scratch.
       tmux send-keys -t "$tgt" Escape 2>/dev/null; sleep 0.2
-      tmux send-keys -t "$tgt" -l "$doorbell" 2>/dev/null
-      sleep 0.2; tmux send-keys -t "$tgt" Enter 2>/dev/null
-      sleep 0.4
-      tmux capture-pane -t "$tgt" -p 2>/dev/null | grep -qF "$doorbell" && return 1
-    fi
+    done
+    return 1
   else
     # DEGRADED PATH — for agents spawned before the mail channel existed (no
     # AF_MAIL in their env, so the path-free doorbell is impossible) and for an
@@ -268,6 +288,29 @@ ring() {
     return 1
   fi
   return 0
+}
+
+# Decode one stored line for display. This MUST have the same fallback `_encode`
+# has: `send` succeeded via python3 on a jq-less host, and then `read` printed an
+# empty envelope — while the cursor advanced anyway (it moves before printing).
+# The message was not merely undelivered, it was destroyed. A decoder that is
+# weaker than the encoder is a data-loss bug, not a formatting one.
+_decode() {
+  local line="$1" out=""
+  if command -v jq >/dev/null 2>&1; then
+    out="$(printf '%s' "$line" | jq -r '
+      "── from: \(.from)   kind: \(.kind)   id: \(.id)",
+      (if .body_file then (.body_file) else .body end)' 2>/dev/null)"
+  fi
+  [ -n "$out" ] && { printf '%s\n' "$out"; return; }
+  printf '%s' "$line" | python3 -c '
+import json, sys
+try:
+    m = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+print("── from: %s   kind: %s   id: %s" % (m.get("from"), m.get("kind"), m.get("id")))
+print(m.get("body_file") or m.get("body") or "")' 2>/dev/null
 }
 
 # --- read (the ack) --------------------------------------------------------
@@ -307,15 +350,12 @@ read_() {
 
   echo "═══ MAIL for '$who' — $((tot-cur)) new ═══"
   sed -n "$((cur+1)),${tot}p" "$box" | while IFS= read -r line; do
-    printf '%s' "$line" | jq -r '
-      "── from: \(.from)   kind: \(.kind)   id: \(.id)",
-      (if .body_file then (.body_file) else .body end)' 2>/dev/null \
-    | while IFS= read -r out; do
-        # A blob reference is expanded here, so the agent sees the full text
-        # inline and never has to go open a file.
-        if [ -f "$out" ] && [[ "$out" == "$MAILROOT/blob/"* ]]; then cat "$out"; echo
-        else printf '%s\n' "$out"; fi
-      done
+    _decode "$line" | while IFS= read -r out; do
+      # A blob reference is expanded here, so the agent sees the full text
+      # inline and never has to go open a file.
+      if [ -f "$out" ] && [[ "$out" == "$MAILROOT/blob/"* ]]; then cat "$out"; echo
+      else printf '%s\n' "$out"; fi
+    done
   done
   echo "═══ end of mail ═══"
   echo "Reply with: bash \$AF_MAIL send --to <agent> --kind <question|blocked|result|done|fyi> \"...\""
@@ -329,10 +369,12 @@ unread() {
   echo $(( $(_lines "$(_box "$who")") - $(_read_cursor "$who") ))
 }
 
+# The recovery path when something went wrong with delivery — so it must not
+# depend on the same tool whose absence caused the loss.
 dump() {
-  local who="${1:-$SELF}" box; box="$(_box "$who")"
+  local who="${1:-$SELF}" box line; box="$(_box "$who")"
   [ -s "$box" ] || { echo "[mail] mailbox of '$who' is empty"; return; }
-  jq -r '"[\(.ts)] \(.from) → \(.to) [\(.kind)]: \(.body // ("(blob) " + .body_file))"' "$box" 2>/dev/null
+  while IFS= read -r line; do _decode "$line"; done < "$box"
 }
 
 cmd="${1:-}"; shift || true
