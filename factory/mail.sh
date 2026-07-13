@@ -106,6 +106,16 @@ send() {
   [ -z "$line" ] && { echo "[mail] jq failed to encode the message — not sent"; return 1; }
   printf '%s\n' "$line" >> "$(_box "$to")"
 
+  # Track whether an agent is MID-TASK, so compaction can tell a turn boundary
+  # from a task boundary. A turn ends many times inside one task; compacting at
+  # the wrong one throws away the working state the agent still needs. The mail
+  # protocol already carries the signal — a task goes out, a done/result comes
+  # back — so we just record it instead of inventing a second mechanism.
+  case "$kind" in
+    task)        printf 'busy' > "$MAILROOT/state-$to" ;;
+    done|result) printf 'idle' > "$MAILROOT/state-$from" ;;
+  esac
+
   local seq; seq="$(_lines "$(_box "$to")")"
   if ring "$to"; then
     echo "[mail] $from → $to [$kind] #$seq delivered (doorbell rung), id=$id"

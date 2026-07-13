@@ -34,12 +34,15 @@
 # or $AF_SLUG) so agents across projects don't collide: ai-linkai-worker,
 # ai-inna-scout. `ai slug` prints the current slug.
 #
-# Compaction is a JUDGMENT call, not an automatic trigger. After a turn, `ask`
-# reports the agent's context size; YOU decide to `ai compact <name>` when it's
-# grown large (rule of thumb: past ~200k tokens) AND compacting won't drop info
-# the agent still needs AND the agent will keep being used. The auto-threshold
-# $AI_COMPACT_AT defaults to 1000000 (effectively off) — set it lower only if you
-# want a hard safety net regardless of judgment.
+# Compaction runs on TASK boundaries, not turn boundaries — a task spans many
+# turns, and compacting mid-task is what throws away the working state the agent
+# still needs. The mail protocol already says which is which (a task goes out, a
+# done/result comes back), so that gates it:
+#   AI_COMPACT_SOFT (200k)  compact only BETWEEN tasks; mid-task, just report.
+#   AI_COMPACT_HARD (500k)  compact at the next TURN boundary regardless — losing
+#                           some working state beats running out of context.
+# Absolute token counts; override per agent (a 200k-window model needs far lower
+# numbers than a 1M one). Set either to 0 to disable it.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # this script's dir
@@ -153,6 +156,14 @@ up() {
   local full envpfx sysprompt
   envpfx="$(printf 'AF_AGENT=%q AF_SLUG=%q AF_INBOX=%q AF_NOTIFY=%q AF_MAIL=%q AF_MAILROOT=%q AF_ROOT=%q' \
             "$name" "$SLUG" "$INBOX" "$NOTIFY" "$MAIL" "$MAILROOT" "${AF_ROOT:-/tmp/agent-factory}")"
+  # Role vars, when set (by `ai line` from a blueprint), travel into the agent's
+  # env so its hooks can enforce the role without any per-agent config file: the
+  # reminder hook reads them to restate the chain of command, the delegate-wall
+  # reads them to decide what it may write. Unset ⇒ a plain unmanaged agent.
+  local v
+  for v in AF_ROLE AF_PARENT AF_PEERS AF_DELEGATE AF_CAVEMAN AF_WORK; do
+    [ -n "${!v:-}" ] && envpfx="$envpfx $(printf '%s=%q' "$v" "${!v}")"
+  done
   mkdir -p "$MAILROOT"; : > "$MAILROOT/cap-$name"
   if [ "${AI_NOTIFY_OFF:-0}" != 1 ]; then
     sysprompt="You are a spawned peer agent named '$name', launched by an orchestrator (another Claude) via the agent-factory skill. You run unattended with permissions skipped and no human necessarily watching.
@@ -355,23 +366,52 @@ compact() {
   echo "[ai] compacting '$name' (ctx ≈ ${before} tok)…"
   say "$name" "/compact" || return 1
   wait_ "$name" "${AI_TIMEOUT:-300}" >/dev/null   # compaction runs the busy timer; wait it out
-  echo "[ai] '$name' compacted (was ≈ ${before} tok, now ≈ $(_ctx "$name") tok)."
+  # _ctx reads the usage of the last ASSISTANT record, and /compact does not write
+  # one — the shrunk size only becomes visible after the agent's next turn. So
+  # don't print a "now ≈ …" that is really the pre-compaction number in disguise.
+  local after; after="$(_ctx "$name")"
+  if [ "${after:-0}" -lt "${before:-0}" ]; then
+    echo "[ai] '$name' compacted: ≈ ${before} → ${after} tok."
+  else
+    echo "[ai] '$name' compacted (was ≈ ${before} tok; the new size reads out after its next turn)."
+  fi
 }
 
-# Called after a turn finishes (the natural safe point). Reports context size so
-# the driver can DECIDE whether to compact (the judgment call). Only auto-runs
-# /compact if context passes the hard net $AI_COMPACT_AT (default 1000000 =
-# effectively off; lower it for an unconditional safety net). We only get here
-# when the agent is idle, so neither the report nor a compact interrupts work.
+# Is the agent in the middle of a TASK (not merely mid-turn)? The mail protocol
+# records it: a task goes out, a done/result comes back. Absent any mail, treat
+# the agent as idle — we'd rather compact a quiet agent than never compact one.
+_mid_task() { [ "$(cat "$MAILROOT/state-$1" 2>/dev/null)" = "busy" ]; }
+
+# Called after a turn finishes — the only safe point to compact, since /compact
+# would otherwise interrupt generation. Two thresholds, because a turn boundary
+# and a task boundary are different things:
+#
+#   SOFT (default 200k) — compact only at a TASK boundary. A task spans many
+#     turns; compacting in the middle of one is what throws away working state.
+#     So if the agent still owes us a `done`, we leave it alone and just report.
+#   HARD (default 500k) — compact at the next TURN boundary regardless. Losing
+#     some working state is bad; running out of context loses everything.
+#
+# Thresholds are absolute tokens. Override per agent (a 200k-window model needs
+# far lower numbers than a 1M one): AI_COMPACT_SOFT / AI_COMPACT_HARD.
 _maybe_autocompact() {
-  local c; c="$(_ctx "$1")"; [ "${c:-0}" -gt 0 ] || return
-  if [ "$c" -gt 200000 ]; then
-    echo "[ai] context ≈ ${c} tok (>200k) — consider 'ai compact $1' if it won't drop needed info and '$1' will keep being used."
+  local name="$1" c soft hard
+  c="$(_ctx "$name")"; [ "${c:-0}" -gt 0 ] || return
+  soft="${AI_COMPACT_SOFT:-200000}"
+  hard="${AI_COMPACT_HARD:-500000}"
+
+  if [ "$hard" != 0 ] && [ "$c" -gt "$hard" ]; then
+    echo "[ai] context ≈ ${c} tok > hard ${hard} — compacting '$name' now (mid-task or not; running out would lose everything)…"
+    compact "$name"
+    return
   fi
-  local at="${AI_COMPACT_AT:-1000000}"; [ "$at" = 0 ] && return
-  if [ "$c" -gt "$at" ]; then
-    echo "[ai] context ≈ ${c} tok > hard net ${at} — auto-compacting '$1'…"
-    compact "$1"
+  if [ "$soft" != 0 ] && [ "$c" -gt "$soft" ]; then
+    if _mid_task "$name"; then
+      echo "[ai] context ≈ ${c} tok > soft ${soft}, but '$name' is mid-task — holding off (compacting now would drop its working state)."
+    else
+      echo "[ai] context ≈ ${c} tok > soft ${soft} and '$name' is between tasks — compacting…"
+      compact "$name"
+    fi
   fi
 }
 

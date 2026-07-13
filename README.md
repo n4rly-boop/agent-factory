@@ -10,9 +10,72 @@ ephemeral subagents.
 
 | Tool | What it is | Use when |
 |------|-----------|----------|
+| **`factory/line.sh`** | A whole **production line** of agents from one `blueprint.yml`: roles, chain of command, per-agent model, enforced delegation. | You want a team, not an agent. |
 | **`factory/ai.sh`** | A real interactive Claude **TUI** in a visible Terminal.app window, driven via `tmux send-keys` and read via `tmux capture-pane`. | You want to *see* a real Claude working, or a tool-using agent. Default. |
+| **`factory/mail.sh`** | The **channel between agents**: mailbox + doorbell + cursor-as-ack. | Agents talking to each other, reliably. |
 | **`factory/af.sh`** | A **headless worker** (`claude -p` loop) driven over a FIFO message bus, persistent `--resume` session. | Programmatic request→reply, autonomous loops, agent-to-agent chains. |
 | **`factory/afctl.sh`** | Cleanup of spawned agents' session logs via a session-id manifest. | Purge factory logs without touching your manual sessions. |
+
+## A line, from a blueprint
+
+A fleet's design — who exists, who reports to whom, who may only delegate, who
+gets the cheap model — is the part that decays fastest when you carry it in a
+prompt. Spawn five agents, tell each its role once, and thirty turns later
+nobody remembers they were supposed to delegate. So it goes in a file, and hooks
+enforce it:
+
+```yaml
+# blueprint.yml
+slug: rlhf-exp
+work: ./work
+defaults:
+  model: sonnet
+  caveman: true          # terse output — a hook, not a request
+  delegate: required     # mini-orchestrator: may not edit code itself
+agents:
+  orc:
+    role: orchestrator   # the one YOU talk to
+    model: opus
+    delegate: no         # the top orchestrator may act directly
+    brief: |
+      Own the experiment end to end. Dispatch to eval/abl*, collect their reports.
+  eval:
+    role: evaluation
+    parent: orc
+    brief: |
+      Own metrics, baselines, eval scripts.
+  abl:
+    count: 3             # → abl1, abl2, abl3
+    role: ablation
+    parent: orc
+    model: haiku
+    brief: |
+      Test exactly ONE hypothesis. Report to work/<you>.md, mail orc when done.
+```
+
+```bash
+bash factory/line.sh plan   blueprint.yml   # resolved roles, no spawn
+bash factory/line.sh up     blueprint.yml   # briefs + settings + spawn
+bash factory/line.sh status blueprint.yml   # alive? context size? unread mail?
+bash factory/line.sh down   blueprint.yml
+```
+
+Each station gets a generated `work/entrypoint-<name>.md` (the full brief) and a
+private settings file wiring two hooks. **Roles are enforced, not requested:**
+
+- **role-reminder** (`UserPromptSubmit`) restates identity, chain of command and
+  standing orders on *every* prompt, for ~25 tokens. A rule stated once in the
+  system prompt survives compaction but loses to 200k tokens of recent work for
+  attention; a rule restated next to the task does not.
+- **delegate-wall** (`PreToolUse` on Write/Edit) *denies* a mini-orchestrator's
+  direct edits outside its `work/` dir and names the way out. Observed in
+  testing: the agent hit the wall and immediately re-routed to
+  `delegate-to-local-model` on its own. Delegation stops being a preference.
+
+⚠️ **A hook that can't execute fails OPEN.** Claude Code reports a hook error and
+runs the tool anyway — so a `delegate-wall` missing its `+x` bit is a wall-shaped
+hole, and nothing in the agent's output says so. `line up` preflights the hooks
+and refuses to spawn rather than hand out enforcement that isn't there.
 
 ## Quick start
 
@@ -71,12 +134,21 @@ list                 list running interactive agents
   the first tool gate. Set `AI_SKIP_PERMS=0` (or pass your own `--permission-mode`)
   to restore prompting; then `ask` surfaces the pause and `approve` answers it.
 - **Slash commands work** — the agent is a real TUI, so `say <name> "/model"` etc.
-  run them. Two are wired in for timing: `compact` (a judgment call you make once
-  context grows past ~200k, only if it won't drop needed info and the agent will
-  keep being used; `ask` reports the size, the command refuses mid-turn, no
-  auto-trigger unless you lower `AI_COMPACT_AT` from its 1m default) and `remote`
-  (relaunch with `--remote-control`, resuming the session, so the human drives it
-  from the Claude web app/phone).
+  run them. Two are wired in for timing: `compact` and `remote` (relaunch with
+  `--remote-control`, resuming the session, so the human drives it from the Claude
+  web app/phone).
+- **Compaction distinguishes a turn boundary from a task boundary.** A task spans
+  many turns; compacting in the middle of one is exactly what throws away the
+  working state the agent still needs. The mail protocol already carries the
+  signal — a `task` goes out, a `done`/`result` comes back — so that is what gates
+  it, rather than a second mechanism invented for the purpose:
+  - `AI_COMPACT_SOFT` (200k): compact only *between* tasks. Still owes a `done`?
+    Leave it alone and just report the size.
+  - `AI_COMPACT_HARD` (500k): compact at the next *turn* boundary regardless.
+    Losing some working state is bad; running out of context loses everything.
+
+  Both are absolute token counts — override per agent, since a 200k-window model
+  needs far lower numbers than a 1M one.
 - **One writer at a time.** The agent shares its tmux session with the window;
   if a human types while the controller drives, keystrokes interleave. To watch
   only, attach read-only: `tmux attach -r -t ai-<name>`.
@@ -126,10 +198,13 @@ up the agent logs" invoke it automatically.
 
 ```
 factory/
+├── line.sh         a whole fleet from one blueprint.yml (roles, hierarchy, models)
 ├── ai.sh           interactive TUI agents (primary)
 ├── mail.sh         agent↔agent transport: mailbox + doorbell + cursor-as-ack
 ├── notify.sh       thin alias for `mail.sh send` (stable entry point for older agents)
 ├── hooks/
+│   ├── role-reminder.sh          restates role + chain of command every prompt
+│   ├── delegate-wall.sh          denies a mini-orchestrator's direct edits
 │   └── escalation-stop-hook.sh   wakes an idle orchestrator when mail arrives
 ├── af.sh           headless FIFO-bus workers
 ├── worker.sh       the worker loop af.sh launches
