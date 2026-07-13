@@ -20,10 +20,19 @@
 #   ai remote[name]          (re)launch with Remote Control so you drive it from the Claude web/app
 #   ai revive[name] [id]     relaunch a killed agent with its memory (resume its session)
 #   ai revivable             list downed agents (with a surviving log) you can revive by name
-#   ai inbox   [--drain]     show blockers spawned agents escalated to you (--drain clears)
+#   ai mail                  read YOUR mailbox (mail agents sent you) and ack it
+#   ai post  <agent> [--kind K] <text>   send mail to an agent + ring its doorbell
+#   ai mailstat              unread count per mailbox (the ack/retry signal)
+#   ai inbox                 old name for `ai mail` (forwards to it)
+#   ai register-self         (run inside the orchestrator's tmux) let agents WAKE you by mail
+#   ai unregister-self       stop agents from waking this session
 #   ai attach[name]          print the command to attach another viewer
 #   ai down  [name]          quit claude + kill the session
 #   ai list                  list running interactive agents
+#
+# Sessions are named ai-<slug>-<name> (slug = short project tag from the dir,
+# or $AF_SLUG) so agents across projects don't collide: ai-linkai-worker,
+# ai-inna-scout. `ai slug` prints the current slug.
 #
 # Compaction is a JUDGMENT call, not an automatic trigger. After a turn, `ask`
 # reports the agent's context size; YOU decide to `ai compact <name>` when it's
@@ -33,13 +42,23 @@
 # want a hard safety net regardless of judgment.
 set -uo pipefail
 
-S() { echo "ai-${1:-claude}"; }                  # tmux session name
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # this script's dir
 CWD="${AF_CWD:-$(pwd)}"                           # where claude runs
 FLAGS="${AI_CLAUDE_FLAGS:-}"                      # extra claude flags
-STATE="${AF_ROOT:-/tmp/agent-factory}/.ai"        # tracks window ids
-INBOX="${AF_ROOT:-/tmp/agent-factory}/inbox.tsv"  # agent→orchestrator escalations
+# Every agent's tmux session is ai-<slug>-<name>. <slug> is a short per-project
+# tag so agents from different projects are distinguishable in `tmux ls`
+# (ai-linkai-worker vs ai-inna-scout). Derived from the project dir name;
+# override with AF_SLUG. It also namespaces state, so a "worker" in one project
+# never collides with a "worker" in another.
+SLUG="${AF_SLUG:-$(basename "$CWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-12)}"
+[ -z "$SLUG" ] && SLUG="proj"
+S() { echo "ai-${SLUG}-${1:-claude}"; }          # tmux session name: ai-<slug>-<name>
+STATE="${AF_ROOT:-/tmp/agent-factory}/.ai/${SLUG}"   # per-slug: window/tty/sid tracking
+ORCHDIR="${AF_ROOT:-/tmp/agent-factory}/.ai"     # slug-keyed orchestrator registry (orch-<slug>)
+INBOX="${AF_ROOT:-/tmp/agent-factory}/inbox.tsv"  # agent→orchestrator escalations (legacy log)
+MAILROOT="${AF_ROOT:-/tmp/agent-factory}/.ai/${SLUG}/mail"  # per-slug mailboxes (the real channel)
 NOTIFY="$HERE/notify.sh"                          # helper a spawned agent runs to escalate
+MAIL="$HERE/mail.sh"                              # reliable agent↔agent transport (see mail.sh)
 MANIFEST="$HOME/.claude/agent-factory/manifest.tsv"  # registry of spawned agents
 
 # Record a spawned agent so its session log can be filtered/purged later.
@@ -126,11 +145,21 @@ up() {
   # plus an appended system prompt telling it to escalate real blockers instead
   # of stalling silently. Opt out with AI_NOTIFY_OFF=1. printf %q keeps the whole
   # thing safe through the sh -c that tmux runs the command under.
+  # AF_MAIL is what makes an agent reachable by the RELIABLE channel: with it in
+  # the env, a sender can ring its doorbell by typing the path-free `!bash $AF_MAIL`
+  # (no slash → no autocomplete popup to swallow the Enter). The cap- marker below
+  # is how senders know this agent understands it. Agents spawned by older versions
+  # have neither, and senders fall back to the legacy payload-typing push for them.
   local full envpfx sysprompt
-  envpfx="$(printf 'AF_AGENT=%q AF_INBOX=%q AF_NOTIFY=%q AF_ROOT=%q' \
-            "$name" "$INBOX" "$NOTIFY" "${AF_ROOT:-/tmp/agent-factory}")"
+  envpfx="$(printf 'AF_AGENT=%q AF_SLUG=%q AF_INBOX=%q AF_NOTIFY=%q AF_MAIL=%q AF_MAILROOT=%q AF_ROOT=%q' \
+            "$name" "$SLUG" "$INBOX" "$NOTIFY" "$MAIL" "$MAILROOT" "${AF_ROOT:-/tmp/agent-factory}")"
+  mkdir -p "$MAILROOT"; : > "$MAILROOT/cap-$name"
   if [ "${AI_NOTIFY_OFF:-0}" != 1 ]; then
-    sysprompt="You are a spawned peer agent named '$name', launched by an orchestrator (another Claude) via the agent-factory skill. You run unattended with permissions skipped and no human necessarily watching. When you hit a real blocker you cannot resolve on your own — a decision only the orchestrator or a human can make, a missing secret or access you lack, an irreversible or destructive action you should not take alone, or repeated failure on the same step — do NOT stall silently. Escalate to your orchestrator by running: bash '$NOTIFY' 'one line: what you need'. That delivers the message tagged with your name ('$name'); then keep doing any work that does not depend on the answer. Escalate only genuine blockers, not routine progress. You may also send bash '$NOTIFY' --kind done 'summary' when you finish a long task."
+    sysprompt="You are a spawned peer agent named '$name', launched by an orchestrator (another Claude) via the agent-factory skill. You run unattended with permissions skipped and no human necessarily watching.
+
+MAIL — how you talk to the rest of the factory. Send: bash \$AF_MAIL send --to <agent> --kind <question|blocked|result|done|fyi> \"your message\". Read: bash \$AF_MAIL read (mail is also pushed to you automatically — when you see a MAIL block in your context, act on it and reply to the sender by mail). Your orchestrator is reachable as --to orchestrator.
+
+When you hit a real blocker you cannot resolve on your own — a decision only the orchestrator or a human can make, a missing secret or access you lack, an irreversible or destructive action you should not take alone, or repeated failure on the same step — do NOT stall silently: mail the orchestrator (--kind blocked), then keep doing any work that does not depend on the answer. Escalate only genuine blockers, not routine progress. Mail --kind done with a summary when you finish a long task."
     full="$(printf '%s claude %s --append-system-prompt %q' "$envpfx" "$launchflags" "$sysprompt")"
   else
     full="$(printf '%s claude %s' "$envpfx" "$launchflags")"
@@ -383,6 +412,68 @@ approve() {
 
 attach() { echo "tmux attach -t $(S "${1:-claude}")"; }
 
+# Register THIS orchestrator's tmux pane so spawned agents can WAKE it directly
+# (tmux send-keys) when they escalate — a true push into a live-but-idle session,
+# no polling, no Stop-hook busy-wait. Must run from inside the orchestrator's own
+# tmux session (launch it as: tmux new -s <slug>-lead 'claude'). Stored per-slug
+# so each project's agents wake their own orchestrator.
+register_self() {
+  if [ -z "${TMUX:-}" ]; then
+    echo "[ai] not inside tmux — can't register for send-keys wake."
+    echo "[ai]   relaunch the orchestrator in tmux:  tmux new -s ${SLUG}-lead 'claude'"
+    return 1
+  fi
+  local tgt; tgt="$(tmux display -p '#{session_name}:#{window_index}.#{pane_id}' 2>/dev/null)"
+  [ -z "$tgt" ] && { echo "[ai] couldn't resolve this tmux pane"; return 1; }
+  mkdir -p "$ORCHDIR" "$MAILROOT"
+  printf '%s' "$tgt" > "$ORCHDIR/orch-$SLUG"     # legacy escalation push
+  printf '%s' "$tgt" > "$MAILROOT/pane-orchestrator"   # mail doorbell target
+  # An orchestrator started WITH AF_MAIL in its env gets the clean path-free
+  # doorbell like any spawned agent. Started without it (a plain `claude` in
+  # tmux), senders fall back to typing the literal path — still works, just
+  # needs a popup-dismiss. Launch as: tmux new -s <slug>-lead 'AF_MAIL=<path> claude'
+  if [ -n "${AF_MAIL:-}" ]; then
+    : > "$MAILROOT/cap-orchestrator"
+    echo "[ai] registered orchestrator for slug '$SLUG' → pane $tgt (mail-capable)"
+  else
+    rm -f "$MAILROOT/cap-orchestrator"
+    echo "[ai] registered orchestrator for slug '$SLUG' → pane $tgt"
+    echo "[ai]   note: AF_MAIL not in this session's env — doorbell falls back to typing a literal path."
+    echo "[ai]   for the clean channel, launch the orchestrator as:"
+    echo "[ai]     tmux new -s ${SLUG}-lead 'AF_MAIL=$MAIL AF_MAILROOT=$MAILROOT AF_SLUG=$SLUG claude'"
+  fi
+  echo "[ai] agents can now WAKE this session with mail (no polling needed)."
+}
+unregister_self() {
+  rm -f "$ORCHDIR/orch-$SLUG" "$MAILROOT/pane-orchestrator" "$MAILROOT/cap-orchestrator"
+  echo "[ai] unregistered orchestrator for slug '$SLUG'"
+}
+
+# --- Mail (the reliable channel) ------------------------------------------
+# Thin front-ends onto mail.sh so the orchestrator drives the same transport its
+# agents use. `ai mail` reads THIS session's mailbox (as 'orchestrator'); `ai post`
+# sends to an agent, appending to its mailbox and ringing its doorbell.
+mail_() { AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" read "$@"; }
+post()  {
+  local to="${1:-}"; shift || true
+  [ -z "$to" ] && { echo "[ai] usage: ai post <agent> [--kind K] <text>"; return 1; }
+  AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" \
+    bash "$MAIL" send --to "$to" "$@"
+}
+# Unread count per mailbox — the retry/ack signal. A sender that sees its message
+# still unread after a while can ring again (or conclude the agent is dead).
+mailstat() {
+  mkdir -p "$MAILROOT"
+  local box who n
+  shopt -s nullglob
+  for box in "$MAILROOT"/*.jsonl; do
+    who="$(basename "$box" .jsonl)"
+    n="$(AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" unread --agent "$who")"
+    printf '  %-14s %s unread\n' "$who" "$n"
+  done
+  shopt -u nullglob
+}
+
 # Relaunch a previously-`down`ed agent WITH its full memory, by resuming its
 # recorded session. `down` keeps the log; only `afctl purge` deletes it — so
 # revive works any time the log still exists. Resolves the session id from (in
@@ -405,8 +496,10 @@ revive() {
 revivable() {
   [ -f "$MANIFEST" ] || { echo "[ai] no manifest — nothing spawned yet"; return; }
   local out
-  # latest manifest row per ai/<name>, then keep only downed-with-surviving-log
-  out="$(awk -F'\t' '$2=="ai"{seen[$3]=$4} END{for(n in seen) print n"\t"seen[n]}' "$MANIFEST" \
+  # latest manifest row per ai/<name>, scoped to THIS project (cwd col), then
+  # keep only downed-with-surviving-log. cwd-scoping keeps slug/session names
+  # consistent (same cwd → same slug → S() resolves correctly).
+  out="$(awk -F'\t' -v cwd="$CWD" '$2=="ai" && $5==cwd {seen[$3]=$4} END{for(n in seen) print n"\t"seen[n]}' "$MANIFEST" \
         | while IFS=$'\t' read -r name id; do
             [ -z "$id" ] && continue
             tmux has-session -t "$(S "$name")" 2>/dev/null && continue   # running → not "revivable"
@@ -426,28 +519,19 @@ down() {
 
 list() { tmux ls 2>/dev/null | grep '^ai-' || echo "[ai] none"; _inbox_hint; }
 
-# --- Agent→orchestrator escalations ---------------------------------------
-# Spawned agents post blockers to $INBOX via notify.sh (see `up`). The
-# orchestrator (this session) reads them here. `inbox --drain` prints then
-# clears so the same escalation isn't re-reported next turn.
-inbox() {
-  local f="$INBOX" drain=0 ts name kind msg hhmm
-  [ "${1:-}" = "--drain" ] && drain=1
-  [ -s "$f" ] || { echo "[ai] no notifications from spawned agents"; return; }
-  echo "[ai] notifications from spawned agents:"
-  while IFS=$'\t' read -r ts name kind msg; do
-    # BSD (macOS) `date -r`, GNU `date -d @`; fall back to the raw epoch.
-    hhmm="$(date -r "$ts" +%H:%M:%S 2>/dev/null || date -d "@$ts" +%H:%M:%S 2>/dev/null || echo "$ts")"
-    printf '  %s  %-10s [%s]  %s\n' "$hhmm" "$name" "$kind" "$msg"
-  done < "$f"
-  [ "$drain" = 1 ] && { : > "$f"; echo "[ai] (inbox drained)"; }
-}
-# One-line nudge appended to ask/list output when escalations are waiting, so
-# the orchestrator notices an agent that blocked while it was doing other work.
+# --- Escalations ----------------------------------------------------------
+# `inbox` is the old name for "show me what agents sent"; mail is where that
+# lives now, so it just forwards. The shared TSV it used to read is dead — no
+# code writes it any more.
+inbox() { mail_; }
+
+# One-line nudge appended to ask/list output when mail is waiting, so the
+# orchestrator notices an agent that blocked while it was doing other work.
 _inbox_hint() {
-  [ -s "$INBOX" ] || return 0
-  local n; n="$(grep -c '' "$INBOX" 2>/dev/null)"; [ "${n:-0}" -gt 0 ] || return 0
-  echo "[ai] ⚠ $n pending escalation(s) from spawned agents — ai inbox"
+  local n; n="$(AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" \
+                AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" unread 2>/dev/null)"
+  [ "${n:-0}" -gt 0 ] || return 0
+  echo "[ai] ⚠ $n unread message(s) from spawned agents — ai mail"
 }
 
 cmd="${1:-}"; shift || true
@@ -456,7 +540,11 @@ case "$cmd" in
   screen) screen "$@" ;;  ask) ask "$@" ;;  approve) approve "$@" ;;  attach) attach "$@" ;;
   ctx) ctx "$@" ;;  compact) compact "$@" ;;  remote) remote "$@" ;;
   wait) wait_ "$@" ;;  result) result "$@" ;;  inbox) inbox "$@" ;;
+  mail) mail_ "$@" ;;  post) post "$@" ;;  mailstat) mailstat ;;
+  register-self) register_self ;;  unregister-self) unregister_self ;;  slug) echo "$SLUG" ;;
   revive) revive "$@" ;;  revivable) revivable ;;
   down) down "$@" ;;  list) list ;;
-  *) sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  # Help = the header comment, printed up to the first non-comment line. Derived,
+  # not a hardcoded line range — so editing the header can't silently truncate it.
+  *) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}" ;;
 esac

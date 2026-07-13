@@ -90,6 +90,30 @@ list                 list running interactive agents
 - **Filterable logs.** Every spawned agent's `--session-id` is recorded in
   `~/.claude/agent-factory/manifest.tsv`, so `afctl purge` removes exactly the
   factory logs and never your manual sessions.
+- **Mail is the channel between agents — the push carries a doorbell, not the
+  letter.** `mail.sh` appends the message to the recipient's mailbox
+  (`.ai/<slug>/mail/<agent>.jsonl`) and types one fixed, path-free command into
+  their pane: `!bash $AF_MAIL read`. The payload never goes through the keyboard,
+  so quotes, backslashes, regexes and newlines survive intact. Three properties
+  fall out of the TUI's own behaviour, each verified on a live agent:
+  - `!cmd` runs the command **and** triggers a model turn, so one keystroke burst
+    both delivers and wakes — no tool-call spent deciding to go look.
+  - Typed at a **busy** agent it queues and fires exactly at the turn boundary, so
+    mail can never interrupt work in progress.
+  - `$AF_MAIL` expands (shell mode inherits the agent's env), so the typed text
+    holds no slash and the file-autocomplete popup — which silently swallows the
+    Enter — never opens.
+
+  The mailbox **cursor is the ack**: `mail read` advances it, so a sender can see
+  its message is still unread and ring again. Nothing is lost if the recipient was
+  dead, busy, or restarted mid-delivery.
+- **Mailboxes are per-slug.** They used to be one global inbox shared by every
+  project on the machine, which meant a session in one repo could be woken with —
+  and told to answer — another repo's escalations. (It happened.) `.ai/<slug>/mail/`
+  makes that impossible by construction.
+- **Escape clears the input line, it does not just close a popup.** Anything that
+  types into a TUI must Escape *before* typing, never after: a post-typing Escape
+  wipes the command you just sent.
 
 ## Packaged as a skill
 
@@ -103,6 +127,10 @@ up the agent logs" invoke it automatically.
 ```
 factory/
 ├── ai.sh           interactive TUI agents (primary)
+├── mail.sh         agent↔agent transport: mailbox + doorbell + cursor-as-ack
+├── notify.sh       thin alias for `mail.sh send` (stable entry point for older agents)
+├── hooks/
+│   └── escalation-stop-hook.sh   wakes an idle orchestrator when mail arrives
 ├── af.sh           headless FIFO-bus workers
 ├── worker.sh       the worker loop af.sh launches
 ├── afctl.sh        session-log cleanup (manifest-based)

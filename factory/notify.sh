@@ -1,27 +1,32 @@
 #!/usr/bin/env bash
-# notify — a SPAWNED agent calls this to escalate a blocker to its orchestrator
-# (the Claude session that launched it via agent-factory). It's the agent→orch
-# back-channel: when a spawned agent gets stuck on something it can't resolve
-# alone, instead of stalling silently it posts a one-line message to a shared
-# inbox that the orchestrator reads with `ai inbox`.
+# notify — thin alias for `mail.sh send`. Kept ONLY as a stable entry point.
 #
-#   notify.sh "<what I need>"                 # kind defaults to "blocked"
-#   notify.sh --kind question "<what I need>" # e.g. question | blocked | done | fyi
+# This used to be the transport: it appended to a shared TSV inbox and typed the
+# whole message into the recipient's TUI. mail.sh replaced it (payload in a file,
+# doorbell in the pane, cursor as ack — see mail.sh for why that is the reliable
+# design). All of that logic is GONE from here; this file now just forwards.
 #
-# Identity + inbox path are injected into the agent's environment at spawn time
-# (AF_AGENT, AF_INBOX), so the agent doesn't need to know its own name or where
-# the inbox lives — it just runs this. Each line is: epoch \t name \t kind \t msg.
+# Why keep the file at all: agents spawned by earlier versions have
+# `bash $AF_NOTIFY …` baked into their system prompt, and their resumed context is
+# full of past calls to it. Deleting the file would make their escalations fail
+# with "No such file" — silently, exactly when they need to be heard. So the entry
+# point stays and routes to the real channel; the duplicated transport does not.
+#
+#   notify.sh "<what I need>"          # → orchestrator, kind "blocked"
+#   notify.sh --to <agent> "<text>"    # → a peer agent
+#   notify.sh --kind question "<text>" # kind: question | blocked | result | done | fyi
 set -uo pipefail
 
-name="${AF_AGENT:-unknown}"
-inbox="${AF_INBOX:-${AF_ROOT:-/tmp/agent-factory}/inbox.tsv}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+to="orchestrator"
 kind="blocked"
-if [ "${1:-}" = "--kind" ]; then kind="${2:-blocked}"; shift 2 || true; fi
-msg="$*"
-[ -z "$msg" ] && { echo "usage: notify.sh [--kind K] <message>"; exit 1; }
+while [ "${1:-}" ] ; do
+  case "$1" in
+    --to)   to="${2:-orchestrator}"; shift 2 || break ;;
+    --kind) kind="${2:-blocked}";    shift 2 || break ;;
+    *) break ;;
+  esac
+done
+[ -z "$*" ] && { echo "usage: notify.sh [--to <agent>] [--kind K] <message>"; exit 1; }
 
-# One physical line per notification (tabs/newlines in msg would corrupt the TSV).
-msg="$(printf '%s' "$msg" | tr '\t\n' '  ')"
-mkdir -p "$(dirname "$inbox")"
-printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$name" "$kind" "$msg" >> "$inbox"
-echo "[notify] escalated to orchestrator as '$name' ($kind): $msg"
+exec bash "$HERE/mail.sh" send --to "$to" --kind "$kind" --from "${AF_AGENT:-unknown}" "$*"
