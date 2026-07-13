@@ -439,7 +439,7 @@ limit hook and no statusline. Give it one with `ai down <name> && line up --resu
 ## Timers — `polling.sh` (the same message, on a clock)
 
 ```bash
-polling start <agent> <interval> "<message>" [--times N] [--kind K]
+polling start <agent> <minutes> "<message>" [--times N] [--kind K]
 polling stop  [agent]        # no agent = $AF_AGENT: an agent switching ITS OWN timer off
 polling list                 # every timer on this line
 polling status <agent>
@@ -461,8 +461,8 @@ Three ways a timer turns on you, and what stops each:
   than hand a ghost's orders to a stranger. (A resumed agent keeps its sid, so it keeps
   its timer. A fresh spawn gets a clean slate.)
 - **It outruns its agent.** A tick is **skipped while the previous one is still unread** —
-  the timer can never build a backlog, one outstanding message ever. The interval floor is
-  60s (`AI_POLL_MIN` to override, deliberately).
+  the timer can never build a backlog, one outstanding message ever. The floor is 1 minute
+  (`AI_POLL_MIN` to override, deliberately).
 - **Everyone forgets it exists.** `--times N` bounds it, `polling list` shows every live
   one, and the **agent can switch itself off** — `bash $AF_POLL stop`, no argument. It is
   the one that knows the wait is over. The first tick tells it so; the rest don't repeat it.

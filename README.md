@@ -14,7 +14,7 @@ ephemeral subagents.
 | **`factory/ai.sh`** | A real interactive Claude **TUI** in a detached tmux session, driven via `tmux send-keys` and read via `tmux capture-pane`. | You want a real, tool-using Claude you can watch and drive. Default. |
 | **`factory/mail.sh`** | The **channel between agents**: mailbox + doorbell + cursor-as-ack. | Agents talking to each other, reliably. |
 | **`factory/limits.sh`** | Survives the **account-wide usage limit**: a token-free shell watcher that learns the exact reset time from the statusline JSON, waits, and tells the cut-off agents to carry on. | Your subscription limit lands mid-work and kills every agent at once. |
-| **`factory/polling.sh`** | A **timer**: the same message to one agent every N seconds, delivered as mail. Dies with its agent; skips a tick while the last one is unread; the agent can switch it off itself. | An agent has to keep checking something — a deploy, a queue, a branch that will land. |
+| **`factory/polling.sh`** | A **timer**: the same message to one agent every N minutes, delivered as mail. Dies with its agent; skips a tick while the last one is unread; the agent can switch it off itself. | An agent has to keep checking something — a deploy, a queue, a branch that will land. |
 | **`factory/af.sh`** | A **headless worker** (`claude -p` loop) driven over a FIFO message bus, persistent `--resume` session. | Programmatic request→reply, autonomous loops, agent-to-agent chains. |
 | **`factory/afctl.sh`** | Cleanup of spawned agents' session logs via a session-id manifest. | Purge factory logs without touching your manual sessions. |
 
