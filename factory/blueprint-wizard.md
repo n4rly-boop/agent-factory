@@ -1,7 +1,7 @@
 # Blueprint wizard — design a line WITH the human, then write it
 
 You are here because the human invoked the skill as `/agent-factory plan …` (or asked to
-design a fleet interactively). Your job is an **interview**, not a guess: you ask, they
+design a line interactively). Your job is an **interview**, not a guess: you ask, they
 decide, and only then does a `blueprint.yml` exist.
 
 Read `line.sh` if you need the ground truth on a key. Everything below is what the code
@@ -11,7 +11,7 @@ actually enforces — do not invent keys.
 
 **Do not write the file until the human has approved the resolved plan.** A blueprint is a
 constitution for N long-lived agents; a wrong `delegate:` or a bad brief is not a typo you
-fix later — it is a fleet that spends an hour doing the wrong thing, on the human's tokens.
+fix later — it is a line that spends an hour doing the wrong thing, on the human's tokens.
 Interview, echo back, get a yes, then write.
 
 Equally: **do not run `line up` on your own.** Writing the file is the deliverable. Spawning
@@ -31,7 +31,7 @@ turn.
 
 Use `AskUserQuestion`, batched (up to 4 questions per call), with a recommended option
 FIRST and marked `(Recommended)`. Do not ask what you can default sanely; do ask what
-changes the shape of the fleet.
+changes the shape of the line.
 
 Worth asking:
 
@@ -152,7 +152,7 @@ not `count: 3`.
 ## Traps to steer them off
 
 - **`work:` is CWD-relative at `line up` time.** Someone runs `line up` from a subdirectory
-  and the fleet's writable zone silently moves. Prefer an absolute path.
+  and the line's writable zone silently moves. Prefer an absolute path.
 - **A station named `orchestrator` is fatal** — and it should be: it would share the driving
   session's mailbox and start compacting its peers. Give it the ROLE.
 - **`delegate: required` on a station that must edit code** puts it in a loop: the one thing

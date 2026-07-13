@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # line — bring up a whole production line of agents from one blueprint.
 #
-# The problem it solves: a fleet's design (who exists, who reports to whom, who
+# The problem it solves: a line's design (who exists, who reports to whom, who
 # may only delegate, who gets the cheap model) is the part that is easiest to get
 # wrong and hardest to remember. Written as a prompt, it decays: you spawn five
 # agents, tell each its role once, and thirty turns later nobody remembers they
@@ -100,7 +100,7 @@ def dlevel(v, default=''):
     if s in ('advised','advise','soft','nudge','1','true','yes','on'): return 'advised'
     if s in ('no','false','off','0','none',''):                        return ''
     raise SystemExit("[line] FATAL: delegate: %r is not one of "
-                     "required | advised | no — refusing to spawn a fleet whose "
+                     "required | advised | no — refusing to spawn a line whose "
                      "enforcement you did not mean." % v)
 
 rows, names = [], []
@@ -150,7 +150,7 @@ for nm, cfg in names:
 
 # Emit only after EVERY station validates. Printing as we went meant a blueprint that
 # died on station 3 had already emitted stations 1-2 — and `line up`, which reads this
-# as a stream, would spawn that half-fleet and never see the error. Validate, then emit.
+# as a stream, would spawn that half a line and never see the error. Validate, then emit.
 for r in rows:
     print(r)
 PY
@@ -258,7 +258,7 @@ print(v if str(v).isdigit() else "")' "$bp" 2>/dev/null)"
     [ -z "$name" ] && continue
     # `ai up` kills any existing session for the name before relaunching. Run
     # `line up` twice — a habit, after an edit to one station's brief — and it would
-    # tear down the whole live fleet, every agent's TUI, mid-task. Alive stays alive;
+    # tear down the whole live line, every agent's TUI, mid-task. Alive stays alive;
     # bring one back deliberately (`ai revive <name>`) or take it down first.
     local dlabel=""
     case "$delegate" in
@@ -313,7 +313,7 @@ print(v if str(v).isdigit() else "")' "$bp" 2>/dev/null)"
       printf '[line] %-10s FAILED TO LAUNCH — check: bash %s up %s\n' "$name" "$AI" "$name"
     fi
   done <<< "$rows"
-  # line.json: the fleet-level facts no per-agent spec can hold — which blueprint
+  # line.json: the line-level facts no per-agent spec can hold — which blueprint
   # this line came from, and who is on it. Written once, by the single process that
   # brought the line up, so it has no concurrent writer.
   local lslug; lslug="$(_plan "$bp" | head -1 | cut -d$'\x1f' -f1)"

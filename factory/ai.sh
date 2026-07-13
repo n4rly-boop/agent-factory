@@ -119,8 +119,8 @@ sys.stdout.buffer.write(b.strip())
 '
 }
 # agent-<name>.json, not <name>.json: an agent named `line` would otherwise share a
-# path with the fleet file line.json. `line up` wrote the spec, then overwrote it with
-# the fleet metadata — and `ai revive line` read a JSON with no flags and no env, i.e.
+# path with the line-level file line.json. `line up` wrote the spec, then overwrote it with
+# the line-level metadata — and `ai revive line` read a JSON with no flags and no env, i.e.
 # revived it with no role and no wall while reporting success.
 _specfile() { echo "$SPECDIR/agent-$1.json"; }
 
@@ -799,16 +799,16 @@ post()  {
 }
 
 # The context guard only fires where ai.sh happens to hold control at the end of an
-# agent's turn — and a mail-driven fleet gives it no such moment (see `sweep`). That
+# agent's turn — and a mail-driven line gives it no such moment (see `sweep`). That
 # left `sweep` needing to be REMEMBERED, and "the model will remember" is exactly the
 # guarantee that has silently failed in this system before. So every command that
-# touches the fleet sweeps first: `post` (handing out work), `mail` (collecting it).
+# touches the line sweeps first: `post` (handing out work), `mail` (collecting it).
 # Turn it off with AI_SWEEP_OFF=1.
 #
 # Only an ORCHESTRATOR sweeps: a worker running `ai mail` in its own session must not
 # start compacting its peers. Orchestrator means either this top session (no AF_AGENT)
 # or an agent whose ROLE is orchestrator — a line's own orc is named whatever the
-# blueprint called it, and testing the NAME left the autonomous fleet (orc drives the
+# blueprint called it, and testing the NAME left the autonomous line (orc drives the
 # workers by mail; the human never touches ai.sh) with no sweeps at all — exactly the
 # case this was built for.
 _autosweep() {
@@ -840,9 +840,9 @@ _self_ctx_warn() {
   return 0
 }
 
-# Compaction for a MAIL-DRIVEN fleet. `_maybe_autocompact` only ever ran from
+# Compaction for a MAIL-DRIVEN line. `_maybe_autocompact` only ever ran from
 # `ask`, but a line's agents are driven by mail, not by `ask` — so the context
-# guard never applied to the very fleet it was built for. `sweep` walks every
+# guard never applied to the very line it was built for. `sweep` walks every
 # agent with a mailbox and applies the same two thresholds at a safe point.
 sweep() {
   local skip="${1:-}"   # an agent the caller is about to touch — see `post`

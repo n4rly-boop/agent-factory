@@ -1,4 +1,4 @@
-# Example line: a reviewer fleet. Copy, edit, `line.sh plan` it, then `line.sh up` it.
+# Example: a code-review line. Copy, edit, `line.sh plan` it, then `line.sh up` it.
 # Every key here is read by line.sh; nothing else is. See blueprint-wizard.md.
 
 slug: review                    # mailbox + tmux namespace → ai-review-lead, ai-review-sec, …

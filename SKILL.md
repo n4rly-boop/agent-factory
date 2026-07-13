@@ -6,7 +6,7 @@ description: >-
   whenever the user wants to launch/spawn/open another agent or "a second
   Claude", drive or chat with a peer/worker agent, run agents that talk to each
   other, revive a killed agent, or list/clean up previously spawned agents and
-  their session logs. ALSO use it to stand up a whole TEAM/FLEET of agents with
+  their session logs. ALSO use it to stand up a whole TEAM of agents — a LINE — with
   roles and a hierarchy (orchestrator + workers, parallel multi-agent experiments,
   ablations) — that is `line.sh` with a blueprint.yml. Invoked as `/agent-factory
   plan <goal>` it runs an INTERACTIVE blueprint wizard: it interviews the user,
@@ -23,9 +23,9 @@ with them across many turns. They are NOT subagents: each has its own context
 window and session, persists across your turns until explicitly `down`ed, and can
 be watched live by the human.
 
-- **`line.sh` — a whole fleet from one `blueprint.yml`.** Roles, chain of command,
+- **`line.sh` — a whole line from one `blueprint.yml`.** Roles, chain of command,
   per-agent model, enforced delegation. Use this the moment the user wants a *team*
-  rather than an agent. See "Fleets".
+  rather than an agent. See "Lines".
 - **`ai.sh` — a real interactive Claude TUI** in a detached tmux session. You drive
   it with `tmux send-keys` and read it with `tmux capture-pane`. **Default for a
   single agent.**
@@ -40,7 +40,7 @@ Scripts live in `scripts/` next to this file. Reference them by absolute path:
 ## Invoked as `/agent-factory plan …` — run the blueprint wizard
 
 If the skill was invoked with `plan` (with or without a goal after
-it), or the user asks to design a fleet *with* you rather than hand you a finished
+it), or the user asks to design a line *with* you rather than hand you a finished
 blueprint: **read `$SKILL/scripts/blueprint-wizard.md` and follow it.** It is an
 interview protocol — you ask, they decide, and a `blueprint.yml` exists only after they
 approve the resolved plan. Do not improvise a blueprint from this file's schema snippet;
@@ -166,7 +166,7 @@ Absolute token counts; set either to `0` to disable. Per-station in a blueprint:
 
 **Where it fires matters.** `ai.sh` is a script, not a daemon: it can only check an
 agent's context at a moment when it happens to hold control right after that agent's
-turn. `ask` is such a moment (it waited for the turn). A **fleet** agent is driven by
+turn. `ask` is such a moment (it waited for the turn). A **line** agent is driven by
 *mail* and takes its turns while `ai.sh` isn't even running — so there is no hook
 point, and nothing guards it. **`ai.sh sweep` is that guard**: it walks every agent
 with a mailbox and compacts the ones past threshold, skipping any that is
@@ -174,7 +174,7 @@ mid-generation or paused on a permission prompt (keystrokes would interrupt the 
 or answer the prompt for the human).
 
 **You do not have to remember to call it.** `ai.sh post` and `ai.sh mail` — the two
-commands that touch a fleet — run a sweep themselves (`AI_SWEEP_OFF=1` disables that).
+commands that touch a line — run a sweep themselves (`AI_SWEEP_OFF=1` disables that).
 `post` sweeps **before** it sends, and skips the recipient — compacting an agent in the
 same breath as handing it a task is a race with nothing to gain. Each agent is judged
 by **its own** thresholds, taken from its spec, not the orchestrator's env.
@@ -195,7 +195,7 @@ guards, and it is the longest-lived agent on the line. For that case `post`/`mai
 print a warning to `orc` when its own context is past threshold: it has to run
 `/compact` itself, at a safe point of its choosing.
 
-## Fleets — `line.sh` (when the user wants a team)
+## Lines — `line.sh` (when the user wants a team)
 
 **No blueprint yet? Do not write one from the snippet below — run the wizard**
 (`$SKILL/scripts/blueprint-wizard.md`): interview the human, propose the stations, write
@@ -246,7 +246,7 @@ what the model is thinking about. So:
   standing orders on **every** prompt, for ~25 tokens. It cannot drift.
 - **`delegate-wall`** (`PreToolUse` on Write/Edit/MultiEdit/NotebookEdit/Bash)
   decides what a mini-orchestrator may write.
-- **`caveman: true`** keeps output terse — a fleet's token cost is dominated by
+- **`caveman: true`** keeps output terse — a line's token cost is dominated by
   agents talking to each other.
 
 ### `delegate:` — three levels
@@ -263,7 +263,7 @@ must not touch code itself. A bare `delegate: true` means `advised`. (Aliases ar
 accepted — `hard`/`block`/`wall`/`full` → required; `advise`/`soft`/`nudge`/`1`/`true`/`yes`/`on`
 → advised; `0`/`false`/`off`/`none` → no. Write the canonical three.)
 
-**An unknown value is fatal** — `line up` refuses to spawn the fleet. (`delegate:
+**An unknown value is fatal** — `line up` refuses to spawn the line. (`delegate:
 requird` used to mean "no hook at all", i.e. a typo silently produced an unwalled
 agent — failing open past even the default.)
 
@@ -361,7 +361,7 @@ and standing orders: on a real blocker it can't resolve — a decision only you 
 human can make, a missing secret, an irreversible action, repeated failure — it mails
 instead of stalling silently. Agents also mail **each other**
 (`mail.sh send --to <peer>`), so work moves between stations without going through
-you. (For a `line.sh` fleet those orders come from the station's brief and system
+you. (For a `line.sh` line those orders come from the station's brief and system
 prompt; `AI_NOTIFY_OFF=1`, which `line.sh` sets, only suppresses `ai.sh`'s own
 generic escalation prompt — the mailbox and `$AF_MAIL` are there either way.)
 

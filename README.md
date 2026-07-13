@@ -18,7 +18,7 @@ ephemeral subagents.
 
 ## A line, from a blueprint
 
-A fleet's design — who exists, who reports to whom, who may only delegate, who
+A line's design — who exists, who reports to whom, who may only delegate, who
 gets the cheap model — is the part that decays fastest when you carry it in a
 prompt. Spawn five agents, tell each its role once, and thirty turns later
 nobody remembers they were supposed to delegate. So it goes in a file, and hooks
@@ -59,6 +59,25 @@ bash factory/line.sh up     blueprint.yml   # briefs + settings + spawn
 bash factory/line.sh status blueprint.yml   # alive? context size? unread mail?
 bash factory/line.sh down   blueprint.yml
 ```
+
+### You don't have to write the blueprint yourself
+
+```
+/agent-factory plan <what the line is for>
+```
+
+This runs an **interview**, not a generator. Claude reads the repo first, proposes the
+stations and what each one owns, asks the four questions that actually change the shape
+of the line (topology, models, `delegate:` level, the writable zone), writes the briefs,
+and shows you the resolved plan. Only then does a `blueprint.yml` exist. It validates it
+with `line plan` and stops — spawning stays a separate, explicit yes.
+
+The protocol is `factory/blueprint-wizard.md`; `factory/blueprint.example.yml` is a
+complete annotated line to copy from by hand.
+
+The reason it is an interview and not a one-shot generator: a blueprint is a constitution
+for N long-lived agents. A vague brief or a wrong `delegate:` is not a typo you fix on the
+next turn — it is an hour of the wrong work, already done, on your tokens.
 
 Each station gets a generated `work/entrypoint-<name>.md` (the full brief) and a
 private settings file wiring two hooks. **Roles are enforced, not requested:**
@@ -325,7 +344,7 @@ commands it names.
 
 ```
 factory/
-├── line.sh         a whole fleet from one blueprint.yml (roles, hierarchy, models)
+├── line.sh         a whole line from one blueprint.yml (roles, hierarchy, models)
 ├── ai.sh           interactive TUI agents (primary)
 ├── mail.sh         agent↔agent transport: mailbox + doorbell + cursor-as-ack
 ├── notify.sh       thin alias for `mail.sh send` (stable entry point for older agents)
