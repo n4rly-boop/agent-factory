@@ -28,8 +28,13 @@ printf 'ROLE: you are %s (%s). Report to: %s.' "$agent" "$role" "$parent"
 printf ' Mail: bash $AF_MAIL send --to <agent> --kind <question|blocked|result|done|fyi> "…".'
 
 # The two rules that decay fastest under load, so they are the two we repeat.
-if [ "${AF_DELEGATE:-}" = "required" ]; then
-  printf ' You are a MINI-ORCHESTRATOR: do not do the work yourself — dispatch it via the delegate-to-local-model skill (the only route that can WRITE; a Task subagent inherits your wall and cannot), or mail the peer who owns the area. Then verify the result. Your own writes are confined to %s/.' "$work"
-fi
+case "${AF_DELEGATE:-}" in
+  required)
+    printf ' You are a MINI-ORCHESTRATOR: do not do the work yourself — dispatch it via the delegate-to-local-model skill (the only route that can WRITE; a Task subagent inherits your wall and cannot), or mail the peer who owns the area. Then verify the result. Your own writes are confined to %s/.' "$work" ;;
+  advised)
+    # Both halves, always. "Delegate" on its own is how you get an agent farming out a
+    # two-line fix to an external model — the rule has to carry its own boundary.
+    printf ' You are a MINI-ORCHESTRATOR: delegate BULK/mechanical work (many items, boilerplate, spec-code, first drafts, big logs) via delegate-to-local-model, or mail the peer who owns it, then verify. Small surgical edits: just make them yourself.' ;;
+esac
 [ "${AF_CAVEMAN:-}" = "1" ] && printf ' Answer in caveman: drop articles/filler/hedging, keep every technical fact exact.'
 printf '\n'

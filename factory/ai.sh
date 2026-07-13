@@ -153,7 +153,7 @@ _writespec() {
   local name="$1" sid="$2" flags="$3"
   mkdir -p "$SPECDIR"
   local v env_kv="" ai_kv=""
-  for v in AF_ROLE AF_PARENT AF_PEERS AF_DELEGATE AF_CAVEMAN AF_WORK; do
+  for v in AF_ROLE AF_PARENT AF_PEERS AF_DELEGATE AF_BULK_LINES AF_CAVEMAN AF_WORK; do
     [ -n "${!v:-}" ] && env_kv="$env_kv$v=${!v}"$'\x1f'
   done
   for v in AI_COMPACT_SOFT AI_COMPACT_HARD AI_NOTIFY_OFF AI_SKIP_PERMS; do
@@ -350,7 +350,7 @@ up() {
   # reminder hook reads them to restate the chain of command, the delegate-wall
   # reads them to decide what it may write. Unset ⇒ a plain unmanaged agent.
   local v
-  for v in AF_ROLE AF_PARENT AF_PEERS AF_DELEGATE AF_CAVEMAN AF_WORK; do
+  for v in AF_ROLE AF_PARENT AF_PEERS AF_DELEGATE AF_BULK_LINES AF_CAVEMAN AF_WORK; do
     [ -n "${!v:-}" ] && envpfx="$envpfx $(printf '%s=%q' "$v" "${!v}")"
   done
   mkdir -p "$MAILROOT"; : > "$MAILROOT/cap-$name"
@@ -829,11 +829,18 @@ revive() {
           bash "$HERE/line.sh" settings "$SLUG" "$name" "$st" >/dev/null 2>&1 || true
         fi
         if ! _hooks_ok "$st"; then
-          echo "[ai] refusing to revive '$name': its hooks are missing or not executable, so they would FAIL OPEN"
-          echo "[ai]   (Claude Code runs the tool anyway on a hook error — the delegate-wall would be a wall-shaped hole.)"
-          echo "[ai]   settings: $st"
-          [ "$force" != 1 ] && return 1
-          echo "[ai] AI_FORCE=1 — reviving '$name' UNWALLED anyway."
+          # Only a `required` station is REFUSED. Its whole point is that the wall is
+          # load-bearing, and a fail-open hook silently removes it. An `advised` station
+          # loses a nudge, not a guarantee — worth saying, not worth blocking on.
+          if [ "${AF_DELEGATE:-}" = "required" ]; then
+            echo "[ai] refusing to revive '$name': it is delegate:required, and its hooks are missing or not executable, so they would FAIL OPEN"
+            echo "[ai]   (Claude Code runs the tool anyway on a hook error — the wall would be a wall-shaped hole.)"
+            echo "[ai]   settings: $st"
+            [ "$force" != 1 ] && return 1
+            echo "[ai] AI_FORCE=1 — reviving '$name' UNWALLED anyway."
+          else
+            echo "[ai] ⚠ '$name' hooks are not executable — its role-reminder and delegate advice will be missing"
+          fi
         fi
       fi
       echo "[ai] restored spec: role=${AF_ROLE:-none} parent=${AF_PARENT:-none} delegate=${AF_DELEGATE:-no} model=$(_spec_get "$sf" model)"
@@ -893,10 +900,14 @@ print("%s\x1f%s\x1f%s\x1f%s" % (e.get("AF_ROLE",""), e.get("AF_PARENT",""),
     # with no settings file at all. The single place an operator would look to notice
     # a missing wall was reading the wrong column, and always said the wall was there.
     wall=""
-    if [ "$delegate" = "required" ]; then
-      if [ -n "$settings" ] && _hooks_ok "$settings" 2>/dev/null; then wall="  [wall]"
-      else wall="  !! NO WALL (hooks missing/not executable)"; fi
-    fi
+    case "$delegate" in
+      required)
+        if [ -n "$settings" ] && _hooks_ok "$settings" 2>/dev/null; then wall="  [wall]"
+        else wall="  !! NO WALL (hooks missing/not executable)"; fi ;;
+      advised)
+        if [ -n "$settings" ] && _hooks_ok "$settings" 2>/dev/null; then wall="  [advise]"
+        else wall="  [advise: hooks broken]"; fi ;;
+    esac
     unread="$(AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" unread --agent "$name" 2>/dev/null)"
     printf '%-10s %-14s %-8s %-8s %8s %5s %-6s %s\n' \
       "$name" "${role:--}" "${model:-default}" "${parent:--}" "${ctx:--}" "${unread:-0}" "${state:--}" \

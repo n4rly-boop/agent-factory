@@ -75,6 +75,34 @@ def flag(v, default=False):
     if isinstance(v, bool): return v
     return str(v).strip().lower() in ('1','true','yes','required','full','on')
 
+# delegate is three-valued, not boolean:
+#   required  hard wall — every write outside work/ is denied, whatever its size
+#   advised   never blocks; a BULK write outside work/ gets a note in the model's
+#             context suggesting delegate-to-local-model. The default.
+#   ''        no hook at all
+# The default moved from `required` to `advised` after watching a `required` agent
+# spin up an external LLM to write a single line, because a one-line write was the
+# one thing it was not allowed to do itself. Delegation pays on bulk; on a three-line
+# fix it is pure overhead. A bare `delegate: true` therefore means advised, not
+# required — say `required` if you mean it.
+#
+# An UNKNOWN value is a hard error, not a shrug. It used to fall through to '' — no hook
+# at all — so `delegate: requird` (typo) on a station meant to be walled spawned with no
+# wall, no advisory, and no delegate clause in its prompts, and nothing said a word. A
+# typo maximised the downgrade: it failed open past even the default. `delegate: full`
+# has the same shape — it meant `required` before this change and would have silently
+# become nothing.
+def dlevel(v, default=''):
+    if v is None: return default
+    if isinstance(v, bool): return 'advised' if v else ''
+    s = str(v).strip().lower()
+    if s in ('required','hard','block','wall','full'):                 return 'required'
+    if s in ('advised','advise','soft','nudge','1','true','yes','on'): return 'advised'
+    if s in ('no','false','off','0','none',''):                        return ''
+    raise SystemExit("[line] FATAL: delegate: %r is not one of "
+                     "required | advised | no — refusing to spawn a fleet whose "
+                     "enforcement you did not mean." % v)
+
 rows, names = [], []
 for name, cfg in agents.items():
     cfg = cfg or {}
@@ -96,7 +124,7 @@ for nm, cfg in names:
     # 'orc': mail into a mailbox nobody reads, and not one error anywhere.
     parent   = cfg.get('parent') or ('' if role == 'orchestrator' else orch)
     model    = cfg.get('model') or d.get('model') or ''
-    delegate = 'required' if flag(cfg.get('delegate'), flag(d.get('delegate'))) else ''
+    delegate = dlevel(cfg.get('delegate'), dlevel(d.get('delegate'), 'advised'))
     caveman  = '1' if flag(cfg.get('caveman'), flag(d.get('caveman'))) else ''
     soft     = str(cfg.get('compact_soft') or d.get('compact_soft') or '')
     hard     = str(cfg.get('compact_hard') or d.get('compact_hard') or '')
@@ -110,7 +138,13 @@ for nm, cfg in names:
     # Windows path silently mangles, and a \c TRUNCATES the rest of the file.
     # Briefs are data — they must survive verbatim.
     b64 = base64.b64encode(brief.encode()).decode()
-    print('\x1f'.join([slug, work, nm, role, parent, model, delegate, caveman, soft, hard, peers, b64]))
+    rows.append('\x1f'.join([slug, work, nm, role, parent, model, delegate, caveman, soft, hard, peers, b64]))
+
+# Emit only after EVERY station validates. Printing as we went meant a blueprint that
+# died on station 3 had already emitted stations 1-2 — and `line up`, which reads this
+# as a stream, would spawn that half-fleet and never see the error. Validate, then emit.
+for r in rows:
+    print(r)
 PY
 }
 
@@ -128,7 +162,7 @@ _settings() {
       { "hooks": [ { "type": "command", "command": "$HERE/hooks/role-reminder.sh", "timeout": 5 } ] }
     ],
     "PreToolUse": [
-      { "matcher": "Write|Edit|NotebookEdit|Bash",
+      { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
         "hooks": [ { "type": "command", "command": "$HERE/hooks/delegate-wall.sh", "timeout": 5 } ] }
     ]
   }
@@ -146,16 +180,29 @@ _entrypoint() {
     [ -n "$parent" ] && printf 'You report to `%s`. Send it your results; escalate blockers to it.\n\n' "$parent"
     printf '## Who you can reach\n\nPeers: %s\n\n```bash\nbash $AF_MAIL send --to <agent> --kind <question|blocked|result|done|fyi> "..."\nbash $AF_MAIL read      # your inbox (mail is also pushed to you automatically)\n```\n\n' "${peers:-none}"
     if [ "$delegate" = "required" ]; then
-      printf '## How you work — you are a MINI-ORCHESTRATOR\n\n'
+      printf '## How you work — you are a MINI-ORCHESTRATOR (hard wall)\n\n'
       printf 'You do **not** do the work yourself. You dispatch it and verify what comes back:\n\n'
       printf '1. `delegate-to-local-model` skill — **the** way to get a file written. Free, runs in\n'
       printf '   its own process, keeps the work off your context.\n'
       printf '2. Mail a peer agent that owns the area: `bash $AF_MAIL send --to <agent> --kind task "..."`.\n'
       printf '3. A Task subagent to READ and analyse — never to write (see below).\n\n'
-      printf 'This is enforced, not advised: a hook blocks your Write/Edit/Bash-writes outside `%s/`.\n' "$work"
-      printf 'A Task subagent **inherits the same wall** and is blocked identically — verified. Do not\n'
-      printf 'try to route a write through one; you will just loop.\n\n'
+      printf 'This is enforced, not advised: a hook blocks your Write/Edit/Bash-writes outside `%s/`,\n' "$work"
+      printf 'at any size. A Task subagent **inherits the same wall** and is blocked identically —\n'
+      printf 'verified. Do not try to route a write through one; you will just loop.\n\n'
       printf 'Verify everything that comes back. Never trust bulk output unread.\n\n'
+    elif [ "$delegate" = "advised" ]; then
+      printf '## How you work — you are a MINI-ORCHESTRATOR\n\n'
+      printf 'Your job is to **dispatch and verify**, not to type out volume yourself.\n\n'
+      printf 'Delegate the work that is bulk or mechanical — many items to convert or classify,\n'
+      printf 'boilerplate, spec-code, first drafts, big logs to read — and cheaply checkable:\n\n'
+      printf '1. `delegate-to-local-model` skill — free, runs in its own process, keeps the tokens\n'
+      printf '   off your context. This is the main one.\n'
+      printf '2. Mail the peer agent that owns the area: `bash $AF_MAIL send --to <agent> --kind task "..."`.\n\n'
+      printf '**Small, surgical edits you just make yourself.** A three-line fix does not need an\n'
+      printf 'external model — delegating it costs more than doing it. A hook will note it if a\n'
+      printf 'write looks like bulk (%s+ lines) outside `%s/`; it does not block you, it is telling\n' "${AF_BULK_LINES:-40}" "$work"
+      printf 'you the cheaper route exists.\n\n'
+      printf 'Always verify what comes back. Never trust bulk output unread.\n\n'
     fi
     printf '## Your report\n\nWrite it to `%s/%s.md`. One file, kept current — it is how the line sees your work.\n\n' "$work" "$name"
     printf '## Your brief\n\n'
@@ -184,6 +231,20 @@ _preflight() {
 up() {
   local bp="${1:?usage: line up <blueprint.yml>}"
   _preflight || return 1
+  # bulk_lines: the advisory threshold, a blueprint key rather than env-only — the hook's
+  # comment promised you could set it per line, and there was nowhere to set it.
+  local blk; blk="$("$PY" -c 'import yaml,sys
+d=(yaml.safe_load(open(sys.argv[1])) or {}).get("defaults") or {}
+v=d.get("bulk_lines") or ""
+print(v if str(v).isdigit() else "")' "$bp" 2>/dev/null)"
+  local BULKN="${blk:-${AF_BULK_LINES:-40}}"
+  # Materialise the plan BEFORE spawning anything, and abort if it did not validate.
+  # `done < <(_plan …)` discards _plan's exit status, so a blueprint that fails validation
+  # produced an empty stream and a cheerful "0 stations up" — the refusal itself printed
+  # to stderr and scrolled past. An enforcement error must stop the command, not decorate it.
+  local rows
+  rows="$(_plan "$bp")" || { echo "[line] blueprint did not validate — nothing was spawned."; return 1; }
+  [ -z "$rows" ] && { echo "[line] blueprint has no agents."; return 1; }
   local slug work name role parent model delegate caveman soft hard peers brief ep n=0 skipped=0
   while IFS=$'\x1f' read -r slug work name role parent model delegate caveman soft hard peers brief; do
     [ -z "$name" ] && continue
@@ -191,6 +252,11 @@ up() {
     # `line up` twice — a habit, after an edit to one station's brief — and it would
     # tear down the whole live fleet, every agent's TUI, mid-task. Alive stays alive;
     # bring one back deliberately (`ai revive <name>`) or take it down first.
+    local dlabel=""
+    case "$delegate" in
+      required) dlabel="  [wall]" ;;
+      advised)  dlabel="  [advise]" ;;
+    esac
     if tmux has-session -t "ai-$slug-$name" 2>/dev/null; then
       # Left alone means NOTHING was applied: not the brief, not the settings, not the
       # spec. Say that. Reporting "already running" next to a blueprint you just edited
@@ -203,7 +269,7 @@ up() {
         printf '[line]            ⚠ it has no spec (spawned by an older version) — it would revive with NO role and NO hooks\n'
       skipped=$((skipped+1)); continue
     fi
-    ep="$(_entrypoint "$work" "$name" "$role" "$parent" "$peers" "$delegate" "$brief")"
+    ep="$(AF_BULK_LINES="$BULKN" _entrypoint "$work" "$name" "$role" "$parent" "$peers" "$delegate" "$brief")"
     local st="$SPECROOT/$slug/settings-$name.json"
     _settings "$slug" "$name" "$st"
 
@@ -216,10 +282,13 @@ up() {
     # this same --settings, and is blocked by the same wall (verified). Advertising it
     # as a route sends the agent into a loop it cannot exit.
     [ "$delegate" = "required" ] && sys="$sys You are a mini-orchestrator: you do NOT do work directly. To get a file WRITTEN, use the delegate-to-local-model skill (it runs in its own process) or mail the peer who owns the area; a Task subagent inherits your wall and cannot write. Then verify the result. A hook enforces this."
+    # advised: say what to delegate AND what not to. Tell an agent only "delegate" and
+    # it delegates one-line fixes to an external LLM — which is what the old default did.
+    [ "$delegate" = "advised" ] && sys="$sys You are a mini-orchestrator: delegate work that is bulk or mechanical (many items, boilerplate, spec-code, first drafts, big logs) via the delegate-to-local-model skill, or mail the peer who owns the area - then verify what comes back. Small surgical edits you make yourself; delegating a three-line fix costs more than doing it."
     [ "$caveman" = "1" ] && sys="$sys Answer tersely - drop articles, filler and hedging; keep every technical fact exact."
 
     AF_SLUG="$slug" AF_ROLE="$role" AF_PARENT="$parent" AF_PEERS="$peers" \
-    AF_DELEGATE="$delegate" AF_CAVEMAN="$caveman" AF_WORK="$work" \
+    AF_DELEGATE="$delegate" AF_BULK_LINES="$BULKN" AF_CAVEMAN="$caveman" AF_WORK="$work" \
     AI_COMPACT_SOFT="${soft:-${AI_COMPACT_SOFT:-200000}}" \
     AI_COMPACT_HARD="${hard:-${AI_COMPACT_HARD:-500000}}" \
     AI_CLAUDE_FLAGS="--settings $st ${model:+--model $model} --append-system-prompt $(printf '%q' "$sys") ${AI_CLAUDE_FLAGS:-}" \
@@ -227,7 +296,7 @@ up() {
       bash "$AI" up "$name" >/dev/null 2>&1
     if tmux has-session -t "ai-$slug-$name" 2>/dev/null; then
       printf '[line] %-10s %-14s %-8s %s\n' "$name" "$role" "${model:-default}" \
-        "${parent:+← $parent}${delegate:+  [delegate-only]}"
+        "${parent:+← $parent}$dlabel"
       n=$((n+1))
     else
       # `ai up` swallows its own output, so a station that never launched (claude
@@ -235,7 +304,7 @@ up() {
       # still be counted and reported as up.
       printf '[line] %-10s FAILED TO LAUNCH — check: bash %s up %s\n' "$name" "$AI" "$name"
     fi
-  done < <(_plan "$bp")
+  done <<< "$rows"
   # line.json: the fleet-level facts no per-agent spec can hold — which blueprint
   # this line came from, and who is on it. Written once, by the single process that
   # brought the line up, so it has no concurrent writer.
