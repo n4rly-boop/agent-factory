@@ -68,8 +68,8 @@ ai.sh screen [name]          # dump the current TUI screen
 ai.sh result [name]          # last completed turn's text (from the session log)
 ai.sh ctx    [name]          # estimated context size (tokens)
 ai.sh compact[name]          # run /compact (idle only)
-ai.sh sweep                  # TWO jobs: compact idle agents past their threshold,
-                             #   and disarm the Stop-hook gate. Run it periodically.
+ai.sh sweep                  # compact idle agents past their threshold; reap stale
+                             #   busy flags. `post`/`mail` run it for you.
 ai.sh remote [name]          # relaunch with Remote Control so the human drives from the Claude app
 ai.sh approve[name] [1|2|3]  # answer a tool-permission prompt (default 2)
 ai.sh keys   [name] <keys>   # raw tmux keys (Escape, C-c, …)
@@ -151,11 +151,36 @@ back), and that gates it:
 Absolute token counts; set either to `0` to disable. Per-station in a blueprint:
 `compact_soft:` / `compact_hard:` (in `defaults:` or on one agent).
 
-**Where it fires matters.** The check runs at the end of `ai.sh ask` — so an agent
-you drive with `ask` guards itself. A **fleet** agent is driven by *mail*, not by
-`ask`, and nothing fires the check for it. **`ai.sh sweep` is what applies the guard
-to a fleet** (it compacts idle agents past their threshold). Run it periodically
-while a line is working, or a long-running station will simply run out of context.
+**Where it fires matters.** `ai.sh` is a script, not a daemon: it can only check an
+agent's context at a moment when it happens to hold control right after that agent's
+turn. `ask` is such a moment (it waited for the turn). A **fleet** agent is driven by
+*mail* and takes its turns while `ai.sh` isn't even running — so there is no hook
+point, and nothing guards it. **`ai.sh sweep` is that guard**: it walks every agent
+with a mailbox and compacts the ones past threshold, skipping any that is
+mid-generation or paused on a permission prompt (keystrokes would interrupt the turn
+or answer the prompt for the human).
+
+**You do not have to remember to call it.** `ai.sh post` and `ai.sh mail` — the two
+commands that touch a fleet — run a sweep themselves (`AI_SWEEP_OFF=1` disables that).
+`post` sweeps **before** it sends, and skips the recipient — compacting an agent in the
+same breath as handing it a task is a race with nothing to gain. Each agent is judged
+by **its own** thresholds, taken from its spec, not the orchestrator's env.
+
+`ai.sh ledger` deliberately does **not** sweep: it's a look, and silently shrinking an
+agent's memory out from under someone who came to inspect it isn't what "show me the
+line" means. It prints which agents a sweep would compact.
+
+**A sweeper cannot compact itself.** A sweep runs inside the sweeper's own shell, so
+typing `/compact` into its own pane would land mid-turn — its own turn. So `sweep`
+skips whoever is running it.
+
+For a line's orchestrator station (`orc`) that is usually harmless: when **you** sweep
+from the top session, `orc` is just another station and gets compacted like the rest.
+The gap is the fully autonomous line — `orc` drives the workers by mail and nobody up
+top ever runs `ai.sh`. Then `orc` is the only sweeper, so it is the one agent nothing
+guards, and it is the longest-lived agent on the line. For that case `post`/`mail`
+print a warning to `orc` when its own context is past threshold: it has to run
+`/compact` itself, at a safe point of its choosing.
 
 ## Fleets — `line.sh` (when the user wants a team)
 
@@ -344,18 +369,19 @@ to obey — but that is for an orchestrator that IS registered and whose env lac
 Mailboxes are per-slug (`$AF_ROOT/.ai/<slug>/mail/`, default under
 `/tmp/agent-factory`), so one project's escalations can't wake a session in another.
 
-### The Stop hook — why your turn hangs for 45s
+### The Stop hook — delivers, never waits
 
 `hooks/escalation-stop-hook.sh` is the fallback for an orchestrator that isn't a
-registered tmux pane: on `Stop` it surfaces waiting mail and, if async work is
-outstanding, **holds the turn open** (`AF_STOP_POLL`, default 45s) waiting for a
-reply rather than handing control back to the human.
+registered tmux pane. On `Stop` it checks your mailbox: if mail is waiting it returns
+`{"decision":"block"}` with the message, so your turn continues and you handle it with
+no human input. If nothing is waiting, it exits immediately and you stop for real.
 
-"Outstanding" is a flag file: **`ai.sh post` arms it, and `ai.sh sweep` is the only
-thing that disarms it** (`ai.sh mail` does not — reading your box says nothing about
-whether the work you handed out came back). So an orchestrator that posts and never
-sweeps pays a 45s poll on every later idle turn. If your turns start hanging, that's
-what it is: run `ai.sh sweep`.
+**It does not hold your turn open waiting for work to come back.** It used to (45s,
+whenever a task was outstanding), and that was a bad trade: the agents are working, and
+whatever they produce arrives as mail that wakes you when it lands — so the wait bought
+nothing, while a stale "outstanding" flag (a crashed agent, a task queued for an agent
+that never came up) stalled *every* idle turn by 45 seconds. Hand control back; the
+doorbell is how you hear about it.
 
 ## Headless workers — `af.sh`
 

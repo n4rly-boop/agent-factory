@@ -284,9 +284,16 @@ list                 list running interactive agents
   project on the machine, which meant a session in one repo could be woken with —
   and told to answer — another repo's escalations. (It happened.) `.ai/<slug>/mail/`
   makes that impossible by construction.
-- **Escape clears the input line, it does not just close a popup.** Anything that
-  types into a TUI must Escape *before* typing, never after: a post-typing Escape
-  wipes the command you just sent.
+- **Clear the input box with `C-u`, never with `Escape`.** Both clear the line (and a
+  stray autocomplete popup with it) — and you must clear it, or your text concatenates
+  with whatever is sitting there (`❯ leftover junkREAL MESSAGE`). But **Escape also
+  cancels the turn in progress** ("Interrupted · What should Claude do instead?"),
+  while `C-u` leaves a running turn alone: verified live, an agent hit with `C-u`
+  mid-generation finished its answer. Everything that types into an agent now sends
+  `C-u` first, unconditionally — which also retired a whole class of bug, since the
+  old code could only Escape when a *screen read* said the agent was idle, and a
+  just-rung agent has not painted its timer yet: it read as idle, and its work died.
+  Clear *before* typing, never after — clearing after wipes the command you just sent.
 - **Keep generated system prompts ASCII.** They travel through bash's `printf %q`,
   and bash 3.2 (what macOS ships) mangles non-ASCII there — an em dash came out as
   one raw byte plus two escaped ones. Downstream, BSD `sed` hit that byte, aborted

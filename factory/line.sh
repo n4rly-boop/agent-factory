@@ -109,6 +109,14 @@ for name, cfg in agents.items():
     n = int(cfg.get('count') or 1)
     for i in range(n):
         nm = f"{name}{i+1}" if cfg.get('count') else name
+        # `orchestrator` is the reserved name of the SESSION that drives the line. A
+        # station called that would share its mailbox (orchestrator.jsonl) and would be
+        # taken for the orchestrator by the sweep guard — it would start compacting its
+        # own peers, and never be compacted itself. Give the role, not the name.
+        if nm == 'orchestrator':
+            raise SystemExit("[line] FATAL: 'orchestrator' is a reserved agent name "
+                             "(it is the mailbox of the session driving the line). "
+                             "Name the station something else and give it `role: orchestrator`.")
         names.append((nm, cfg))
 
 # Peers = everyone else on the line. Every agent may mail every agent; the
@@ -328,6 +336,9 @@ json.dump({"slug": os.environ["AF_SL"], "blueprint": os.environ["AF_BP"],
 
 status() {
   local bp="${1:?usage: line status <blueprint.yml>}" slug work name rest
+  # Materialise first: `done < <(_plan …)` throws away _plan's exit status, so an
+  # invalid blueprint reported an empty-but-successful line.
+  local rows; rows="$(_plan "$bp")" || return 1
   while IFS=$'\x1f' read -r slug work name rest; do
     [ -z "$name" ] && continue
     local s="ai-$slug-$name" alive="down" ctx="-" un="-"
@@ -337,26 +348,33 @@ status() {
     fi
     un="$(AF_SLUG="$slug" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$HERE/mail.sh" unread --agent "$name" 2>/dev/null)"
     printf '  %-10s %-5s ctx=%-9s unread=%s\n' "$name" "$alive" "${ctx:-0}" "${un:-0}"
-  done < <(_plan "$bp")
+  done <<< "$rows"
 }
 
 down() {
   local bp="${1:?usage: line down <blueprint.yml>}" slug work name rest
+  # Same reason as `status`: an invalid blueprint must not report a line successfully
+  # torn down while every station is still running.
+  local rows; rows="$(_plan "$bp")" || return 1
   while IFS=$'\x1f' read -r slug work name rest; do
     [ -z "$name" ] && continue
     AF_SLUG="$slug" bash "$AI" down "$name" >/dev/null 2>&1
     echo "[line] $name down"
-  done < <(_plan "$bp")
+  done <<< "$rows"
 }
 
 plan() {
   local bp="${1:?usage: line plan <blueprint.yml>}"
+  # Materialise BEFORE printing anything, and fail loudly: `done < <(_plan …)` discards
+  # _plan's exit status, so an invalid blueprint printed a header, printed the FATAL to
+  # stderr — and still exited 0. `line plan && line up` would then sail on into `up`.
+  local rows; rows="$(_plan "$bp")" || return 1
   printf '%-10s %-14s %-8s %-8s %-9s %s\n' NAME ROLE MODEL PARENT DELEGATE PEERS
   local slug work name role parent model delegate caveman soft hard peers brief
   while IFS=$'\x1f' read -r slug work name role parent model delegate caveman soft hard peers brief; do
     [ -z "$name" ] && continue
     printf '%-10s %-14s %-8s %-8s %-9s %s\n' "$name" "$role" "${model:-default}" "${parent:--}" "${delegate:--}" "$peers"
-  done < <(_plan "$bp")
+  done <<< "$rows"
 }
 
 cmd="${1:-}"; shift || true

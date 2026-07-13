@@ -15,6 +15,14 @@
 # The mailbox CURSOR gives exactly-once delivery: `mail read` advances it as it
 # hands the message over, so re-firing after a block (stop_hook_active) cannot
 # loop on the same message.
+#
+# IT NEVER WAITS. It used to hold the turn open for 45s whenever an `await` flag said
+# async work was outstanding, hoping the reply would land inside the window. That was
+# a bad trade: the agents are working and their answer arrives as mail, which WAKES the
+# orchestrator whenever it lands — so the wait bought nothing, while every stale flag
+# (a crashed agent, a task queued for an agent that never came up, a sweep killed
+# mid-run) cost a 45-second stall on EVERY idle turn thereafter. Deliver what has
+# arrived; never sit and hope.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,29 +34,27 @@ CWD="${AF_CWD:-$(pwd)}"
 SLUG="${AF_SLUG:-$(basename "$CWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-12)}"
 [ -z "$SLUG" ] && SLUG="proj"
 SELF="${AF_AGENT:-orchestrator}"          # unset in an orchestrator session
-AWAIT="$ROOT/.ai/$SLUG/await"             # arm flag: poll ONLY while awaiting async work
-POLL="${AF_STOP_POLL:-45}"                # seconds to hold the turn open for new mail
-POLL_ACTIVE="${AF_STOP_POLL_ACTIVE:-3}"   # shorter re-check after we already delivered
 
-payload="$(cat 2>/dev/null)"              # Stop hooks get JSON on stdin
-active=0
-printf '%s' "$payload" | grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true' && active=1
+cat >/dev/null 2>&1                       # drain the Stop payload; we no longer read it
 
 _m()      { env AF_AGENT="$SELF" AF_SLUG="$SLUG" AF_ROOT="$ROOT" bash "$MAIL" "$@"; }
 _unread() { local n; n="$(_m unread --agent "$SELF" 2>/dev/null)"; echo "${n:-0}"; }
 
-# Gate: hold the session open ONLY when the orchestrator explicitly armed the wait
-# (it delegated async work and touched $AWAIT). Otherwise every idle turn would
-# hang for POLL seconds. Mail already waiting is delivered regardless — the gate
-# only decides whether we POLL for more.
-_outstanding() { [ -f "$AWAIT" ]; }
-
 # `mail read` prints the unread mail AND advances the cursor, so what we deliver
 # here is exactly what the agent never saw, exactly once.
 _deliver() {
-  local body reason
-  body="$(_m read --agent "$SELF" 2>/dev/null)"
+  local body reason rc=0
+  body="$(_m read --agent "$SELF" 2>/dev/null)" || rc=$?
   [ -z "$body" ] && exit 0
+  # `mail read` FAILED — the box is locked by the other reader (the doorbell the agent
+  # itself just ran). Its cursor did not move, so nothing was consumed: let the session
+  # stop and pick the message up next time. Blocking here would re-block on every Stop
+  # until the lock cleared, and would hand the model an error string as if it were the
+  # escalation.
+  [ "$rc" -ne 0 ] && exit 0
+  # Same for mail.sh's own status lines ("no new mail…"): the doorbell reader can win
+  # the race between our unread count and our read, and a status line is not mail.
+  case "$body" in "[mail]"*) exit 0 ;; esac
   reason="⚡ A spawned agent mailed you while you were idle:
 
 ${body}
@@ -65,14 +71,4 @@ Handle it now: reply by mail (ai post <agent> --kind result \"…\"), or drive t
 
 [ -f "$MAIL" ] || exit 0
 [ "$(_unread)" -gt 0 ] && _deliver
-
-# Nothing waiting. Don't hold the session hostage unless work is genuinely out.
-_outstanding || exit 0
-[ "$active" = 1 ] && POLL="$POLL_ACTIVE"
-
-for ((i=0; i<POLL; i++)); do
-  sleep 1
-  [ "$(_unread)" -gt 0 ] && _deliver
-  _outstanding || exit 0        # work finished while we waited → let it stop
-done
-exit 0   # poll window closed with nothing new → allow the stop
+exit 0   # nothing waiting → stop for real, immediately. No polling, no hostage-taking.

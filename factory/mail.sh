@@ -98,12 +98,15 @@ _target() {
   printf 'ai-%s-%s' "$SLUG" "$a"
 }
 _alive() { local t; t="$(_target "$1")"; tmux has-session -t "${t%%:*}" 2>/dev/null; }
-# Actively generating: a live "(Ns · …)" timer on screen. Escape is only safe when
-# this is false — mid-turn it would CANCEL the turn instead of closing a popup.
-_busy()  { tmux capture-pane -t "$(_target "$1")" -p 2>/dev/null | grep -qE '\([0-9]+s · '; }
+# NO _busy() HERE ANY MORE. It existed to answer "is it safe to press Escape", and the
+# answer was read off the screen — which is racy: a just-rung agent has not painted its
+# timer yet, so it reads idle and its turn gets cancelled. The doorbell now clears with
+# C-u, which never cancels a turn, so the question no longer needs asking. Typed at a
+# busy agent, the command simply queues and fires at the turn boundary.
+#
 # Paused on a tool-permission decision. Ringing now would be destructive, not
-# merely useless: Escape REJECTS the pending tool call, and the doorbell text
-# would be typed into a select prompt. ai.sh's compact() already refuses on this
+# merely useless: the prompt is a SELECT — the doorbell text would be typed into it and
+# the Enter would confirm the highlighted default. ai.sh's compact() refuses on this
 # state for the same reason; the transport must too.
 _permission(){ tmux capture-pane -t "$(_target "$1")" -p 2>/dev/null | grep -qE 'Do you want to proceed\?|❯ 1\. Yes'; }
 
@@ -220,11 +223,13 @@ ring() {
   # (or `ai approve`) answers.
   _permission "$to" && return 1
 
-  # Escape closes a stray autocomplete popup / leaves sticky shell mode, so the
-  # command we type lands in a clean input box. ONLY when idle: mid-turn, Escape
-  # cancels the agent's work. When busy we skip it and just type — the TUI queues
-  # the command and fires it at the turn boundary, which is exactly what we want.
-  _busy "$to" || { tmux send-keys -t "$tgt" Escape 2>/dev/null; sleep 0.2; }
+  # Clear the input box so the command lands clean (leftover text would concatenate
+  # with ours). C-u, NOT Escape: Escape cancels a turn in progress, so it could only be
+  # sent when `_busy` said the agent was idle — and that is a screen read with a race
+  # in it. C-u clears the line and closes any popup WITHOUT touching a running turn
+  # (verified live), so it needs no guard and can never kill work.
+  # Typed at a busy agent the command still queues and fires at the turn boundary.
+  tmux send-keys -t "$tgt" C-u 2>/dev/null; sleep 0.2
 
   if [ -f "$(_cap "$to")" ]; then
     # Mail-capable agent: AF_MAIL is in its env, so the typed text has no slash
@@ -252,9 +257,10 @@ ring() {
       # and the check silently always passed.) Isolate the last prompt line and
       # compare its contents, tolerating either rendering.
       _pending "$tgt" "$body" || return 0
-      # Still sitting in the box → a popup ate the Enter. Escape CLEARS the line
-      # (it does not merely close the popup), so retype from scratch.
-      tmux send-keys -t "$tgt" Escape 2>/dev/null; sleep 0.2
+      # Still sitting in the box → a popup ate the Enter. C-u clears the line (popup
+      # included), so retype from scratch — and unlike Escape it cannot cancel a turn
+      # that started in the meantime.
+      tmux send-keys -t "$tgt" C-u 2>/dev/null; sleep 0.2
     done
     return 1
   else
@@ -264,9 +270,9 @@ ring() {
     #
     # Shell mode is not usable here: without $AF_MAIL we would have to type a
     # literal path, and a path opens the file-autocomplete popup which swallows
-    # the Enter. Escape does NOT rescue that — in Claude Code it CLEARS THE WHOLE
-    # INPUT LINE, so dismissing the popup after typing wipes the command (observed:
-    # the pane was left holding an empty "! " and the agent never woke).
+    # the Enter. Clearing after typing does NOT rescue that — it wipes the whole input
+    # line, command included (observed: the pane was left holding an empty "! " and the
+    # agent never woke).
     #
     # So we send an ordinary prompt and let the agent run the command itself. That
     # reintroduces a model-judgment step — it has to decide to obey — which is
@@ -275,13 +281,13 @@ ring() {
     local prompt="NEW MAIL — run: bash $HERE/mail.sh read"
     local try pending
     for try in 1 2; do
-      _busy "$to" || { tmux send-keys -t "$tgt" Escape 2>/dev/null; sleep 0.2; }
+      tmux send-keys -t "$tgt" C-u 2>/dev/null; sleep 0.2
       tmux send-keys -t "$tgt" -l "$prompt" 2>/dev/null || return 1
       sleep 0.2
       tmux send-keys -t "$tgt" Enter 2>/dev/null || return 1
       sleep 0.5
       # Submitted ⇔ the live input box no longer holds our text. A popup that ate
-      # the Enter leaves it sitting there; retry re-opens with a clearing Escape.
+      # the Enter leaves it sitting there; the next pass clears the line with C-u first.
       pending="$(tmux capture-pane -t "$tgt" -p 2>/dev/null | grep -E '❯|^!' | tail -1 | sed 's/.*❯[[:space:]]*//; s/^![[:space:]]*//')"
       [ "$pending" != "$prompt" ] && return 0
     done

@@ -28,7 +28,8 @@
 #   ai mail                  read YOUR mailbox (mail agents sent you) and ack it
 #   ai post  <agent> [--kind K] <text>   send mail to an agent + ring its doorbell
 #   ai mailstat              unread count per mailbox (the ack/retry signal)
-#   ai sweep                 compact idle agents past their threshold; disarm the stop-gate
+#   ai sweep                 compact idle agents past their threshold; reap stale busy flags
+#                            (runs automatically on `ai post` and `ai mail`; AI_SWEEP_OFF=1 to stop that)
 #   ai inbox                 old name for `ai mail` (forwards to it)
 #   ai register-self         (run inside the orchestrator's tmux) let agents WAKE you by mail
 #   ai unregister-self       stop agents from waking this session
@@ -264,7 +265,7 @@ except Exception: pass' "$1" "$2" 2>/dev/null; }
 #
 # Stale win-/tty- files from that era are removed on `down` so they can't outlive
 # the code that understood them.
-_rmwinstate() { rm -f "$STATE/win-$1" "$STATE/tty-$1" 2>/dev/null || true; }
+_rmwinstate() { rm -f "$STATE/win-$1" "$STATE/tty-$1" "$STATE/log-$1" 2>/dev/null || true; }
 
 # When resuming, claude pauses on a chooser for large/old sessions:
 #   ❯ 1. Resume from summary   2. Resume full session as-is   3. Don't ask again
@@ -297,6 +298,14 @@ up() {
     esac
   done
   name="${name:-claude}"
+  # `orchestrator` is the mailbox of the SESSION that drives the agents. An agent by
+  # that name would share it, would be skipped by every sweep (so never compacted),
+  # and would pass the sweep guard — it would start compacting its peers. line.sh
+  # already refuses the name in a blueprint; the direct route must refuse it too.
+  if [ "$name" = orchestrator ]; then
+    echo "[ai] 'orchestrator' is a reserved name (it is the driving session's mailbox). Pick another." >&2
+    return 1
+  fi
   local s; s="$(S "$name")"
   tmux kill-session -t "$s" 2>/dev/null || true
   _rmwinstate "$name"
@@ -395,9 +404,30 @@ say() {
   local s; s="$(S "$name")"; local msg="$*"
   [ -z "$msg" ] && { echo "[ai] usage: ai say $name <text>"; return 1; }
   tmux has-session -t "$s" 2>/dev/null || { echo "[ai] no agent '$name' — ai up $name"; return 1; }
+  # NEVER type into a permission prompt. That prompt is a SELECT, not an input box:
+  # C-u does not dismiss it, our text lands in the selector, and the Enter that follows
+  # confirms the highlighted default — `❯ 1. Yes` — silently APPROVING a tool call no
+  # human ever saw (and a message starting with a digit can pick an option outright).
+  # `ring` and `compact` have always refused here; `say` was the one writer that did
+  # not, and it got more dangerous when the clear stopped being an Escape: Escape at
+  # least REJECTED the call. Answer prompts deliberately, with `ai approve`.
+  _permission "$name" && {
+    echo "[ai] '$name' is paused on a permission prompt — answer it first: ai approve $name"
+    return 1
+  }
   local try pending
   for try in 1 2; do
-    tmux send-keys -t "$s" Escape        # close any autocomplete/file popup + clear line
+    # Clear the input box before typing: whatever is sitting there (a half-typed line,
+    # a stale autocomplete popup) would otherwise CONCATENATE with our text —
+    # `❯ leftover junkREAL MESSAGE`, verified live.
+    #
+    # C-u, NOT Escape. Escape clears the box too, but it also CANCELS a turn in progress
+    # ("Interrupted · What should Claude do instead?"), and every `_busy` check that
+    # guarded it is a screen read with a race in it: an agent that has just been rung
+    # has not painted its timer yet, so it reads as idle and gets its work killed.
+    # C-u clears the line and closes the popup while a running turn continues to
+    # completion — verified live: mid-generation C-u, the agent finished its answer.
+    tmux send-keys -t "$s" C-u
     sleep 0.2
     tmux send-keys -t "$s" -l "$msg"     # literal text (no key interpretation)
     sleep 0.2
@@ -439,8 +469,20 @@ screen() {
 # TUI. Hence the split below: log for done, screen for needs-input.
 
 _log() {  # path to this agent's session jsonl, via the id we recorded at `up`
-  local sid; sid="$(cat "$STATE/sid-$1" 2>/dev/null)"; [ -z "$sid" ] && return 1
-  find "$HOME/.claude/projects" -type f -name "$sid.jsonl" 2>/dev/null | head -1
+  local sid cache p
+  sid="$(cat "$STATE/sid-$1" 2>/dev/null)"; [ -z "$sid" ] && return 1
+  # The find is a full walk of ~/.claude/projects (hundreds of MB of transcripts), and
+  # it used to run on EVERY _ctx — which `sweep` now calls per agent, per `ai post`.
+  # The path never moves once claude has created the log, so resolve it once and cache.
+  cache="$STATE/log-$1"
+  if [ -f "$cache" ]; then
+    p="$(cat "$cache" 2>/dev/null)"
+    case "$p" in *"/$sid.jsonl") [ -f "$p" ] && { printf '%s' "$p"; return 0; } ;; esac
+  fi
+  p="$(find "$HOME/.claude/projects" -type f -name "$sid.jsonl" 2>/dev/null | head -1)"
+  [ -z "$p" ] && return 1
+  mkdir -p "$STATE"; printf '%s' "$p" > "$cache"
+  printf '%s' "$p"
 }
 # Count completed turns. grep (not jq) so a half-written final line can't break
 # it. Capture via $() because `grep -c` EXITS 1 on zero matches — an &&/|| chain
@@ -457,10 +499,16 @@ _endturns() {
 # if no usage yet. This is what we threshold for auto-compaction.
 _ctx() {
   local f; f="$(_log "$1")" && [ -f "$f" ] || { echo 0; return; }
+  # Only the LAST assistant record matters, so feed jq the tail instead of the whole
+  # transcript. Sweep calls this per agent on every `ai post`/`ai mail`, and a mature
+  # agent's jsonl runs to tens of MB — slurping all of it was seconds per agent, per
+  # command. The leading fragment of a cut line fails `fromjson?` and is dropped, which
+  # is exactly what we want; AI_CTX_TAIL raises the window if a single record is huge.
+  tail -c "${AI_CTX_TAIL:-4000000}" "$f" 2>/dev/null | \
   jq -sRr 'split("\n") | map(fromjson? // empty)
            | map(select(.type=="assistant" and .message.usage)) | (last.message.usage // {})
            | ((.input_tokens//0)+(.cache_read_input_tokens//0)+(.cache_creation_input_tokens//0))' \
-     "$f" 2>/dev/null || echo 0
+     2>/dev/null || echo 0
 }
 # Actively generating: a live "(Ns · …)" timer on screen.
 _busy()      { tmux capture-pane -t "$(S "$1")" -p | grep -qE '\([0-9]+s · '; }
@@ -526,13 +574,20 @@ ctx() { echo "[ai] '$1' context ≈ $(_ctx "${1:-claude}") tokens"; }
 # permission prompt (the keystrokes would answer the prompt, not compact).
 # /compact preserves a summary, so no task context is lost — only raw history.
 compact() {
-  local name="${1:-claude}" s; s="$(S "$name")"
+  local name="${1:-claude}" mode="${2:-}" s; s="$(S "$name")"
   tmux has-session -t "$s" 2>/dev/null || { echo "[ai] no agent '$name'"; return 1; }
   _busy "$name"       && { echo "[ai] '$name' is mid-turn — refusing to compact (would interrupt). retry when idle."; return 1; }
   _permission "$name" && { echo "[ai] '$name' is on a permission prompt — answer it first (ai approve $name)."; return 1; }
   local before; before="$(_ctx "$name")"
   echo "[ai] compacting '$name' (ctx ≈ ${before} tok)…"
   say "$name" "/compact" || return 1
+  # nowait (used by `sweep`): the keystrokes are sent, the agent compacts on its own.
+  # Waiting is only to report the new size — and doing it inside an autosweep would
+  # hang `ai post` for up to AI_TIMEOUT per over-threshold agent.
+  if [ "$mode" = nowait ]; then
+    echo "[ai] '$name' compacting in the background (was ≈ ${before} tok)."
+    return 0
+  fi
   wait_ "$name" "${AI_TIMEOUT:-300}" >/dev/null   # compaction runs the busy timer; wait it out
   # _ctx reads the usage of the last ASSISTANT record, and /compact does not write
   # one — the shrunk size only becomes visible after the agent's next turn. So
@@ -563,14 +618,19 @@ _mid_task() { [ "$(cat "$MAILROOT/state-$1" 2>/dev/null)" = "busy" ]; }
 # Thresholds are absolute tokens. Override per agent (a 200k-window model needs
 # far lower numbers than a 1M one): AI_COMPACT_SOFT / AI_COMPACT_HARD.
 _maybe_autocompact() {
-  local name="$1" c soft hard
+  local name="$1" c soft hard mode
+  # Thresholds: explicit args (sweep passes the agent's own, from its spec) else this
+  # session's env else the defaults.
+  soft="${2:-}"; hard="${3:-}"; mode="${4:-}"
+  soft="${soft:-${AI_COMPACT_SOFT:-200000}}"
+  hard="${hard:-${AI_COMPACT_HARD:-500000}}"
+  case "$soft" in ''|*[!0-9]*) soft=200000 ;; esac   # junk must not disable the guard
+  case "$hard" in ''|*[!0-9]*) hard=500000 ;; esac
   c="$(_ctx "$name")"; [ "${c:-0}" -gt 0 ] || return
-  soft="${AI_COMPACT_SOFT:-200000}"
-  hard="${AI_COMPACT_HARD:-500000}"
 
   if [ "$hard" != 0 ] && [ "$c" -gt "$hard" ]; then
     echo "[ai] context ≈ ${c} tok > hard ${hard} — compacting '$name' now (mid-task or not; running out would lose everything)…"
-    compact "$name"
+    compact "$name" "$mode"
     return
   fi
   if [ "$soft" != 0 ] && [ "$c" -gt "$soft" ]; then
@@ -578,9 +638,25 @@ _maybe_autocompact() {
       echo "[ai] context ≈ ${c} tok > soft ${soft}, but '$name' is mid-task — holding off (compacting now would drop its working state)."
     else
       echo "[ai] context ≈ ${c} tok > soft ${soft} and '$name' is between tasks — compacting…"
-      compact "$name"
+      compact "$name" "$mode"
     fi
   fi
+}
+
+# Milliseconds are not needed; portability is. BSD stat and GNU stat disagree on flags.
+_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+# An agent's own compaction thresholds, as recorded in its spec at spawn (line.sh puts
+# compact_soft/compact_hard there per station). Empty when unknown — the caller falls
+# back to this session's env.
+_spec_thresholds() {
+  python3 -c '
+import json,sys
+try:
+    e = (json.load(open(sys.argv[1])).get("ai_env") or {})
+    print("%s\x1f%s" % (e.get("AI_COMPACT_SOFT",""), e.get("AI_COMPACT_HARD","")))
+except Exception:
+    print("\x1f")' "$(_specfile "$1")" 2>/dev/null || printf '\x1f'
 }
 
 # (Re)launch the named agent with Claude Code's Remote Control enabled, so the
@@ -668,24 +744,100 @@ unregister_self() {
 # Thin front-ends onto mail.sh so the orchestrator drives the same transport its
 # agents use. `ai mail` reads THIS session's mailbox (as 'orchestrator'); `ai post`
 # sends to an agent, appending to its mailbox and ringing its doorbell.
-mail_() { AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" read "$@"; }
+mail_() {
+  local rc=0
+  AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" read "$@" || rc=$?
+  _autosweep
+  # `mail read` can genuinely fail (the box is locked by another reader), and that
+  # verdict is this command's. Sweep's last act is a conditional `rm`, whose status is
+  # not — returning it made `ai mail` look failed on every turn work was outstanding.
+  return "$rc"
+}
 post()  {
   local to="${1:-}"; shift || true
   [ -z "$to" ] && { echo "[ai] usage: ai post <agent> [--kind K] <text>"; return 1; }
-  # Default kind is `task`, because that is what posting to an agent MEANS. It is
-  # also the signal that marks the agent busy — without it, `_mid_task` is never
-  # true and compaction happily runs in the middle of a multi-turn task.
-  local kind=task a
-  for a in "$@"; do [ "$a" = --kind ] && kind="" ; done
+  # Default kind is `task`, because that is what posting to an agent MEANS. It is also
+  # the signal that marks the agent busy — without it, `_mid_task` is never true and
+  # compaction happily runs in the middle of a multi-turn task.
+  # Only the LEADING flag position is scanned: a message body containing the word
+  # --kind must not be read as one.
+  local kind=""
+  [ "${1:-}" = --kind ] && kind="${2:-}"
+  # A dangling `--kind` with no value is the one input the two sides read differently:
+  # mail.sh's parser breaks on the orphan flag, files the message as `fyi` (marking
+  # nobody busy) and puts the literal word "--kind" in the body. Refuse it rather than
+  # half-obey it.
+  if [ "${1:-}" = --kind ] && [ -z "$kind" ]; then
+    echo "[ai] --kind needs a value (task|question|blocked|result|done|fyi)" >&2
+    return 1
+  fi
+
+  # SWEEP FIRST, SEND SECOND — and skip the recipient.
+  #
+  # Sweeping AFTER the send let the sweep's reaper delete the state-$to/tasker-$to that
+  # `send` had just written for a task QUEUED to a down agent, reading them as garbage
+  # from a crashed one. Sweeping first only ever sees state that predates this command.
+  #
+  # Skipping $to: a /compact typed at the same moment we hand the agent a task is a race
+  # with nothing to win. Both are keystrokes into one input box; the compaction would
+  # eat the turn we are trying to start, or land after it, and either way the agent is
+  # about to be busy with the very task we just gave it.
+  _autosweep "$to"
+
+  # Supply --kind only when the caller didn't; passing it twice would send two flags.
+  local kindflag=(); [ -z "$kind" ] && kindflag=(--kind task)
   AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" \
-    bash "$MAIL" send --to "$to" ${kind:+--kind "$kind"} "$@"
-  # Arm the Stop hook: we have just handed out async work, so an idle stop should
-  # wait for the reply instead of handing control back to the human.
-  # DISARMED BY `ai sweep` ONLY — not by `ai mail`, which merely reads the box and
-  # says nothing about whether the work you posted has come back. So an orchestrator
-  # that posts and never sweeps holds every later idle turn open for AF_STOP_POLL
-  # (45s). That is the cost of the gate; `ai sweep` is what pays it off.
-  mkdir -p "$STATE"; : > "$STATE/await"
+    bash "$MAIL" send --to "$to" ${kindflag+"${kindflag[@]}"} "$@" || return 1
+
+  # NO GATE. There used to be an `await` flag here: post a task, and the orchestrator's
+  # Stop hook would hold its turn open for 45s hoping the reply landed inside it. It
+  # bought nothing — the agents are working, and whatever they produce arrives as mail
+  # that WAKES the orchestrator whenever it lands — while costing a 45s stall on every
+  # idle turn whose flag was stale (a crashed agent, a queued task, an interrupted
+  # sweep). Waiting is not how this system hears back; the doorbell is.
+  return 0
+}
+
+# The context guard only fires where ai.sh happens to hold control at the end of an
+# agent's turn — and a mail-driven fleet gives it no such moment (see `sweep`). That
+# left `sweep` needing to be REMEMBERED, and "the model will remember" is exactly the
+# guarantee that has silently failed in this system before. So every command that
+# touches the fleet sweeps first: `post` (handing out work), `mail` (collecting it).
+# Turn it off with AI_SWEEP_OFF=1.
+#
+# Only an ORCHESTRATOR sweeps: a worker running `ai mail` in its own session must not
+# start compacting its peers. Orchestrator means either this top session (no AF_AGENT)
+# or an agent whose ROLE is orchestrator — a line's own orc is named whatever the
+# blueprint called it, and testing the NAME left the autonomous fleet (orc drives the
+# workers by mail; the human never touches ai.sh) with no sweeps at all — exactly the
+# case this was built for.
+_autosweep() {
+  [ "${AI_SWEEP_OFF:-0}" = 1 ] && return 0
+  case "${AF_AGENT:-orchestrator}" in
+    orchestrator) ;;
+    *) [ "${AF_ROLE:-}" = orchestrator ] || return 0 ;;
+  esac
+  sweep "${1:-}" || true
+  _self_ctx_warn
+  return 0
+}
+
+# A sweeper cannot compact ITSELF: the sweep runs inside its own agent's Bash tool, so
+# /compact would land in its own pane, mid-turn — its own turn. Whenever a human sweeps
+# from the top session, a line's orc is just another station and gets compacted with
+# the rest. The gap is the AUTONOMOUS line — orc drives the workers by mail and nobody
+# up top ever runs ai.sh — where orc is the only sweeper and therefore the one agent
+# nothing guards, while being the longest-lived on the line. We cannot act for it; we
+# can tell it, in output it is already reading, to act for itself. (The top session has
+# no AF_AGENT and no agent log of its own, so it says nothing there.)
+_self_ctx_warn() {
+  local me="${AF_AGENT:-}"; [ -z "$me" ] && return 0
+  local c soft; c="$(_ctx "$me" 2>/dev/null)"; [ "${c:-0}" -gt 0 ] || return 0
+  soft="${AI_COMPACT_SOFT:-200000}"
+  case "$soft" in ''|*[!0-9]*) soft=200000 ;; esac
+  [ "$soft" != 0 ] && [ "$c" -gt "$soft" ] && \
+    echo "[ai] ⚠ YOUR OWN context is ≈ ${c} tok (> ${soft}). Nothing can compact you — run /compact yourself at your next safe point."
+  return 0
 }
 
 # Compaction for a MAIL-DRIVEN fleet. `_maybe_autocompact` only ever ran from
@@ -693,35 +845,81 @@ post()  {
 # guard never applied to the very fleet it was built for. `sweep` walks every
 # agent with a mailbox and applies the same two thresholds at a safe point.
 sweep() {
-  mkdir -p "$MAILROOT"
-  local box name
+  local skip="${1:-}"   # an agent the caller is about to touch — see `post`
+  mkdir -p "$MAILROOT" "$STATE"
+  # One sweep at a time. Two concurrent ones would each decide the same agent is idle
+  # and type /compact into the same pane twice. A lock older than 10 min is a corpse
+  # (the holder was killed mid-sweep) — take it.
+  local lock="$STATE/sweep.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    local age; age="$(( $(date +%s) - $(_mtime "$lock") ))"
+    if [ "$age" -lt 600 ]; then
+      # Silence here would make an explicit `ai sweep` report success having done
+      # nothing at all.
+      echo "[ai] another sweep is running (lock ${age}s old) — skipped."
+      return 0
+    fi
+    rmdir "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null || return 0
+  fi
+  # Released at the end AND on a signal: a sweep killed by Ctrl-C or a tool timeout
+  # (each `_ctx` reads a whole transcript, so a slow sweep is real) would otherwise
+  # leave the lock behind and silently disable EVERY sweep — and with it the gate
+  # disarm — for the next 10 minutes.
+  # $STATE is a global, so this trap body is safe under `set -u`, which a `trap …
+  # RETURN` on the local $lock was NOT: it ran after the function returned, when the
+  # local was already gone, and killed the whole `ai post`.
+  # EXIT releases the lock. INT/TERM must ALSO exit: a handler that only cleans up lets
+  # bash resume the loop, so a Ctrl-C'd sweep could not be aborted AND kept running with
+  # its lock already released — a second sweep could start and type /compact into the
+  # same pane twice, which is the one thing the lock exists to prevent.
+  trap 'rmdir "$STATE/sweep.lock" 2>/dev/null || true' EXIT
+  trap 'rmdir "$STATE/sweep.lock" 2>/dev/null || true; exit 130' INT TERM
+
+  local box name soft hard
   shopt -s nullglob
   for box in "$MAILROOT"/*.jsonl; do
     name="$(basename "$box" .jsonl)"
     [ "$name" = orchestrator ] && continue
+    [ "$name" = "${AF_AGENT:-}" ] && continue   # never compact yourself: /compact would
+                                                # land in your own pane, mid-turn
+    [ -n "$skip" ] && [ "$name" = "$skip" ] && continue
     tmux has-session -t "$(S "$name")" 2>/dev/null || continue
     _busy "$name" && continue          # mid-turn: not a safe point, skip
     _permission "$name" && continue    # waiting on a human: don't touch
-    _maybe_autocompact "$name"
+    # The agent's OWN thresholds, from its spec — not the orchestrator's env. A station
+    # on a 200k-window model is configured `compact_soft: 80000`; judging it by this
+    # session's 200000 means it is never compacted until it dies.
+    IFS=$'\x1f' read -r soft hard <<< "$(_spec_thresholds "$name")"
+    # nowait: /compact is keystrokes, and the agent compacts on its own time. Blocking
+    # here would put a 300s wait_ inside every `ai post` — per over-threshold agent.
+    _maybe_autocompact "$name" "$soft" "$hard" nowait
   done
   shopt -u nullglob
-  # Nothing outstanding anywhere → let the orchestrator stop for real.
-  local n; n="$(AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" \
-                AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" unread 2>/dev/null)"
-  local anybusy=0 f who
+
+  # The reaper. A `busy` flag says "this agent owes a done/result", and SOFT compaction
+  # refuses to touch a busy agent — so a flag whose agent no longer exists silently
+  # exempts that NAME from compaction forever (the next agent to take the name inherits
+  # it). Reap it.
+  #
+  # UNLESS the dead agent still has UNREAD mail: then the flag is not garbage, it is a
+  # task legitimately QUEUED for an agent that is down (mail.sh promises "it will be
+  # rung on next ai up/revive"). Reaping it would also destroy the tasker record its
+  # eventual `done` needs in order to clear the busy state.
+  local f who un
   shopt -s nullglob
   for f in "$MAILROOT"/state-*; do
     [ "$(cat "$f" 2>/dev/null)" = busy ] || continue
     who="$(basename "$f")"; who="${who#state-}"
-    # A `busy` flag whose agent no longer exists is not work outstanding — it is
-    # garbage. Left counted, one `ai post` to a name that never came up would hold
-    # the orchestrator's every idle turn open for AF_STOP_POLL seconds, forever;
-    # a crashed agent would do the same. Reap it instead.
-    if tmux has-session -t "$(S "$who")" 2>/dev/null; then anybusy=1
-    else rm -f "$f" "$MAILROOT/tasker-$who"; fi
+    tmux has-session -t "$(S "$who")" 2>/dev/null && continue
+    un="$(AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" \
+          bash "$MAIL" unread --agent "$who" 2>/dev/null)"
+    [ "${un:-0}" -gt 0 ] && continue            # still owed: leave the bookkeeping alone
+    rm -f "$f" "$MAILROOT/tasker-$who"
   done
   shopt -u nullglob
-  [ "${n:-0}" -eq 0 ] && [ "$anybusy" = 0 ] && rm -f "$STATE/await"
+  rmdir "$lock" 2>/dev/null || true
+  trap - EXIT INT TERM
+  return 0
 }
 # Unread count per mailbox — the retry/ack signal. A sender that sees its message
 # still unread after a while can ring again (or conclude the agent is dead).
@@ -841,6 +1039,10 @@ ledger() {
   echo "[ai] line '$SLUG'${bp:+   blueprint: $bp}   specs: $d"
   printf '\n%-10s %-14s %-8s %-8s %8s %5s %-6s %s\n' NAME ROLE MODEL PARENT CTX MAIL STATE SESSION
   local f name role model parent delegate settings sess alive ctx unread state wall
+  # `ledger` is a LOOK, so it does not compact: silently shrinking an agent's memory
+  # out from under someone who came to inspect it is not what "show me the line" means.
+  # It reports what a sweep would do instead. (post/mail sweep for real — they act.)
+  local fat="" soft asoft
   while IFS= read -r f; do
     [ -z "$f" ] && continue
     name="$(_spec_get "$f" name)"
@@ -881,11 +1083,18 @@ print("%s\x1f%s\x1f%s\x1f%s" % (e.get("AF_ROLE",""), e.get("AF_PARENT",""),
         else wall="  [advise: hooks broken]"; fi ;;
     esac
     unread="$(AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" bash "$MAIL" unread --agent "$name" 2>/dev/null)"
+    # Each agent judged by ITS OWN soft threshold (from its spec), like sweep does.
+    IFS=$'\x1f' read -r asoft _ <<< "$(_spec_thresholds "$name")"
+    soft="${asoft:-${AI_COMPACT_SOFT:-200000}}"
+    case "$soft" in ''|*[!0-9]*) soft=200000 ;; esac
+    [ "$soft" != 0 ] && [ "${ctx:-0}" -gt "$soft" ] 2>/dev/null && fat="$fat $name"
     printf '%-10s %-14s %-8s %-8s %8s %5s %-6s %s\n' \
       "$name" "${role:--}" "${model:-default}" "${parent:--}" "${ctx:--}" "${unread:-0}" "${state:--}" \
       "$alive$wall"
   done <<< "$specs"
   echo
+  [ -n "$fat" ] && echo "[ai] ⚠ past their soft threshold:$fat — 'ai sweep' will compact the idle ones."
+  return 0
 }
 
 # List agents that CAN be revived by name: every ai-spawned agent in the manifest
