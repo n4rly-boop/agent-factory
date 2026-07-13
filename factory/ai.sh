@@ -68,6 +68,7 @@ ORCHDIR="${AF_ROOT:-/tmp/agent-factory}/.ai"     # slug-keyed orchestrator regis
 INBOX="${AF_ROOT:-/tmp/agent-factory}/inbox.tsv"  # agent→orchestrator escalations (legacy log)
 MAILROOT="${AF_ROOT:-/tmp/agent-factory}/.ai/${SLUG}/mail"  # per-slug mailboxes (the real channel)
 NOTIFY="$HERE/notify.sh"                          # helper a spawned agent runs to escalate
+POLL="$HERE/polling.sh"                           # timer: the same message on a clock
 MAIL="$HERE/mail.sh"                              # reliable agent↔agent transport (see mail.sh)
 MANIFEST="$HOME/.claude/agent-factory/manifest.tsv"  # registry of spawned agents
 # An agent's SPEC — the constitution it was spawned with: role env, model, flags,
@@ -350,8 +351,11 @@ up() {
   # is how senders know this agent understands it. Agents spawned by older versions
   # have neither, and senders fall back to the legacy payload-typing push for them.
   local full envpfx sysprompt
-  envpfx="$(printf 'AF_AGENT=%q AF_SLUG=%q AF_INBOX=%q AF_NOTIFY=%q AF_MAIL=%q AF_MAILROOT=%q AF_ROOT=%q' \
-            "$name" "$SLUG" "$INBOX" "$NOTIFY" "$MAIL" "$MAILROOT" "${AF_ROOT:-/tmp/agent-factory}")"
+  # AF_POLL travels with AF_MAIL for one reason: the agent must be able to switch its
+  # OWN timer off (`bash $AF_POLL stop` — no argument, it reads AF_AGENT). It is the only
+  # party that knows the wait is over; a human who has to notice a stale timer will not.
+  envpfx="$(printf 'AF_AGENT=%q AF_SLUG=%q AF_INBOX=%q AF_NOTIFY=%q AF_MAIL=%q AF_POLL=%q AF_MAILROOT=%q AF_ROOT=%q' \
+            "$name" "$SLUG" "$INBOX" "$NOTIFY" "$MAIL" "$POLL" "$MAILROOT" "${AF_ROOT:-/tmp/agent-factory}")"
   # Role vars, when set (by `ai line` from a blueprint), travel into the agent's
   # env so its hooks can enforce the role without any per-agent config file: the
   # reminder hook reads them to restate the chain of command, the delegate-wall

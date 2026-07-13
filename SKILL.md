@@ -400,6 +400,40 @@ nothing, while a stale "outstanding" flag (a crashed agent, a task queued for an
 that never came up) stalled *every* idle turn by 45 seconds. Hand control back; the
 doorbell is how you hear about it.
 
+## Timers — `polling.sh` (the same message, on a clock)
+
+```bash
+polling start <agent> <interval> "<message>" [--times N] [--kind K]
+polling stop  [agent]        # no agent = $AF_AGENT: an agent switching ITS OWN timer off
+polling list                 # every timer on this line
+polling status <agent>
+```
+
+For an agent that must keep checking something: a deploy that takes twenty minutes, a
+queue that drains, a colleague's branch that will eventually land. Instead of a human
+re-poking it, a timer re-poks it.
+
+**It delivers by MAIL, never by typing.** The naive build — `sleep N; ai say <agent> "…"`
+in a loop — types into a live TUI on a clock, with no idea whether the agent is mid-turn,
+mid-tool-call, or sitting on a permission prompt. Mail appends to a mailbox (always safe)
+and only rings the doorbell.
+
+Three ways a timer turns on you, and what stops each:
+
+- **It outlives its agent.** The loop records the agent's `sid` and re-checks it every
+  tick. A changed sid means a *different* agent took the name — the timer exits rather
+  than hand a ghost's orders to a stranger. (A resumed agent keeps its sid, so it keeps
+  its timer. A fresh spawn gets a clean slate.)
+- **It outruns its agent.** A tick is **skipped while the previous one is still unread** —
+  the timer can never build a backlog, one outstanding message ever. The interval floor is
+  60s (`AI_POLL_MIN` to override, deliberately).
+- **Everyone forgets it exists.** `--times N` bounds it, `polling list` shows every live
+  one, and the **agent can switch itself off** — `bash $AF_POLL stop`, no argument. It is
+  the one that knows the wait is over. The first tick tells it so; the rest don't repeat it.
+
+The tick is sent **from whoever started the timer** (you, by default), so the agent's reply
+lands in your `ai mail` and not in some fictional `poll` mailbox nobody reads.
+
 ## Headless workers — `af.sh`
 
 ```bash

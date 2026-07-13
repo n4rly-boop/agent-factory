@@ -20,6 +20,9 @@ role="${AF_ROLE:-}"
 
 agent="${AF_AGENT:-unknown}"
 parent="${AF_PARENT:-orchestrator}"
+# An orchestrator's parent is the human, not another orchestrator. Without this,
+# AF_PARENT's default makes the top station report to a station that does not exist.
+[ "$role" = "orchestrator" ] && [ -z "${AF_PARENT:-}" ] && parent="the human, directly in chat (do NOT mail an 'orchestrator' — no such station)"
 peers="${AF_PEERS:-}"
 work="${AF_WORK:-work}"
 

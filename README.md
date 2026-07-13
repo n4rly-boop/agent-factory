@@ -13,6 +13,7 @@ ephemeral subagents.
 | **`factory/line.sh`** | A whole **production line** of agents from one `blueprint.yml`: roles, chain of command, per-agent model, enforced delegation. | You want a team, not an agent. |
 | **`factory/ai.sh`** | A real interactive Claude **TUI** in a detached tmux session, driven via `tmux send-keys` and read via `tmux capture-pane`. | You want a real, tool-using Claude you can watch and drive. Default. |
 | **`factory/mail.sh`** | The **channel between agents**: mailbox + doorbell + cursor-as-ack. | Agents talking to each other, reliably. |
+| **`factory/polling.sh`** | A **timer**: the same message to one agent every N seconds, delivered as mail. Dies with its agent; skips a tick while the last one is unread; the agent can switch it off itself. | An agent has to keep checking something — a deploy, a queue, a branch that will land. |
 | **`factory/af.sh`** | A **headless worker** (`claude -p` loop) driven over a FIFO message bus, persistent `--resume` session. | Programmatic request→reply, autonomous loops, agent-to-agent chains. |
 | **`factory/afctl.sh`** | Cleanup of spawned agents' session logs via a session-id manifest. | Purge factory logs without touching your manual sessions. |
 
@@ -347,6 +348,7 @@ factory/
 ├── line.sh         a whole line from one blueprint.yml (roles, hierarchy, models)
 ├── ai.sh           interactive TUI agents (primary)
 ├── mail.sh         agent↔agent transport: mailbox + doorbell + cursor-as-ack
+├── polling.sh      timers: the same message to an agent every N seconds, by mail
 ├── notify.sh       thin alias for `mail.sh send` (stable entry point for older agents)
 ├── hooks/
 │   ├── role-reminder.sh          restates role + chain of command every prompt
