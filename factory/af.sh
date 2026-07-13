@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # af — Agent Factory controller.
-# Lets THIS interactive claude (via the Bash tool) spawn a second, *visible*
-# claude agent in its own shell window and then talk to it freely.
+# Lets THIS interactive claude (via the Bash tool) spawn a second claude agent in
+# its own shell and then talk to it freely.
 #
-#   af up   [name]         spawn a visible worker agent (new window/pane)
+#   af up   [name]         spawn a worker agent (detached tmux session)
 #   af say  [name] <text>  send a task, block, print the reply  <-- I call this
 #   af ask  [name] <text>  alias for `say`
 #   af log  [name]         show the worker's transcript so far
 #   af down [name]         stop the worker, clean up FIFOs
 #   af list                list running workers
 #
-# Visibility (AF_VIEW): macos (new Terminal.app window, default on darwin) |
-#                       tmux (detached session you `tmux attach` to) |
-#                       iterm.
+# The worker lives in a detached tmux session (af-<name>) and NOTHING pops up. A
+# human who wants to watch runs `tmux attach -t af-<name>`. Spawning a Terminal.app
+# window used to be the default on macOS; it is gone. It only ever worked on
+# Terminal.app and iTerm (AppleScript `do script`) — never in Warp, over ssh, or on
+# Linux — so it was a second, less portable code path for the same job, and the one
+# that needed macOS Automation permission to not silently fail.
 set -uo pipefail
 
 ROOT="${AF_ROOT:-/tmp/agent-factory}"
@@ -21,18 +24,6 @@ WORKER="$HERE/worker.sh"
 MANIFEST="$HOME/.claude/agent-factory/manifest.tsv"  # registry of spawned agents
 
 _dir()  { echo "$ROOT/$1"; }
-# Pick a viewer. Terminal.app + iTerm have AppleScript `do script` (no special
-# perms). Warp does NOT, and keystroke injection is blocked by Accessibility —
-# so Warp (and Linux, SSH, anything else) falls back to tmux: portable, works
-# everywhere. Override with AF_VIEW=macos|iterm|tmux.
-_view() {
-  if [ -n "${AF_VIEW:-}" ]; then echo "$AF_VIEW"; return; fi
-  case "${TERM_PROGRAM:-}" in
-    Apple_Terminal) echo macos ;;
-    iTerm.app)      echo iterm ;;
-    *)              echo tmux ;;   # Warp, Linux, ssh, tmux-in-anything
-  esac
-}
 b64enc() { base64 | tr -d '\n'; }
 
 up() {
@@ -47,30 +38,16 @@ up() {
   printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "af" "$name" "$id" "$(pwd)" >> "$MANIFEST"
   local cmd="AF_DIR='$dir' AF_NAME='$name' AF_SID='$id' bash '$WORKER' '$name' | tee -a '$dir/transcript.log'"
 
-  case "$(_view)" in
-    macos)
-      osascript >/dev/null 2>&1 <<OSA
-tell application "Terminal"
-  activate
-  do script "clear; echo '== agent: $name =='; $cmd"
-end tell
-OSA
-      echo "[af] spawned '$name' in a new Terminal window (visible)." ;;
-    iterm)
-      osascript >/dev/null 2>&1 <<OSA
-tell application "iTerm"
-  create window with default profile
-  tell current session of current window to write text "clear; echo '== agent: $name =='; $cmd"
-end tell
-OSA
-      echo "[af] spawned '$name' in a new iTerm window." ;;
-    tmux|*)
-      tmux kill-session -t "af-$name" 2>/dev/null || true
-      tmux new-session -d -s "af-$name" -n "$name" "$cmd"
-      echo "[af] spawned '$name' in a detached tmux session (portable — Warp/any terminal)."
-      echo "[af] SEE IT: open a Warp pane (Cmd+D / Cmd+T) and run:"
-      echo "             tmux attach -t af-$name" ;;
-  esac
+  # AF_VIEW used to pick between a Terminal.app window, an iTerm window and tmux.
+  # tmux is now the only one. Say so rather than quietly ignoring a value someone
+  # has exported in their shell profile and still believes in.
+  [ -n "${AF_VIEW:-}" ] && [ "${AF_VIEW}" != tmux ] && \
+    echo "[af] note: AF_VIEW=$AF_VIEW is ignored — workers are tmux-only now." >&2
+
+  tmux kill-session -t "af-$name" 2>/dev/null || true
+  tmux new-session -d -s "af-$name" -n "$name" "$cmd"
+  echo "[af] spawned '$name' in a detached tmux session (no window pops up)."
+  echo "[af] SEE IT: open a pane in your terminal and run:  tmux attach -t af-$name"
   echo "[af] dir=$dir  — now drive it with:  af say $name \"...\""
 }
 
@@ -111,5 +88,8 @@ case "$cmd" in
   log|logs) logs "$@" ;;
   down) down "$@" ;;
   list) list ;;
-  *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  # Help = the header comment, printed up to the first non-comment line. Derived,
+  # not a hardcoded line range: the old `sed -n 2,20p` outlived the header it was
+  # measured against and printed `set -uo pipefail` as if it were help text.
+  *) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}" ;;
 esac

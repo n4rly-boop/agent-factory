@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# ai — spawn a REAL interactive `claude` TUI in a visible Terminal.app window,
-# then let THIS agent type into it and read its screen.
+# ai — spawn a REAL interactive `claude` TUI in a detached tmux session, then let
+# THIS agent type into it and read its screen.
 #
-# How: interactive claude runs inside a tmux session (gives it a real TTY); a
-# Terminal.app window is opened attached to that session, so you watch the live
-# TUI. The controlling agent drives it with `tmux send-keys` and reads with
-# `tmux capture-pane` — no FIFOs, no headless mode. The actual interactive app.
+# How: interactive claude runs inside a tmux session, which gives it the real TTY
+# the TUI needs. The controlling agent drives it with `tmux send-keys` and reads
+# with `tmux capture-pane` — no FIFOs, no headless mode. The actual interactive app.
 #
-#   ai up    [name] [-w]     launch interactive claude (detached tmux; -w/--window opens a Terminal window)
+# NO WINDOW IS EVER OPENED. The agent is a detached tmux session and nothing else;
+# a human who wants to watch runs `tmux attach -t ai-<slug>-<name>` (add -r to
+# watch read-only, which is what you want while this session is driving it — two
+# writers on one pane interleave keystrokes and corrupt the input).
+#
+#   ai up    [name]          launch interactive claude in a detached tmux session
 #   ai say   [name] <text>   type text into it and submit (Enter)
 #   ai keys  [name] <args>   send raw tmux keys (e.g. Escape, C-c, /model)
 #   ai screen[name]          print the current TUI screen
@@ -58,7 +62,7 @@ FLAGS="${AI_CLAUDE_FLAGS:-}"                      # extra claude flags
 SLUG="${AF_SLUG:-$(basename "$CWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-12)}"
 [ -z "$SLUG" ] && SLUG="proj"
 S() { echo "ai-${SLUG}-${1:-claude}"; }          # tmux session name: ai-<slug>-<name>
-STATE="${AF_ROOT:-/tmp/agent-factory}/.ai/${SLUG}"   # per-slug: window/tty/sid tracking
+STATE="${AF_ROOT:-/tmp/agent-factory}/.ai/${SLUG}"   # per-slug: session-id tracking
 ORCHDIR="${AF_ROOT:-/tmp/agent-factory}/.ai"     # slug-keyed orchestrator registry (orch-<slug>)
 INBOX="${AF_ROOT:-/tmp/agent-factory}/inbox.tsv"  # agent→orchestrator escalations (legacy log)
 MAILROOT="${AF_ROOT:-/tmp/agent-factory}/.ai/${SLUG}/mail"  # per-slug mailboxes (the real channel)
@@ -252,22 +256,15 @@ import json,sys
 try: print(json.load(open(sys.argv[1])).get(sys.argv[2], "") or "")
 except Exception: pass' "$1" "$2" 2>/dev/null; }
 
-# Close the Terminal window previously opened for this name (if any), by killing
-# the processes on its tty (no modal prompt), with an AppleScript close fallback.
-# Used by both `up` (to avoid orphaning the old window when relaunching) and
-# `down`. Killing a window's tmux client also stops it dropping to a bare login
-# shell — the empty-window symptom when a session is re-`up`ed underneath it.
-_closewin() {
-  local name="$1" wf="$STATE/win-$name" tf="$STATE/tty-$name" wid tty
-  [ -f "$wf" ] && wid="$(cat "$wf")"
-  [ -f "$tf" ] && tty="$(cat "$tf")"
-  if [ -n "${tty:-}" ]; then pkill -t "${tty#/dev/}" 2>/dev/null || true; sleep 0.3; fi
-  if [ -n "${wid:-}" ]; then
-    local n; n="$(osascript -e "tell application \"Terminal\" to count (every window whose id is $wid)" 2>/dev/null)"
-    [ "$n" != "0" ] && osascript >/dev/null 2>&1 -e "tell application \"Terminal\" to close (every window whose id is $wid) saving no"
-  fi
-  rm -f "$wf" "$tf"
-}
+# An agent used to be able to own a Terminal.app window, which had to be closed by
+# hand on `down` (and re-`up`) or it was left behind as an empty login shell. That
+# whole path is gone: an agent is a detached tmux session, `tmux kill-session` ends
+# it completely, and there is nothing else to clean up. Any human viewer is an
+# `attach`ed client, which tmux detaches on its own when the session dies.
+#
+# Stale win-/tty- files from that era are removed on `down` so they can't outlive
+# the code that understood them.
+_rmwinstate() { rm -f "$STATE/win-$1" "$STATE/tty-$1" 2>/dev/null || true; }
 
 # When resuming, claude pauses on a chooser for large/old sessions:
 #   ❯ 1. Resume from summary   2. Resume full session as-is   3. Don't ask again
@@ -287,21 +284,22 @@ _answer_resume() {
 }
 
 up() {
-  # Parse args: a name plus an optional -w/--window flag (any order). By default
-  # the agent runs in a DETACHED tmux session only — no Terminal window pops up.
-  # Pass -w/--window (or set AI_WINDOW=1) to also open a visible Terminal.app
-  # window attached to it.
-  local name="" want_win="${AI_WINDOW:-0}" a
+  # The agent always lands in a detached tmux session. -w/--window used to also
+  # open a Terminal.app window; it is accepted and ignored so an old call site (or
+  # an agent working from a stale brief) doesn't die on an unknown argument — but
+  # it must not be swallowed as the NAME, or `ai up -w` would spawn an agent
+  # literally called "-w".
+  local name="" a
   for a in "$@"; do
     case "$a" in
-      -w|--window) want_win=1 ;;
+      -w|--window) echo "[ai] note: -w/--window is gone — agents are tmux-only now." >&2 ;;
       *) [ -z "$name" ] && name="$a" ;;
     esac
   done
   name="${name:-claude}"
   local s; s="$(S "$name")"
   tmux kill-session -t "$s" 2>/dev/null || true
-  _closewin "$name"   # close any prior window for this name so we don't orphan it as a bare shell
+  _rmwinstate "$name"
   # Give the agent a known identity so its session log is filterable later:
   # --session-id <uuid> sets the log filename (<uuid>.jsonl); we record that
   # uuid in the manifest. (Note: --append-system-prompt is NOT written to the
@@ -375,45 +373,9 @@ When you hit a real blocker you cannot resolve on your own - a decision only the
     return 1
   fi
   echo "[ai] interactive claude launched (session=$s id=$id cwd=$CWD)"
-  # Open a visible Terminal.app window attached to it. Capture both the window
-  # id AND its tty — `down` kills the tty's process to close the window cleanly
-  # (AppleScript `close` pops a modal "terminate?" sheet that can't be dismissed
-  # headlessly; killing the backing process closes the window with no prompt).
   mkdir -p "$STATE"
-  printf '%s' "$id" > "$STATE/sid-$name"   # always: jsonl-based completion tracking needs this
-  # Only open a visible Terminal window when asked (-w/--window or AI_WINDOW=1).
-  # By default the agent lives in the detached tmux session; watch with attach.
-  if [ "$want_win" = 1 ]; then
-    local meta err winid tty tmpf; tmpf="$(mktemp)"
-    meta=$(osascript 2>"$tmpf" <<OSA
-tell application "Terminal"
-  activate
-  set tb to do script "tmux attach -t $s"
-  delay 0.2
-  return (id of front window as text) & "|" & (tty of tb)
-end tell
-OSA
-)
-    err="$(cat "$tmpf" 2>/dev/null)"; rm -f "$tmpf"
-    if [ -n "$meta" ] && [[ "$meta" == *"|"* ]] && [ -n "${meta%%|*}" ]; then
-      winid="${meta%%|*}"; tty="${meta##*|}"
-      printf '%s' "$winid" > "$STATE/win-$name"
-      printf '%s' "$tty"   > "$STATE/tty-$name"
-      echo "[ai] opened a Terminal.app window (id=$winid, $tty) showing the live TUI."
-    else
-      # osascript blocked (e.g. Apple Events not authorized, -1743) or no window —
-      # agent is alive in tmux regardless; tell the human how to watch it.
-      rm -f "$STATE/win-$name" "$STATE/tty-$name"
-      echo "[ai] ⚠ couldn't open a Terminal window${err:+ ($err)}."
-      echo "[ai]   likely macOS Automation permission: System Settings ▸ Privacy & Security ▸"
-      echo "[ai]   Automation ▸ allow your terminal app to control \"Terminal\". Until then it's headless."
-      echo "[ai]   watch it live:  tmux attach -t $s"
-    fi
-  else
-    rm -f "$STATE/win-$name" "$STATE/tty-$name"   # no window for this run
-    echo "[ai] running detached (no window) — watch it live:  tmux attach -t $s"
-    echo "[ai]   want a window? relaunch with:  ai up $name --window"
-  fi
+  printf '%s' "$id" > "$STATE/sid-$name"   # jsonl-based completion tracking needs this
+  echo "[ai] detached — watch it live:  tmux attach -r -t $s   (-r = read-only)"
   # If resuming, clear the "summary vs full" chooser so the agent is ready to drive.
   [[ "$launchflags" == *"--resume"* ]] && _answer_resume "$name"
   # Mail that arrived while this agent was down would otherwise sit unread forever:
@@ -629,7 +591,7 @@ remote() {
   local name="${1:-claude}" sid="${2:-}"
   [ -z "$sid" ] && sid="$(cat "$STATE/sid-$name" 2>/dev/null)"
   [ -z "$sid" ] && sid="$(awk -F'\t' -v n="$name" '$3==n{print $4}' "$MANIFEST" 2>/dev/null | tail -1)"
-  tmux has-session -t "$(S "$name")" 2>/dev/null && down "$name"   # close the old window/session first
+  tmux has-session -t "$(S "$name")" 2>/dev/null && down "$name"   # kill the old session first
   if [ -n "$sid" ] && [ -n "$(find "$HOME/.claude/projects" -type f -name "$sid.jsonl" 2>/dev/null | head -1)" ]; then
     echo "[ai] launching '$name' with Remote Control, resuming session $sid"
     FLAGS="--resume $sid --remote-control $name $FLAGS"
@@ -656,7 +618,14 @@ approve() {
   esac
 }
 
-attach() { echo "tmux attach -t $(S "${1:-claude}")"; }
+# The only way a human ever sees a spawned agent. Read-only is offered first and
+# on purpose: while this session is driving the agent with send-keys, a second
+# writer on the same pane interleaves keystrokes and corrupts the input.
+attach() {
+  local s; s="$(S "${1:-claude}")"
+  echo "tmux attach -r -t $s   # watch (read-only — safe while the orchestrator drives)"
+  echo "tmux attach -t $s      # take over the keyboard (don't, while it's being driven)"
+}
 
 # Register THIS orchestrator's tmux pane so spawned agents can WAKE it directly
 # (tmux send-keys) when they escalate — a true push into a live-but-idle session,
@@ -711,8 +680,11 @@ post()  {
   AF_AGENT="${AF_AGENT:-orchestrator}" AF_SLUG="$SLUG" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" \
     bash "$MAIL" send --to "$to" ${kind:+--kind "$kind"} "$@"
   # Arm the Stop hook: we have just handed out async work, so an idle stop should
-  # wait for the reply instead of handing control back to the human. Disarmed by
-  # `ai sweep`/`ai mail` once nothing is outstanding.
+  # wait for the reply instead of handing control back to the human.
+  # DISARMED BY `ai sweep` ONLY — not by `ai mail`, which merely reads the box and
+  # says nothing about whether the work you posted has come back. So an orchestrator
+  # that posts and never sweeps holds every later idle turn open for AF_STOP_POLL
+  # (45s). That is the cost of the gate; `ai sweep` is what pays it off.
   mkdir -p "$STATE"; : > "$STATE/await"
 }
 
@@ -943,8 +915,8 @@ down() {
   # compacts again.
   rm -f "$MAILROOT/state-$name" "$MAILROOT/tasker-$name" 2>/dev/null
   tmux kill-session -t "$s" 2>/dev/null || true
-  _closewin "$name"
-  echo "[ai] '$name' down — session killed, window closed."
+  _rmwinstate "$name"
+  echo "[ai] '$name' down — session killed."
 }
 
 list() { tmux ls 2>/dev/null | grep '^ai-' || echo "[ai] none"; _inbox_hint; }

@@ -11,7 +11,7 @@ ephemeral subagents.
 | Tool | What it is | Use when |
 |------|-----------|----------|
 | **`factory/line.sh`** | A whole **production line** of agents from one `blueprint.yml`: roles, chain of command, per-agent model, enforced delegation. | You want a team, not an agent. |
-| **`factory/ai.sh`** | A real interactive Claude **TUI** in a visible Terminal.app window, driven via `tmux send-keys` and read via `tmux capture-pane`. | You want to *see* a real Claude working, or a tool-using agent. Default. |
+| **`factory/ai.sh`** | A real interactive Claude **TUI** in a detached tmux session, driven via `tmux send-keys` and read via `tmux capture-pane`. | You want a real, tool-using Claude you can watch and drive. Default. |
 | **`factory/mail.sh`** | The **channel between agents**: mailbox + doorbell + cursor-as-ack. | Agents talking to each other, reliably. |
 | **`factory/af.sh`** | A **headless worker** (`claude -p` loop) driven over a FIFO message bus, persistent `--resume` session. | Programmatic request→reply, autonomous loops, agent-to-agent chains. |
 | **`factory/afctl.sh`** | Cleanup of spawned agents' session logs via a session-id manifest. | Purge factory logs without touching your manual sessions. |
@@ -176,11 +176,12 @@ editing one brief.
 ## Quick start
 
 ```bash
-# Interactive agent in a visible window
-bash factory/ai.sh up neo                       # opens a Terminal window
+# Interactive agent (detached tmux session — nothing pops up)
+bash factory/ai.sh up neo
 bash factory/ai.sh ask neo "Summarize the README in one line"
 bash factory/ai.sh ask neo "What did you just say?"   # remembers — same session
-bash factory/ai.sh down neo                      # quit + close the window
+tmux attach -r -t ai-<slug>-neo                  # watch it live, read-only
+bash factory/ai.sh down neo                      # quit + kill the session
 
 # Headless worker over a FIFO bus
 bash factory/af.sh up worker
@@ -195,7 +196,7 @@ bash factory/afctl.sh purge                      # delete + clear manifest
 ## `ai.sh` commands
 
 ```
-up [name]            launch interactive Claude TUI in a Terminal window
+up [name]            launch interactive Claude TUI in a detached tmux session
 say [name] "text"    type text + submit (don't wait)
 ask [name] "text"    say + wait until the agent finishes + print its screen
 approve [name] [1|2|3]answer a tool-permission prompt (default 2 = allow & don't ask)
@@ -207,8 +208,8 @@ revivable            list downed agents (surviving log) you can revive by name
 ledger               one view of the line: role, model, ctx, unread mail, alive?
 screen [name]        dump the current TUI screen
 keys [name] <keys>   send raw tmux keys (Escape, C-c, …)
-attach [name]        print the tmux attach command for another viewer
-down [name]          quit the agent + close its window
+attach [name]        print the tmux attach command for a human viewer
+down [name]          quit the agent + kill its session
 list                 list running interactive agents
 ```
 
@@ -217,12 +218,16 @@ list                 list running interactive agents
 - **Long-lived sessions** come from native flags: `claude --session-id <uuid>`
   (so we know/record the id) + `--resume`. The factory supplies the transport
   and orchestration the CLI leaves to you.
-- **Visibility is terminal-specific.** Terminal.app and iTerm expose AppleScript
-  `do script`, so `up` auto-opens a window. **Warp, Linux, and ssh have no
-  scriptable spawn and block keystroke injection**, so they fall back to a
-  detached **tmux** session you attach to (`tmux attach -t ai-<name>`). tmux is
-  the portable substrate underneath everything. Override with
-  `AF_VIEW=macos|iterm|tmux`.
+- **An agent is a detached tmux session, and nothing else pops up.** To watch one,
+  attach: `tmux attach -r -t ai-<slug>-<name>` (`-r` = read-only, which is what you
+  want while this session is driving it — two writers on one pane interleave
+  keystrokes and corrupt the input). `ai attach <name>` prints both commands.
+  Earlier versions auto-opened a Terminal.app window via AppleScript `do script`.
+  That path is **gone**: it only ever worked on Terminal.app and iTerm — never in
+  Warp, over ssh, or on Linux — needed macOS Automation permission to not fail
+  silently, and left a window to clean up on `down` (an orphaned window drops to a
+  bare login shell when the session under it dies). tmux was already the substrate
+  underneath it; now it is the only one. `-w/--window` is accepted and ignored.
 - **`ask` knows when the agent is done** by watching its live generation timer
   (`✻ Computing… (4s · …)`) appear then vanish — not by diffing the whole screen
   (the footer/token-counter churn would never settle).
@@ -246,13 +251,12 @@ list                 list running interactive agents
 
   Both are absolute token counts — override per agent, since a 200k-window model
   needs far lower numbers than a 1M one.
-- **One writer at a time.** The agent shares its tmux session with the window;
-  if a human types while the controller drives, keystrokes interleave. To watch
-  only, attach read-only: `tmux attach -r -t ai-<name>`.
-- **Clean teardown.** `down` closes the window by killing its tty process, not
-  AppleScript `close` (which pops a modal "terminate?" sheet that can't be
-  dismissed headlessly). Re-`up`/`revive` of the same name closes that name's old
-  window first, so relaunching never leaves an orphaned bare-shell window behind.
+- **One writer at a time.** An attached human and the controller type into the
+  same pane; keystrokes interleave and corrupt the input. To watch only, attach
+  read-only: `tmux attach -r -t ai-<slug>-<name>`.
+- **Clean teardown.** `down` is `tmux kill-session` — the whole agent, gone. Any
+  attached viewer is detached by tmux itself. Re-`up`/`revive` of the same name
+  kills the old session first, so relaunching is idempotent.
 - **Resume chooser handled.** Resuming a large/old session, claude pauses on
   `1. Resume from summary / 2. Resume full session as-is`; `revive` auto-answers
   it (default 2 = full memory; `AI_RESUME_MODE=1` for the summary).
@@ -294,10 +298,21 @@ list                 list running interactive agents
 
 ## Packaged as a skill
 
-The toolkit is wrapped as a Claude Code skill at
-`~/.claude/skills/agent-factory/` (its `scripts/` symlinks to `factory/`), so
-phrases like "spawn an agent", "open a second claude", "talk to it", or "clean
-up the agent logs" invoke it automatically.
+The toolkit is wrapped as a Claude Code skill, so phrases like "spawn an agent",
+"open a second claude", "talk to it", or "clean up the agent logs" invoke it
+automatically. `SKILL.md` — the file the model actually reads — lives **here, in
+the repo**; the installed skill is two symlinks into it:
+
+```bash
+mkdir -p ~/.claude/skills/agent-factory
+ln -s "$PWD/SKILL.md" ~/.claude/skills/agent-factory/SKILL.md
+ln -s "$PWD/factory"  ~/.claude/skills/agent-factory/scripts
+```
+
+Both point back at the repo on purpose. A skill whose instructions live only in
+`~/.claude` drifts away from the code it describes and is lost on reinstall — and a
+doc that lies about the code is a defect, since a model reads it and then runs the
+commands it names.
 
 ## Files
 
