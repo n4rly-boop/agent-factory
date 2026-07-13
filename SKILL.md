@@ -7,11 +7,13 @@ description: >-
   Claude", drive or chat with a peer/worker agent, run agents that talk to each
   other, revive a killed agent, or list/clean up previously spawned agents and
   their session logs. ALSO use it to stand up a whole TEAM/FLEET of agents with
-  roles and a hierarchy (orchestrator + workers, "agents that each own a role",
-  parallel multi-agent experiments, ablations) — that is `line.sh` with a
-  blueprint.yml. Trigger even if the user just says "spawn an agent", "open
-  another claude", "talk to it", "kill that agent", "set up a team of agents", or
-  "clean up the agent logs" without naming this skill.
+  roles and a hierarchy (orchestrator + workers, parallel multi-agent experiments,
+  ablations) — that is `line.sh` with a blueprint.yml. Invoked as `/agent-factory
+  plan <goal>` it runs an INTERACTIVE blueprint wizard: it interviews the user,
+  proposes the stations and their briefs, and writes the blueprint.yml with them.
+  Trigger even if the user just says "spawn an agent", "open another claude", "talk
+  to it", "kill that agent", "design a team of agents", or "clean up the agent
+  logs" without naming this skill.
 ---
 
 # Agent Factory
@@ -34,6 +36,17 @@ be watched live by the human.
 
 Scripts live in `scripts/` next to this file. Reference them by absolute path:
 `bash "$SKILL/scripts/ai.sh" ...`, where `$SKILL` is this skill's dir.
+
+## Invoked as `/agent-factory plan …` — run the blueprint wizard
+
+If the skill was invoked with `plan` / `new` / `design` (with or without a goal after
+it), or the user asks to design a fleet *with* you rather than hand you a finished
+blueprint: **read `$SKILL/scripts/blueprint-wizard.md` and follow it.** It is an
+interview protocol — you ask, they decide, and a `blueprint.yml` exists only after they
+approve the resolved plan. Do not improvise a blueprint from this file's schema snippet;
+the wizard carries the briefs, the traps, and the validation step.
+
+`$SKILL/scripts/blueprint.example.yml` is a complete, annotated line to copy from.
 
 ## Nothing pops up: an agent is a tmux session
 
@@ -183,6 +196,10 @@ print a warning to `orc` when its own context is past threshold: it has to run
 `/compact` itself, at a safe point of its choosing.
 
 ## Fleets — `line.sh` (when the user wants a team)
+
+**No blueprint yet? Do not write one from the snippet below — run the wizard**
+(`$SKILL/scripts/blueprint-wizard.md`): interview the human, propose the stations, write
+the briefs, validate with `line plan`, then stop. See the top of this file.
 
 ```bash
 line.sh plan   blueprint.yml   # resolved roles/hierarchy/models — no spawn. Show this first.
