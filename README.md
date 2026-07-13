@@ -95,10 +95,83 @@ Three things the wall had to learn the hard way, all found by review + a live te
 It is **not a sandbox.** It is a routing enforcer against an agent that forgets,
 not a jail against one trying to get out. If you need containment, use permissions.
 
+**It enforces the route, not the location — and those are not the same thing.**
+Observed, on a live walled agent asked to write outside its zone: the wall blocked
+the Bash write, the agent said *"Wall blocked direct write. Using
+delegate-to-local-model"*, and the local model — running in its own process, which
+is the entire point of it being the sanctioned route — wrote the file exactly where
+it had been asked to. Outside `work/`. So "this agent's writes are confined to
+`work/`" is true of the agent and false of the system: anything it delegates can land
+anywhere the delegate is told to put it. What the wall reliably buys you is that the
+mini-orchestrator *dispatches and verifies* instead of doing the work itself. What it
+does not buy you is a boundary on the filesystem.
+
 ⚠️ **A hook that can't execute fails OPEN.** Claude Code reports a hook error and
 runs the tool anyway — so a `delegate-wall` missing its `+x` bit is a wall-shaped
 hole, and nothing in the agent's output says so. `line up` preflights the hooks
 and refuses to spawn rather than hand out enforcement that isn't there.
+
+## An agent's spec: what makes `revive` bring back the *same* agent
+
+`--resume` restores an agent's memory. It does not restore its **constitution** —
+the role env, the model, the appended system prompt, and the `--settings` file that
+installs its hooks. Those lived only in the environment of the process that spawned
+it, and died with it. So `ai revive eval` used to return an agent that remembered
+being `eval` and had no wall, no role-reminder, and possibly the wrong model —
+reporting success, saying nothing.
+
+Every `ai up` now writes a **spec** — one file per agent, in `$HOME` (not `/tmp`,
+which a reboot wipes while the manifest in `$HOME` survives — that combination is
+exactly how you get a green revive with the guards gone):
+
+```
+~/.claude/agent-factory/lines/<slug>/
+├── line.json            which blueprint this line came from, who is on it
+├── orc.json             ┐ raw:   sid, model, flags, system prompt, role env
+├── eval.json            │ links: settings, entrypoint, work, mailbox
+└── abl1.json            ┘
+├── settings-orc.json    the file that installs the hooks
+└── settings-eval.json
+```
+
+Raw vs link is one rule: **inline whatever is needed to recreate the agent
+identically** (small, immutable — lose it and the agent comes back wrong); **link
+whatever is big, live, or regenerable** (copy it and the copy rots). `ai revive`
+reads the spec back, and if the settings file has gone missing it regenerates it
+rather than reviving an agent whose hooks would simply be absent.
+
+**The spec, not the blueprint, is the source of truth on revive.** The agent's 100k
+of context was built under those rules; handing it a system prompt that its own
+history contradicts is worse than an out-of-date one. To adopt an edited blueprint,
+respawn deliberately (`ai down <name> && line up` — `line up` alone leaves a running
+station untouched, and says so).
+
+**`revive` refuses rather than half-restoring.** No spec, a spec that won't parse, a
+spec with no launch flags, or a settings file whose hooks can't execute — every one of
+those produces an agent that looks healthy and has no wall, so every one of them is a
+refusal with a reason, not a warning you'd scroll past. `AI_FORCE=1` if you really do
+want the memory back without the role. And the `[wall]` column in `ai ledger` is a live
+check of the hooks on disk, not an echo of the spec's own `delegate: required` — the one
+view meant to reveal a missing wall used to be reading the wrong column, and always said
+the wall was there.
+
+One file per agent, so each file has exactly one writer and there is no
+read-modify-write race to lose — the same race that once cost us mail. The single
+view is a *derived* one, `ai ledger`, which joins the specs against the live world
+(tmux for aliveness, the session log for context size, the mailbox for unread):
+
+```
+$ ai ledger
+NAME       ROLE           MODEL    PARENT        CTX  MAIL STATE  SESSION
+orc        orchestrator   opus     -           142k     0 idle   ● alive
+eval       evaluation     sonnet   orc          38k     2 busy   ● alive  [wall]
+abl1       ablation       haiku    orc          91k     0 idle   ● alive  [wall]
+abl2       ablation       haiku    orc            -     1 -      ○ down (revivable)
+```
+
+`line up` is also idempotent now: a station that is already running is left alone.
+It used to tear down every live agent's TUI, mid-task, if you re-ran it after
+editing one brief.
 
 ## Quick start
 
@@ -129,8 +202,9 @@ approve [name] [1|2|3]answer a tool-permission prompt (default 2 = allow & don't
 ctx [name]           estimated context size (tokens)
 compact [name]       run /compact to shrink context (idle only; your call past ~200k)
 remote [name]        (re)launch with Remote Control — drive it from the Claude web/app
-revive [name] [id]   relaunch a downed agent with its memory (resumes its session)
+revive [name] [id]   relaunch a downed agent with its memory AND its role/hooks/model
 revivable            list downed agents (surviving log) you can revive by name
+ledger               one view of the line: role, model, ctx, unread mail, alive?
 screen [name]        dump the current TUI screen
 keys [name] <keys>   send raw tmux keys (Escape, C-c, …)
 attach [name]        print the tmux attach command for another viewer
@@ -209,6 +283,14 @@ list                 list running interactive agents
 - **Escape clears the input line, it does not just close a popup.** Anything that
   types into a TUI must Escape *before* typing, never after: a post-typing Escape
   wipes the command you just sent.
+- **Keep generated system prompts ASCII.** They travel through bash's `printf %q`,
+  and bash 3.2 (what macOS ships) mangles non-ASCII there — an em dash came out as
+  one raw byte plus two escaped ones. Downstream, BSD `sed` hit that byte, aborted
+  with *illegal byte sequence*, and printed **nothing**; the empty result became the
+  agent's saved flags. The spec looked fine — every other field was right — and the
+  agent would have revived with no model, no system prompt and no hooks. One em dash
+  in a prompt, and the wall is gone. (Both ends are fixed: the prompts are ASCII, and
+  the flag parsing is byte-level with no locale in the middle.)
 
 ## Packaged as a skill
 

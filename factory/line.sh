@@ -45,6 +45,14 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AI="$HERE/ai.sh"
 PY="${PYTHON:-python3}"
+# Specs and settings live in $HOME, not under $AF_ROOT (which defaults into /tmp).
+# /tmp is wiped on reboot while the manifest in $HOME survives — so the old layout
+# let `ai revive` come back green with the settings file, and therefore the hooks,
+# and therefore the delegate-wall, silently gone. Same class of failure as a hook
+# without its +x bit: the guard is absent and nothing says so.
+# Side benefit: $HOME is outside the wall's allowlist (work/ + /tmp), so a walled
+# agent cannot rewrite the file that installs its own wall.
+SPECROOT="${AF_SPECROOT:-$HOME/.claude/agent-factory/lines}"
 
 # Flatten the blueprint into one TSV row per agent, so the shell never has to
 # parse YAML. `count:` is expanded here (abl → abl1 abl2 abl3) and defaults are
@@ -78,9 +86,15 @@ for name, cfg in agents.items():
 # Peers = everyone else on the line. Every agent may mail every agent; the
 # blueprint only fixes who they REPORT to, not who they may talk to.
 allnames = [n for n, _ in names]
+# The line's own orchestrator, by ROLE not by name — see the parent default below.
+orch = next((n for n, c in names if (c.get('role') or 'worker') == 'orchestrator'), '')
 for nm, cfg in names:
     role     = cfg.get('role') or 'worker'
-    parent   = cfg.get('parent') or ('' if role == 'orchestrator' else 'orc')
+    # Default parent = whoever holds role:orchestrator on THIS line. It used to be
+    # the literal 'orc' — my own example name, leaked into the code. Name your top
+    # station 'boss' and every other station would have reported to a nonexistent
+    # 'orc': mail into a mailbox nobody reads, and not one error anywhere.
+    parent   = cfg.get('parent') or ('' if role == 'orchestrator' else orch)
     model    = cfg.get('model') or d.get('model') or ''
     delegate = 'required' if flag(cfg.get('delegate'), flag(d.get('delegate'))) else ''
     caveman  = '1' if flag(cfg.get('caveman'), flag(d.get('caveman'))) else ''
@@ -170,20 +184,39 @@ _preflight() {
 up() {
   local bp="${1:?usage: line up <blueprint.yml>}"
   _preflight || return 1
-  local slug work name role parent model delegate caveman soft hard peers brief ep n=0
+  local slug work name role parent model delegate caveman soft hard peers brief ep n=0 skipped=0
   while IFS=$'\x1f' read -r slug work name role parent model delegate caveman soft hard peers brief; do
     [ -z "$name" ] && continue
+    # `ai up` kills any existing session for the name before relaunching. Run
+    # `line up` twice — a habit, after an edit to one station's brief — and it would
+    # tear down the whole live fleet, every agent's TUI, mid-task. Alive stays alive;
+    # bring one back deliberately (`ai revive <name>`) or take it down first.
+    if tmux has-session -t "ai-$slug-$name" 2>/dev/null; then
+      # Left alone means NOTHING was applied: not the brief, not the settings, not the
+      # spec. Say that. Reporting "already running" next to a blueprint you just edited
+      # reads as "your edit is live", and it is not — the running agent still holds the
+      # old system prompt, and `ai revive` deliberately restores the OLD spec too.
+      printf '[line] %-10s %-14s %-8s already running — LEFT ALONE (blueprint edits NOT applied)\n' \
+        "$name" "$role" "${model:-default}"
+      printf '[line]            to apply them:  ai down %s && line up %s\n' "$name" "$bp"
+      [ -f "$SPECROOT/$slug/agent-$name.json" ] || \
+        printf '[line]            ⚠ it has no spec (spawned by an older version) — it would revive with NO role and NO hooks\n'
+      skipped=$((skipped+1)); continue
+    fi
     ep="$(_entrypoint "$work" "$name" "$role" "$parent" "$peers" "$delegate" "$brief")"
-    local st="${AF_ROOT:-/tmp/agent-factory}/.ai/$slug/settings-$name.json"
+    local st="$SPECROOT/$slug/settings-$name.json"
     _settings "$slug" "$name" "$st"
 
     # The invariant goes in the system prompt (it survives compaction); the full
     # brief goes in the entrypoint file (too long to repeat, and re-readable).
     local sys="You are '$name', the $role station on the '$slug' line."
     [ -n "$parent" ] && sys="$sys You report to '$parent'."
-    sys="$sys Read $ep NOW — it is your brief, your chain of command and your working rules — then follow it."
-    [ "$delegate" = "required" ] && sys="$sys You are a mini-orchestrator: you do NOT do work directly, you delegate it (delegate-to-local-model skill, or a Task subagent) and verify the result. A hook enforces this."
-    [ "$caveman" = "1" ] && sys="$sys Answer tersely — drop articles, filler and hedging; keep every technical fact exact."
+    sys="$sys Read $ep NOW - it is your brief, your chain of command and your working rules - then follow it."
+    # NOT "…or a Task subagent": a Task subagent runs in this same process, inherits
+    # this same --settings, and is blocked by the same wall (verified). Advertising it
+    # as a route sends the agent into a loop it cannot exit.
+    [ "$delegate" = "required" ] && sys="$sys You are a mini-orchestrator: you do NOT do work directly. To get a file WRITTEN, use the delegate-to-local-model skill (it runs in its own process) or mail the peer who owns the area; a Task subagent inherits your wall and cannot write. Then verify the result. A hook enforces this."
+    [ "$caveman" = "1" ] && sys="$sys Answer tersely - drop articles, filler and hedging; keep every technical fact exact."
 
     AF_SLUG="$slug" AF_ROLE="$role" AF_PARENT="$parent" AF_PEERS="$peers" \
     AF_DELEGATE="$delegate" AF_CAVEMAN="$caveman" AF_WORK="$work" \
@@ -203,8 +236,25 @@ up() {
       printf '[line] %-10s FAILED TO LAUNCH — check: bash %s up %s\n' "$name" "$AI" "$name"
     fi
   done < <(_plan "$bp")
-  echo "[line] $n stations up. attach: tmux attach -t ai-$(_plan "$bp" | head -1 | cut -d$'\x1f' -f1)-<name>"
-  echo "[line] talk to the line:  ai post <agent> \"…\"   |   read replies:  ai mail"
+  # line.json: the fleet-level facts no per-agent spec can hold — which blueprint
+  # this line came from, and who is on it. Written once, by the single process that
+  # brought the line up, so it has no concurrent writer.
+  local lslug; lslug="$(_plan "$bp" | head -1 | cut -d$'\x1f' -f1)"
+  if [ -n "$lslug" ]; then
+    mkdir -p "$SPECROOT/$lslug"
+    AF_BP="$(cd "$(dirname "$bp")" && pwd)/$(basename "$bp")" AF_SL="$lslug" \
+    AF_AG="$(_plan "$bp" | cut -d$'\x1f' -f3 | tr '\n' ' ')" AF_TS="$(date +%s)" \
+    AF_OUT="$SPECROOT/$lslug/line.json" "$PY" -c '
+import json, os
+json.dump({"slug": os.environ["AF_SL"], "blueprint": os.environ["AF_BP"],
+           "agents": os.environ["AF_AG"].split(), "created": int(os.environ["AF_TS"])},
+          open(os.environ["AF_OUT"], "w"), indent=2, ensure_ascii=False)' 2>/dev/null
+  fi
+  # `${skipped:+…}` was wrong: "0" is a NON-EMPTY string, so a clean run always
+  # announced ", 0 already running".
+  local skipmsg=""; [ "$skipped" -gt 0 ] && skipmsg=", $skipped left alone (already running)"
+  echo "[line] $n stations up$skipmsg. attach: tmux attach -t ai-$lslug-<name>"
+  echo "[line] talk to the line:  ai post <agent> \"…\"   |   read replies:  ai mail   |   see it all:  ai ledger"
 }
 
 status() {
@@ -243,5 +293,12 @@ plan() {
 cmd="${1:-}"; shift || true
 case "$cmd" in
   up) up "$@" ;;  down) down "$@" ;;  status) status "$@" ;;  plan) plan "$@" ;;
+  # Regenerate one agent's settings file. Called by `ai revive` when the file has
+  # vanished from under a spec — reviving without it means reviving without hooks.
+  # Preflights first: `up` refuses to spawn into a fail-open state, and this path had
+  # no reason to be the one that quietly hands out a settings file pointing at a hook
+  # that cannot execute.
+  settings) _preflight || exit 1
+            _settings "${1:?slug}" "${2:?name}" "${3:?out}" && echo "[line] wrote $3" ;;
   *) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}" ;;
 esac
