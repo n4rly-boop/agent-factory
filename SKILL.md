@@ -400,13 +400,20 @@ nothing, while a stale "outstanding" flag (a crashed agent, a task queued for an
 that never came up) stalled *every* idle turn by 45 seconds. Hand control back; the
 doorbell is how you hear about it.
 
-## Surviving the usage limit — `limits.sh`
+## The warden — `warden.sh` (the line, when nobody is driving it)
 
 ```bash
-limits watch     # started automatically by `line up`; safe to re-run
-limits status    # quota, reset time, who got cut off
-limits stop
+warden watch     # started automatically by `line up`; safe to re-run
+warden status    # quota, reset time, who got cut off, last sweep
+warden stop
 ```
+
+**It runs the context guard on a clock.** `ai sweep` only ever fired from `ai post` /
+`ai mail` / `ai sweep` — i.e. only while the *driving session* was speaking. A line working
+autonomously never goes through those (the agents mail each other via `mail.sh`), so it was
+never compacted at all. Observed: a station reached **767k tokens against a 500k hard
+threshold** overnight, with nothing to trip it. "Automatic" compaction that only fires while
+a human is at the keyboard is a manual command with a misleading name.
 
 The 5-hour subscription limit is **account-wide**. It does not stop one agent — it kills
 every agent on the machine *and the orchestrator session driving them*, mid-turn, at the

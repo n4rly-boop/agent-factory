@@ -388,7 +388,7 @@ json.dump({"slug": os.environ["AF_SL"], "blueprint": os.environ["AF_BP"],
   # start a rescuer once it lands. It has to already be running, and it has to be something
   # that spends no tokens. Idempotent: re-running `line up` does not start a second one.
   AF_SLUG="$lslug" AF_ROOT="${AF_ROOT:-/tmp/agent-factory}" AF_CWD="$(pwd)" \
-    bash "$HERE/limits.sh" watch 2>/dev/null | sed 's/^/[line] /'
+    bash "$HERE/warden.sh" watch 2>/dev/null | sed 's/^/[line] /'
 }
 
 status() {

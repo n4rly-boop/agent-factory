@@ -517,6 +517,13 @@ _ctx() {
 # Actively generating: a live "(Ns · …)" timer on screen.
 _busy()      { tmux capture-pane -t "$(S "$1")" -p | grep -qE '\([0-9]+s · '; }
 # Paused on a tool-permission decision.
+# An agent under the account-wide usage limit cannot compact: /compact is a MODEL CALL, and
+# the model is exactly what it has run out of. Sending it anyway achieves nothing, and it
+# achieves nothing FOREVER — the context never drops, so the next sweep sees the same fat
+# agent and sends /compact again, every tick, until the quota returns. Observed live:
+# `❯ /compact ⎿ You've hit your session limit · resets 10am`.
+# The warden is the one that deals with the limit; sweep's only job is to stay out of its way.
+_limited()   { tmux capture-pane -t "$(S "$1")" -p 2>/dev/null | grep -qE "hit your (session|usage) limit|usage limit reached"; }
 _permission(){ tmux capture-pane -t "$(S "$1")" -p | grep -qE 'Do you want to proceed\?|❯ 1\. Yes'; }
 
 # Block until the in-flight turn ends, the agent pauses for input, or timeout.
@@ -582,9 +589,14 @@ compact() {
   tmux has-session -t "$s" 2>/dev/null || { echo "[ai] no agent '$name'"; return 1; }
   _busy "$name"       && { echo "[ai] '$name' is mid-turn — refusing to compact (would interrupt). retry when idle."; return 1; }
   _permission "$name" && { echo "[ai] '$name' is on a permission prompt — answer it first (ai approve $name)."; return 1; }
+  _limited "$name"    && { echo "[ai] '$name' is out of quota (usage limit) — /compact is a model call and would bounce. The warden wakes it on reset."; return 1; }
   local before; before="$(_ctx "$name")"
   echo "[ai] compacting '$name' (ctx ≈ ${before} tok)…"
   say "$name" "/compact" || return 1
+  # Stamp it. `_ctx` reads the session log, which keeps the OLD size until the compaction
+  # turn lands — so without this the next sweep sees a still-fat agent and compacts it
+  # again. The stamp, not the size, is what says "this one has been dealt with".
+  mkdir -p "$STATE" 2>/dev/null; printf '%s' "$(date +%s)" > "$STATE/compacted-$name"
   # nowait (used by `sweep`): the keystrokes are sent, the agent compacts on its own.
   # Waiting is only to report the new size — and doing it inside an autosweep would
   # hang `ai post` for up to AI_TIMEOUT per over-threshold agent.
@@ -890,6 +902,18 @@ sweep() {
     tmux has-session -t "$(S "$name")" 2>/dev/null || continue
     _busy "$name" && continue          # mid-turn: not a safe point, skip
     _permission "$name" && continue    # waiting on a human: don't touch
+    if _limited "$name"; then          # out of quota: /compact would just bounce, forever
+      echo "[ai] '$name' is out of quota (usage limit) — not compacting; the warden will wake it on reset"
+      continue
+    fi
+    # A compaction takes a turn to happen, and `_ctx` reads the session LOG — which does not
+    # shrink until that turn lands. So for the next minute or two the agent still reads as
+    # fat, and an unguarded sweep re-sends /compact to an agent that is already compacting.
+    # (Seen: the warden's first tick re-compacted three agents a manual sweep had just done.)
+    local lastc; lastc="$(cat "$STATE/compacted-$name" 2>/dev/null)"
+    if [ -n "$lastc" ] && [ $(( $(date +%s) - lastc )) -lt "${AI_COMPACT_COOLDOWN:-600}" ]; then
+      continue
+    fi
     # The agent's OWN thresholds, from its spec — not the orchestrator's env. A station
     # on a 200k-window model is configured `compact_soft: 80000`; judging it by this
     # session's 200000 means it is never compacted until it dies.
