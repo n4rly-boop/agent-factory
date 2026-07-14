@@ -1,0 +1,50 @@
+
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+❯ /compact
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+❯ /compact
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+❯ /compact
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+❯ /compact
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+❯ /compact
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+❯ /compact
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+❯ /compact
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+❯ /compact
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+                                                                                                                                                                                         current: 2.1.207 · latest: 2.1.208
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  inna |  git:(feat/pagination-identity) | [Opus 4.8] Context: 0%                                                                                                                                                       /rc
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · gh auth login · ← for agents

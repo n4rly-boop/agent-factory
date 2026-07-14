@@ -1,0 +1,26 @@
+{
+  "slug": "inna",
+  "name": "qa",
+  "cwd": "/Users/work/Code/Croissan/inna",
+  "sid": "a505202e-65e8-4880-bb4f-1b1b1208706e",
+  "spawned": 1783970152,
+  "model": "opus",
+  "flags": "--settings /Users/work/.claude/agent-factory/lines/inna/settings-qa.json --model opus --append-system-prompt You\\ are\\ \\'qa\\'\\,\\ the\\ qa\\ station\\ on\\ the\\ \\'inna\\'\\ line.\\ You\\ report\\ to\\ \\'orc\\'.\\ Read\\ /Users/work/Code/Croissan/inna/context/agents/entrypoint-qa.md\\ NOW\\ -\\ it\\ is\\ your\\ brief\\,\\ your\\ chain\\ of\\ command\\ and\\ your\\ working\\ rules\\ -\\ then\\ follow\\ it.\\ You\\ are\\ a\\ mini-orchestrator:\\ delegate\\ work\\ that\\ is\\ bulk\\ or\\ mechanical\\ \\(many\\ items\\,\\ boilerplate\\,\\ spec-code\\,\\ first\\ drafts\\,\\ big\\ logs\\)\\ via\\ the\\ delegate-to-local-model\\ skill\\,\\ or\\ mail\\ the\\ peer\\ who\\ owns\\ the\\ area\\ -\\ then\\ verify\\ what\\ comes\\ back.\\ Small\\ surgical\\ edits\\ you\\ make\\ yourself\\;\\ delegating\\ a\\ three-line\\ fix\\ costs\\ more\\ than\\ doing\\ it.\\ Answer\\ tersely\\ -\\ drop\\ articles\\,\\ filler\\ and\\ hedging\\;\\ keep\\ every\\ technical\\ fact\\ exact.  --dangerously-skip-permissions",
+  "env": {
+    "AF_ROLE": "qa",
+    "AF_PARENT": "orc",
+    "AF_PEERS": "orc,lead,rag",
+    "AF_DELEGATE": "advised",
+    "AF_BULK_LINES": "40",
+    "AF_CAVEMAN": "1",
+    "AF_WORK": "/Users/work/Code/Croissan/inna/context/agents"
+  },
+  "ai_env": {
+    "AI_COMPACT_SOFT": "200000",
+    "AI_COMPACT_HARD": "500000",
+    "AI_NOTIFY_OFF": "1"
+  },
+  "settings": "/Users/work/.claude/agent-factory/lines/inna/settings-qa.json",
+  "entrypoint": "/Users/work/Code/Croissan/inna/context/agents/entrypoint-qa.md",
+  "work": "/Users/work/Code/Croissan/inna/context/agents"
+}

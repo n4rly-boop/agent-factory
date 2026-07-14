@@ -1,0 +1,24 @@
+{
+  "slug": "aae1",
+  "name": "orc",
+  "cwd": "/Users/work/Code/link_ai",
+  "sid": "b045d974-cf11-4979-955c-fd3f2ee9d37f",
+  "spawned": 1783969972,
+  "model": "opus",
+  "flags": "--settings /Users/work/.claude/agent-factory/lines/aae1/settings-orc.json --model opus --append-system-prompt You\\ are\\ \\'orc\\'\\,\\ the\\ orchestrator\\ station\\ on\\ the\\ \\'aae1\\'\\ line.\\ Read\\ /Users/work/Code/context_vault/link_ai/stories/ai-assistant-evolution-1/work/lanes/entrypoint-orc.md\\ NOW\\ -\\ it\\ is\\ your\\ brief\\,\\ your\\ chain\\ of\\ command\\ and\\ your\\ working\\ rules\\ -\\ then\\ follow\\ it.\\ Answer\\ tersely\\ -\\ drop\\ articles\\,\\ filler\\ and\\ hedging\\;\\ keep\\ every\\ technical\\ fact\\ exact.  --dangerously-skip-permissions",
+  "env": {
+    "AF_ROLE": "orchestrator",
+    "AF_PEERS": "eval,annotator",
+    "AF_BULK_LINES": "40",
+    "AF_CAVEMAN": "1",
+    "AF_WORK": "/Users/work/Code/context_vault/link_ai/stories/ai-assistant-evolution-1/work/lanes"
+  },
+  "ai_env": {
+    "AI_COMPACT_SOFT": "200000",
+    "AI_COMPACT_HARD": "500000",
+    "AI_NOTIFY_OFF": "1"
+  },
+  "settings": "/Users/work/.claude/agent-factory/lines/aae1/settings-orc.json",
+  "entrypoint": "/Users/work/Code/context_vault/link_ai/stories/ai-assistant-evolution-1/work/lanes/entrypoint-orc.md",
+  "work": "/Users/work/Code/context_vault/link_ai/stories/ai-assistant-evolution-1/work/lanes"
+}

@@ -1,0 +1,146 @@
+"""Every path in the factory, derived in one place.
+
+No other module in `af` builds a path by string concatenation. The bash system and
+this package write the SAME files during the migration, so a path that drifts by one
+character is not a typo — it is an agent whose mail nobody reads and whose spec
+nobody finds. Both sides derive from the same three env vars (AF_ROOT, AF_SLUG,
+AF_SPECROOT); this file is the Python half of that contract.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+DEFAULT_ROOT = "/tmp/agent-factory"
+SPEC_HOME = Path.home() / ".claude" / "agent-factory"
+PROJECTS = Path.home() / ".claude" / "projects"
+
+_SLUG_STRIP = re.compile(r"[^a-z0-9]")
+
+
+def slugify(name: str) -> str:
+    """ai.sh: basename $CWD | tr A-Z a-z | sed 's/[^a-z0-9]//g' | cut -c1-12."""
+    s = _SLUG_STRIP.sub("", name.lower())[:12]
+    return s or "proj"
+
+
+@dataclass(frozen=True)
+class Paths:
+    """A resolved view of the factory's filesystem for one slug."""
+
+    slug: str
+    root: Path
+    cwd: Path
+    mailroot: Path
+    specroot: Path
+
+    @classmethod
+    def from_env(cls, slug: str | None = None) -> "Paths":
+        cwd = Path(os.environ.get("AF_CWD") or os.getcwd())
+        slug = slug or os.environ.get("AF_SLUG") or slugify(cwd.name)
+        root = Path(os.environ.get("AF_ROOT") or DEFAULT_ROOT)
+        state = root / ".ai" / slug
+        # AF_MAILROOT is honoured because mail.sh honours it: an agent's env carries it,
+        # and a Python reader that ignored it would read a different mailbox than the
+        # bash writer in the same session.
+        mailroot = Path(os.environ.get("AF_MAILROOT") or (state / "mail"))
+        specroot = Path(os.environ.get("AF_SPECROOT") or (SPEC_HOME / "lines"))
+        return cls(slug=slug, root=root, cwd=cwd, mailroot=mailroot, specroot=specroot)
+
+    # --- state -------------------------------------------------------------
+    @property
+    def state(self) -> Path:
+        return self.root / ".ai" / self.slug
+
+    def session(self, agent: str) -> str:
+        return f"ai-{self.slug}-{agent}"
+
+    def sid_file(self, agent: str) -> Path:
+        return self.state / f"sid-{agent}"
+
+    def log_cache(self, agent: str) -> Path:
+        return self.state / f"log-{agent}"
+
+    def compacted(self, agent: str) -> Path:
+        return self.state / f"compacted-{agent}"
+
+    def limited(self, agent: str) -> Path:
+        return self.state / f"limited-{agent}"
+
+    @property
+    def limits_json(self) -> Path:
+        return self.state / "limits.json"
+
+    @property
+    def sweep_lock(self) -> Path:
+        return self.state / "sweep.lock"
+
+    @property
+    def polldir(self) -> Path:
+        return self.state / "poll"
+
+    # --- mail --------------------------------------------------------------
+    def box(self, agent: str) -> Path:
+        return self.mailroot / f"{agent}.jsonl"
+
+    def cursor(self, agent: str) -> Path:
+        return self.mailroot / f"{agent}.cursor"
+
+    def cap(self, agent: str) -> Path:
+        return self.mailroot / f"cap-{agent}"
+
+    def pane(self, agent: str) -> Path:
+        return self.mailroot / f"pane-{agent}"
+
+    def task_flag(self, agent: str) -> Path:
+        return self.mailroot / f"state-{agent}"
+
+    def tasker(self, agent: str) -> Path:
+        return self.mailroot / f"tasker-{agent}"
+
+    @property
+    def blobdir(self) -> Path:
+        return self.mailroot / "blob"
+
+    def blob(self, msg_id: str) -> Path:
+        return self.blobdir / f"{msg_id}.txt"
+
+    def mail_lock(self, agent: str) -> Path:
+        return self.mailroot / f".lock-{agent}"
+
+    def boxes(self) -> list[str]:
+        if not self.mailroot.is_dir():
+            return []
+        return sorted(p.stem for p in self.mailroot.glob("*.jsonl"))
+
+    # --- specs -------------------------------------------------------------
+    @property
+    def specdir(self) -> Path:
+        return self.specroot / self.slug
+
+    def spec_file(self, agent: str) -> Path:
+        # agent-<name>.json, never <name>.json: an agent named `line` would otherwise
+        # collide with the line-level line.json.
+        return self.specdir / f"agent-{agent}.json"
+
+    def settings_file(self, agent: str) -> Path:
+        return self.specdir / f"settings-{agent}.json"
+
+    @property
+    def line_file(self) -> Path:
+        return self.specdir / "line.json"
+
+    @property
+    def manifest(self) -> Path:
+        return SPEC_HOME / "manifest.tsv"
+
+    @property
+    def projects(self) -> Path:
+        return PROJECTS
+
+
+def paths(slug: str | None = None) -> Paths:
+    return Paths.from_env(slug)

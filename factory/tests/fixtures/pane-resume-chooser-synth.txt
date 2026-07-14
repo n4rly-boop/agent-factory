@@ -1,0 +1,8 @@
+ Claude Code v2.1.207
+
+ This session is large. How do you want to resume it?
+
+ ❯ 1. Resume from summary
+   2. Resume full session as-is
+   3. Don't ask again
+
