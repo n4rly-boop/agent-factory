@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import patterns
 from .paths import Paths, paths
+from .nums import intish
 
 
 class SpecError(Exception):
@@ -71,7 +72,7 @@ class Spec:
         the sweeper's env means it is never compacted until it dies."""
         def num(key: str) -> int | None:
             v = self.ai_env.get(key, "")
-            return int(v) if v.isdigit() else None
+            return intish(v, None)
         return num("AI_COMPACT_SOFT"), num("AI_COMPACT_HARD")
 
     def to_dict(self) -> dict:

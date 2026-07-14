@@ -68,6 +68,16 @@ def session_log(agent: str, p: Paths | None = None) -> Path | None:
     return None
 
 
+# Byte PREFILTERS, not parsers. bash grepped for the exact compact rendering
+# ('"stop_reason":"end_turn"'), which is what Claude Code writes today — and which a single
+# whitespace change in the writer would silently reduce to a count of zero, i.e. an `ask`
+# that never returns. These match the token wherever it sits; the json.loads that follows is
+# what decides.
+_END_TURN = b"end_turn"
+_USAGE = b"usage"
+_ASSISTANT = b'"assistant"'
+
+
 def _scan_log(f: Path) -> tuple[int | None, int]:
     """(ctx, endturns) from one streaming pass over the transcript.
 
@@ -76,40 +86,59 @@ def _scan_log(f: Path) -> tuple[int | None, int]:
            the next prompt; the cached buckets are.
     endturns = assistant records with stop_reason == "end_turn".
 
-    Parsed with json.loads under try/except, not grepped. bash counted end_turns with
-    `grep -c` explicitly because it feared a half-written final line — which is a real
-    hazard (the file is being appended to as we read it) but grep is not the fix for it:
-    a try/except drops exactly the torn line and nothing else.
+    ONE json.loads per END_TURN LINE, and one for the ctx record — not one per assistant
+    record. The difference is the whole cost of this function, and this function is on the
+    hot path twice over: `sweep` calls it per agent on every `post`/`mail`, and the wait
+    loops call it every 0.5s tick. A mature agent's jsonl runs to tens of MB, and parsing
+    every assistant record in one was seconds per agent, per command — which is why bash
+    fed jq only a `tail -c` window (ai.sh:508). We cannot take that shortcut: the window is
+    anchored to the END of the file, so end_turns would silently drop out of it as the
+    transcript grew, and `ask`'s "a NEW end_turn since my baseline" would compare two counts
+    taken over different windows. Byte-scanning per line, and parsing only the few lines
+    that matter, is cheap AND whole-file honest.
+
+    The torn final line (the file is being appended to as we read it) is dropped by the
+    try/except, which is what bash reached for `grep` to avoid.
     """
     ctx: int | None = None
     endturns = 0
+    last_usage: bytes | None = None
     try:
         with f.open("rb") as fh:
             for raw in fh:
-                # Only assistant records carry usage or a stop_reason; skipping the rest
-                # unparsed is what keeps this cheap on a 40MB transcript.
-                if b'"assistant"' not in raw:
+                if _ASSISTANT not in raw:
                     continue
+                if _USAGE in raw:
+                    last_usage = raw   # remembered, not parsed: only the LAST one is read
+                if _END_TURN not in raw:
+                    continue
+                # An end_turn line is one per TURN — a handful in a 40MB transcript — so
+                # confirming each one with a real parse is affordable, and it is what keeps a
+                # stray "end_turn" inside a message body from counting as a finished turn.
                 try:
                     rec = json.loads(raw)
                 except Exception:
-                    continue
+                    continue   # the torn final line: the file is being appended to as we read
                 if not isinstance(rec, dict) or rec.get("type") != "assistant":
                     continue
                 msg = rec.get("message") or {}
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("stop_reason") == "end_turn":
+                if isinstance(msg, dict) and msg.get("stop_reason") == "end_turn":
                     endturns += 1
-                usage = msg.get("usage")
-                if isinstance(usage, dict):
-                    ctx = (
-                        int(usage.get("input_tokens") or 0)
-                        + int(usage.get("cache_read_input_tokens") or 0)
-                        + int(usage.get("cache_creation_input_tokens") or 0)
-                    )
     except OSError:
         return None, 0
+
+    if last_usage is not None:
+        try:
+            rec = json.loads(last_usage)
+            usage = ((rec.get("message") or {}).get("usage")) or {}
+            if isinstance(usage, dict) and usage:
+                ctx = (
+                    int(usage.get("input_tokens") or 0)
+                    + int(usage.get("cache_read_input_tokens") or 0)
+                    + int(usage.get("cache_creation_input_tokens") or 0)
+                )
+        except Exception:
+            ctx = None
     return ctx, endturns
 
 
@@ -125,6 +154,12 @@ def _phase(pane: str) -> Phase:
     if patterns.USAGE_LIMIT.search(pane):
         return "limited"
     return "idle"
+
+
+def phase_of(pane: str) -> Phase:
+    """The phase of an ALREADY-CAPTURED pane. The doorbell needs the phase without paying
+    for a transcript walk — see drive.ring, which asks only "is this a permission prompt"."""
+    return _phase(pane)
 
 
 def probe(agent: str, p: Paths | None = None) -> Probe:

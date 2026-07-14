@@ -139,15 +139,32 @@ def _read_cursor(agent: str, p: Paths) -> int:
     land 'behind' the cursor and are eaten one by one, forever, with no error.
 
     A non-numeric cursor fails closed to 0 for the same reason — note str.isdigit() is not
-    [0-9] ('²'.isdigit() is True and int('²') raises), so match explicitly."""
+    [0-9] ('²'.isdigit() is True and int('²') raises), so match explicitly.
+
+    The reset is WRITTEN BACK, which is what keeps bash and Python from disagreeing about the
+    same bytes: mail.sh clamps the in-memory value and leaves the bad one on disk, so for as
+    long as both implementations are live, an unrepaired cursor would have bash reporting
+    `unread 0` and Python reporting `unread N` for one mailbox — and sweep's reaper decides
+    whether a busy flag is garbage on exactly that number. Repairing the file makes the two
+    agree on the next read: bash clamps nothing, because there is nothing left to clamp."""
     try:
         raw = p.cursor(agent).read_text(encoding="utf-8").strip()
     except (OSError, ValueError):
         raw = ""
     c = int(raw) if _DIGITS.fullmatch(raw) else 0
     if c > _lines(p.box(agent)):
+        try:
+            p.cursor(agent).write_text("0", encoding="utf-8")
+        except OSError:
+            pass   # read-only mailbox: still answer 0, still deliver the mail
         return 0
     return c
+
+
+def total(agent: str, p: Paths | None = None) -> int:
+    """How many messages the mailbox holds — the sequence number `send` reports."""
+    p = p or paths()
+    return _lines(p.box(agent))
 
 
 def unread(agent: str, p: Paths | None = None) -> int:

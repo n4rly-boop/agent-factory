@@ -62,8 +62,24 @@ def kill_session(name: str) -> bool:
     return _run(["kill-session", "-t", name]).returncode == 0
 
 
+def display(fmt: str) -> str:
+    """Ask tmux about the pane THIS process is running in (register-self needs it)."""
+    p = _run(["display", "-p", fmt])
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
 def list_sessions() -> list[str]:
     p = _run(["ls", "-F", "#{session_name}"])
+    if p.returncode != 0:
+        return []
+    return [s for s in p.stdout.splitlines() if s]
+
+
+def list_sessions_verbose() -> list[str]:
+    """`tmux ls` as a human reads it — "ai-slug-name: 1 windows (created …)". `ai list` prints
+    exactly this, so `af list` must too, or the same command in two implementations shows a
+    human two different things."""
+    p = _run(["ls"])
     if p.returncode != 0:
         return []
     return [s for s in p.stdout.splitlines() if s]

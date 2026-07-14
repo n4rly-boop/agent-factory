@@ -18,6 +18,16 @@ DEFAULT_ROOT = "/tmp/agent-factory"
 SPEC_HOME = Path.home() / ".claude" / "agent-factory"
 PROJECTS = Path.home() / ".claude" / "projects"
 
+# The bash half of the factory, which is still live and which the AGENTS themselves run:
+# every spawned agent gets AF_MAIL=<mail.sh> in its env, and the doorbell it is told to
+# type is `!bash $AF_MAIL read`. That must keep pointing at the SHELL script — an agent
+# spawned by Python is a plain `claude` with no PYTHONPATH, so a python -m af doorbell
+# would die in its pane. line.sh is here for revive's settings regeneration.
+FACTORY_DIR = Path(__file__).resolve().parents[1]
+MAIL_SH = FACTORY_DIR / "mail.sh"
+POLL_SH = FACTORY_DIR / "polling.sh"
+LINE_SH = FACTORY_DIR / "line.sh"
+
 _SLUG_STRIP = re.compile(r"[^a-z0-9]")
 
 
@@ -66,6 +76,13 @@ class Paths:
 
     def compacted(self, agent: str) -> Path:
         return self.state / f"compacted-{agent}"
+
+    def dead_win_state(self, agent: str) -> list[Path]:
+        """Leftovers from the era when an agent could own a Terminal.app window. Removed on
+        down/up so they cannot outlive the code that understood them; log-<agent> is the
+        session-log path cache, which MUST die with the session id it was resolved for."""
+        return [self.state / f"win-{agent}", self.state / f"tty-{agent}",
+                self.log_cache(agent)]
 
     def limited(self, agent: str) -> Path:
         return self.state / f"limited-{agent}"
