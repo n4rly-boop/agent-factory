@@ -153,7 +153,6 @@ _loop() {
       out="$(AF_SLUG="$SLUG" AF_ROOT="$ROOT" AF_CWD="$CWD" AI_SWEEP_OFF=0 \
              bash "$AI" sweep 2>&1 | grep -E "compact|⚠" | tr '\n' ' ')"
       [ -n "$out" ] && _log "sweep: $out"
-      printf '%s' "$last_sweep" > "$STATE/warden-swept" 2>/dev/null
     fi
 
     local a marked=""

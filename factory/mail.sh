@@ -87,14 +87,11 @@ _lock() {
 _unlock() { rm -rf "$MAILROOT/.lock-$1" 2>/dev/null; }
 
 # Resolve the tmux target of an agent: an explicitly registered pane wins (that's
-# how a human-launched orchestrator makes itself reachable), then the legacy
-# per-slug orchestrator registration, else the deterministic session ai-<slug>-<agent>.
+# how a human-launched orchestrator makes itself reachable), else the
+# deterministic session ai-<slug>-<agent>.
 _target() {
   local a="$1" p; p="$(_pane "$a")"
   [ -f "$p" ] && { cat "$p"; return; }
-  if [ "$a" = orchestrator ] && [ -f "$ROOT/.ai/orch-$SLUG" ]; then
-    cat "$ROOT/.ai/orch-$SLUG"; return
-  fi
   printf 'ai-%s-%s' "$SLUG" "$a"
 }
 _alive() { local t; t="$(_target "$1")"; tmux has-session -t "${t%%:*}" 2>/dev/null; }

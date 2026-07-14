@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # afctl — manage/clean up session logs of agents spawned by the factory.
 #
-# Every agent launched by ai.sh / af.sh runs with a known --session-id (so its
+# Every agent launched by ai.sh runs with a known --session-id (so its
 # log file is <uuid>.jsonl) recorded in the manifest. This tool uses the
 # manifest to list and purge ONLY factory logs, never your manual sessions.
 #

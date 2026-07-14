@@ -64,10 +64,7 @@ SLUG="${AF_SLUG:-$(basename "$CWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-
 [ -z "$SLUG" ] && SLUG="proj"
 S() { echo "ai-${SLUG}-${1:-claude}"; }          # tmux session name: ai-<slug>-<name>
 STATE="${AF_ROOT:-/tmp/agent-factory}/.ai/${SLUG}"   # per-slug: session-id tracking
-ORCHDIR="${AF_ROOT:-/tmp/agent-factory}/.ai"     # slug-keyed orchestrator registry (orch-<slug>)
-INBOX="${AF_ROOT:-/tmp/agent-factory}/inbox.tsv"  # agent→orchestrator escalations (legacy log)
 MAILROOT="${AF_ROOT:-/tmp/agent-factory}/.ai/${SLUG}/mail"  # per-slug mailboxes (the real channel)
-NOTIFY="$HERE/notify.sh"                          # helper a spawned agent runs to escalate
 POLL="$HERE/polling.sh"                           # timer: the same message on a clock
 MAIL="$HERE/mail.sh"                              # reliable agent↔agent transport (see mail.sh)
 MANIFEST="$HOME/.claude/agent-factory/manifest.tsv"  # registry of spawned agents
@@ -341,10 +338,10 @@ up() {
   fi
   _writespec "$name" "$id" "$basefl"
   # Give the agent an IDENTITY and a back-channel to its orchestrator: env vars
-  # (AF_AGENT/AF_INBOX/AF_NOTIFY) so notify.sh knows who it is + where to post,
-  # plus an appended system prompt telling it to escalate real blockers instead
-  # of stalling silently. Opt out with AI_NOTIFY_OFF=1. printf %q keeps the whole
-  # thing safe through the sh -c that tmux runs the command under.
+  # (AF_AGENT/AF_SLUG) so it knows who it is, plus an appended system prompt
+  # telling it to escalate real blockers instead of stalling silently. Opt out
+  # with AI_NOTIFY_OFF=1. printf %q keeps the whole thing safe through the sh -c
+  # that tmux runs the command under.
   # AF_MAIL is what makes an agent reachable by the RELIABLE channel: with it in
   # the env, a sender can ring its doorbell by typing the path-free `!bash $AF_MAIL`
   # (no slash → no autocomplete popup to swallow the Enter). The cap- marker below
@@ -354,8 +351,8 @@ up() {
   # AF_POLL travels with AF_MAIL for one reason: the agent must be able to switch its
   # OWN timer off (`bash $AF_POLL stop` — no argument, it reads AF_AGENT). It is the only
   # party that knows the wait is over; a human who has to notice a stale timer will not.
-  envpfx="$(printf 'AF_AGENT=%q AF_SLUG=%q AF_INBOX=%q AF_NOTIFY=%q AF_MAIL=%q AF_POLL=%q AF_MAILROOT=%q AF_ROOT=%q' \
-            "$name" "$SLUG" "$INBOX" "$NOTIFY" "$MAIL" "$POLL" "$MAILROOT" "${AF_ROOT:-/tmp/agent-factory}")"
+  envpfx="$(printf 'AF_AGENT=%q AF_SLUG=%q AF_MAIL=%q AF_POLL=%q AF_MAILROOT=%q AF_ROOT=%q' \
+            "$name" "$SLUG" "$MAIL" "$POLL" "$MAILROOT" "${AF_ROOT:-/tmp/agent-factory}")"
   # Role vars, when set (by `ai line` from a blueprint), travel into the agent's
   # env so its hooks can enforce the role without any per-agent config file: the
   # reminder hook reads them to restate the chain of command, the delegate-wall
@@ -732,8 +729,7 @@ register_self() {
   fi
   local tgt; tgt="$(tmux display -p '#{session_name}:#{window_index}.#{pane_id}' 2>/dev/null)"
   [ -z "$tgt" ] && { echo "[ai] couldn't resolve this tmux pane"; return 1; }
-  mkdir -p "$ORCHDIR" "$MAILROOT"
-  printf '%s' "$tgt" > "$ORCHDIR/orch-$SLUG"     # legacy escalation push
+  mkdir -p "$MAILROOT"
   printf '%s' "$tgt" > "$MAILROOT/pane-orchestrator"   # mail doorbell target
   # An orchestrator started WITH AF_MAIL in its env gets the clean path-free
   # doorbell like any spawned agent. Started without it (a plain `claude` in
@@ -752,7 +748,7 @@ register_self() {
   echo "[ai] agents can now WAKE this session with mail (no polling needed)."
 }
 unregister_self() {
-  rm -f "$ORCHDIR/orch-$SLUG" "$MAILROOT/pane-orchestrator" "$MAILROOT/cap-orchestrator"
+  rm -f "$MAILROOT/pane-orchestrator" "$MAILROOT/cap-orchestrator"
   echo "[ai] unregistered orchestrator for slug '$SLUG'"
 }
 

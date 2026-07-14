@@ -31,8 +31,6 @@ be watched live by the human.
   single agent.**
 - **`mail.sh` — the channel between agents.** Mailbox + doorbell + cursor-as-ack.
   Never type a message into another agent's pane by hand; send it as mail.
-- **`af.sh` — headless worker** over a FIFO bus (`claude -p` in a loop, persistent
-  `--resume`). No TUI; programmatic request→reply. For scripted pipelines.
 
 Scripts live in `scripts/` next to this file. Reference them by absolute path:
 `bash "$SKILL/scripts/ai.sh" ...`, where `$SKILL` is this skill's dir.
@@ -476,20 +474,6 @@ Three ways a timer turns on you, and what stops each:
 
 The tick is sent **from whoever started the timer** (you, by default), so the agent's reply
 lands in your `ai mail` and not in some fictional `poll` mailbox nobody reads.
-
-## Headless workers — `af.sh`
-
-```bash
-af.sh up   [name]          # spawn a worker in a detached tmux session (af-<name>)
-af.sh say  [name] "text"   # send a task, block, print the reply
-af.sh log  [name]          # the worker's transcript
-af.sh down [name]          # stop + clean up FIFOs
-af.sh list                 # list workers
-```
-
-For request→reply without a TUI, autonomous loops, or chaining agents. `start.sh`
-launches a two-pane tmux demo (worker + orchestrator REPL); `orchestrator.sh` and
-`send.sh` are its helpers.
 
 ## Cleanup — `afctl.sh`
 

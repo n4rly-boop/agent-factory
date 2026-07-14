@@ -15,7 +15,6 @@ ephemeral subagents.
 | **`factory/mail.sh`** | The **channel between agents**: mailbox + doorbell + cursor-as-ack. | Agents talking to each other, reliably. |
 | **`factory/warden.sh`** | The line **when nobody is driving it**: runs the context guard on a clock (compaction was never automatic — it only fired when a human spoke), and survives the **account-wide usage limit**, waking the cut-off agents at the exact reset time. Spends no tokens, so the limit cannot kill it. | Always, on any line you leave working. `line up` starts it. |
 | **`factory/polling.sh`** | A **timer**: the same message to one agent every N minutes, delivered as mail. Dies with its agent; skips a tick while the last one is unread; the agent can switch it off itself. | An agent has to keep checking something — a deploy, a queue, a branch that will land. |
-| **`factory/af.sh`** | A **headless worker** (`claude -p` loop) driven over a FIFO message bus, persistent `--resume` session. | Programmatic request→reply, autonomous loops, agent-to-agent chains. |
 | **`factory/afctl.sh`** | Cleanup of spawned agents' session logs via a session-id manifest. | Purge factory logs without touching your manual sessions. |
 
 ## A line, from a blueprint
@@ -204,11 +203,6 @@ bash factory/ai.sh ask neo "What did you just say?"   # remembers — same sessi
 tmux attach -r -t ai-<slug>-neo                  # watch it live, read-only
 bash factory/ai.sh down neo                      # quit + kill the session
 
-# Headless worker over a FIFO bus
-bash factory/af.sh up worker
-bash factory/af.sh say worker "list the risks in worker.sh"
-bash factory/af.sh down worker
-
 # Clean up the session logs the agents created
 bash factory/afctl.sh purge --dry               # preview
 bash factory/afctl.sh purge                      # delete + clear manifest
@@ -352,17 +346,10 @@ factory/
 ├── polling.sh      timers: the same message to an agent every N minutes, by mail
 ├── warden.sh       the unattended line: context guard on a clock + usage-limit rescue
 ├── statusline.sh   per-agent status line; also the ONLY source of rate_limits.resets_at
-├── notify.sh       thin alias for `mail.sh send` (stable entry point for older agents)
-├── hooks/
-│   ├── role-reminder.sh          restates role + chain of command every prompt
-│   ├── delegate-wall.sh          denies a mini-orchestrator's direct edits
-│   ├── limit-hook.sh             StopFailure/rate_limit → marks who the limit cut off
-│   └── escalation-stop-hook.sh   wakes an idle orchestrator when mail arrives
-├── af.sh           headless FIFO-bus workers
-├── worker.sh       the worker loop af.sh launches
 ├── afctl.sh        session-log cleanup (manifest-based)
-├── orchestrator.sh REPL for the af.sh demo
-├── send.sh         one-shot send to an af.sh worker
-├── start.sh        two-pane tmux demo (worker + orchestrator)
-└── README.md       factory-level docs
+└── hooks/
+    ├── role-reminder.sh          restates role + chain of command every prompt
+    ├── delegate-wall.sh          denies a mini-orchestrator's direct edits
+    ├── limit-hook.sh             StopFailure/rate_limit → marks who the limit cut off
+    └── escalation-stop-hook.sh   wakes an idle orchestrator when mail arrives
 ```
