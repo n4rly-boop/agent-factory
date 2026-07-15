@@ -191,8 +191,29 @@ def ring(agent: str, p: Paths | None = None) -> bool:
     if not tmux.has_session(tgt.split(":", 1)[0]):
         return False
     pane = tmux.capture_pane(tgt)
-    if pane is not None and probemod.phase_of(pane) == "permission":
+    phase = probemod.phase_of(pane) if pane is not None else "idle"
+    if phase == "permission":
         return False
+
+    # DEDUP. Typing the doorbell at a BUSY agent QUEUES it to fire at the turn boundary —
+    # and each queued `!…read` is its OWN model turn. N sends during one long turn queue N
+    # doorbells; the first reads ALL unread, the rest fire empty turns. So if a doorbell is
+    # already queued (marker set) and the agent is still busy, don't queue another: the one
+    # in flight will deliver this message too. An IDLE agent is always rung — it needs the
+    # nudge, and its read clears the marker. (Cheap best-effort marker; a lost race just
+    # costs one extra doorbell, never a lost message.)
+    busy = phase == "generating"
+    if busy and p.ring_pending(agent).is_file():
+        return True
+
+    def _queued() -> bool:
+        """Record that a doorbell is now queued into a busy agent, so the next send skips."""
+        if busy:
+            try:
+                p.ring_pending(agent).write_text("1", encoding="utf-8")
+            except OSError:
+                pass
+        return True
 
     tmux.send_keys(tgt, "C-u")
     time.sleep(CLEAR_SETTLE)
@@ -207,7 +228,7 @@ def ring(agent: str, p: Paths | None = None) -> bool:
             time.sleep(SUBMIT_SETTLE)
             back = tmux.capture_pane(tgt)
             if back is None or patterns.input_box(back) != DOORBELL_BODY:
-                return True   # the box no longer holds it ⇒ it was submitted
+                return _queued()   # the box no longer holds it ⇒ it was submitted
             tmux.send_keys(tgt, "C-u")
             time.sleep(CLEAR_SETTLE)
         return False
@@ -229,7 +250,7 @@ def ring(agent: str, p: Paths | None = None) -> bool:
         time.sleep(SUBMIT_SETTLE)
         back = tmux.capture_pane(tgt)
         if back is None or patterns.input_box(back) != prompt:
-            return True
+            return _queued()
     return False
 
 

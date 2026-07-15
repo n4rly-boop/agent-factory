@@ -118,6 +118,13 @@ class Paths:
     def tasker(self, agent: str) -> Path:
         return self.mailroot / f"tasker-{agent}"
 
+    def ring_pending(self, agent: str) -> Path:
+        """Set when a doorbell has been QUEUED into a busy agent, cleared when the agent next
+        reads. While it exists, further sends to that busy agent skip the doorbell: the one
+        already queued drains ALL unread on the turn boundary, so extra `!…read` keystrokes
+        would only fire extra empty model turns."""
+        return self.mailroot / f"ring-{agent}"
+
     @property
     def blobdir(self) -> Path:
         return self.mailroot / "blob"

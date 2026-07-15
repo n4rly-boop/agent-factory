@@ -264,6 +264,12 @@ def read(agent: str | None = None, peek: bool = False,
         box = p.box(agent)
         cur = _read_cursor(agent, p)
         tot = _lines(box)
+        if not peek:
+            # The doorbell that triggered this read has now fired — clear the pending marker
+            # so a future send may ring again. Cleared even when there is nothing new (a
+            # doorbell that found the box already drained still fired), or the marker would
+            # stick and silence the next send. See Paths.ring_pending / drive.ring.
+            p.ring_pending(agent).unlink(missing_ok=True)
         if tot <= cur:
             return []
         if not peek:
