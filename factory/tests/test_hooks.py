@@ -735,11 +735,16 @@ class BashParity(TempFactory):
         self.assertEqual((b.returncode, b.stdout), (0, ""))
         self.assertEqual((p.returncode, p.stdout), (0, ""))
 
-    def test_the_typo_is_where_python_deliberately_diverges(self):
+    def test_the_typo_hole_is_closed_now_that_bash_is_a_shim(self):
+        # The old bash delegate-wall had a hole: a typo'd AF_DELEGATE ("requird") matched no
+        # case, so the wall silently fell open (returncode 0) — the exact fail-open this port
+        # exists to close. Python is FATAL on a level it cannot read (2). After T4, bash is a
+        # thin shim that EXECS Python, so the two no longer diverge: bash fails closed too,
+        # because bash IS Python now. That convergence is the migration working as designed.
         b, p = self.both("delegate-wall", write_ev(f"{REPO}/src.py"),
                          AF_DELEGATE="requird", AF_WORK=WORK, AF_CWD=REPO)
-        self.assertEqual(b.returncode, 0, "the bash hole this port exists to close")
         self.assertEqual(p.returncode, 2, "python must be FATAL on a level it cannot read")
+        self.assertEqual(b.returncode, 2, "bash is a shim → Python → same fail-closed verdict")
 
     def test_the_role_line_is_byte_for_byte_the_same(self):
         for env in ({"AF_ROLE": "worker", "AF_AGENT": "coder", "AF_DELEGATE": "advised"},
