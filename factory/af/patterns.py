@@ -15,8 +15,11 @@ import re
 
 # The generation timer the TUI paints while a turn is in flight: "(4s · ↑ 1.2k tokens…)".
 # Its presence is the ONLY honest "this agent is working right now" signal — the session
-# jsonl says nothing until the turn lands.
-GENERATING = re.compile(r"\(\d+s · ")
+# jsonl says nothing until the turn lands. A turn past 60s rolls the timer to "(1m 5s · …)"
+# and a compaction paints "Coalescing… (7m 12s · …)" — both are STILL working, so the
+# hours/minutes prefix is optional. Matching only "(\d+s" read every long turn as idle,
+# which silently disarmed the doorbell dedup for exactly the busy agents it protects.
+GENERATING = re.compile(r"\((?:\d+h )?(?:\d+m )?\d+s · ")
 
 # A tool-permission pause. This prompt is a SELECT, not an input box: text typed here
 # lands in the selector and the Enter that follows confirms the highlighted default.

@@ -19,17 +19,20 @@ no orchestrator is issuing commands.
      same instant, mid-turn. The rescuer therefore cannot be a Claude — there is none left.
      It must be a process that spends no tokens, so the limit cannot touch it.
 
-HOW IT KNOWS THE LIMIT LIFTED. Two documented signals, no screen-scraping:
-  * the StopFailure hook (matcher rate_limit) drops `limited-<name>` for the agent whose turn
-    was killed — that distinguishes "was cut off mid-work" from "was idle anyway"; only the
-    first needs waking.
-  * the statusline writes rate_limits.five_hour.resets_at to limits.json — the exact epoch
-    the window lifts. NO CLI reports that number from outside a session, so the agents have
-    to leave it behind. If it is not there, the warden WAITS and says so; it does not guess.
-    A wake that lands one second early just burns the agent's turn on the same error.
-
-The pane is read too, but only as a BELT: a hook that fails to fire (wrong version, lost +x)
-fails SILENTLY, and a rescue system that quietly does not rescue is worse than none.
+HOW IT RESCUES. It marks WHO was cut off, then wakes them by GROUND TRUTH — never a clock:
+  * WHO — the StopFailure hook (matcher rate_limit) drops `limited-<name>` for the agent whose
+    turn was killed, so an agent that was merely idle when the limit landed is left alone. The
+    pane is read as a BELT: a hook that fails to fire (wrong version, lost +x) fails SILENTLY,
+    and a rescue system that quietly does not rescue is worse than none.
+  * WHEN — it does NOT wait for a reset time. The statusline's resets_at was a PROPHECY: true
+    only for the account that rendered it, and a line's agents get moved between accounts, so a
+    reset time can name a window that has already lifted (or one that never applied). Instead
+    the warden POKES a cut-off agent on a capped interval and watches its TRANSCRIPT. A turn
+    that LANDS (the end_turn count climbs) is the only honest proof the window reopened — the
+    limit prose lingers in the scrollback long past the reset, so the pane cannot say. A poke
+    that lands while still limited costs one turn that errors instantly: cheap, and the price
+    of never trusting a clock that lies. (limits.json is still read, but ONLY for `status`
+    display — never for a wake decision.)
 
 WHAT IT DOES NOT DO. It cannot recover the killed turn: that API call is gone, and its tool
 call with it. The agent keeps its full context, so it can pick the work back up — but it has
@@ -49,7 +52,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import drive, live, mailbox, patterns, sweep as sweepmod, tmux
+from . import drive, live, mailbox, patterns, probe as probemod, sweep as sweepmod, tmux
 from .paths import FACTORY_DIR, Paths, paths
 from .nums import intish
 
@@ -63,10 +66,11 @@ def tick_secs() -> int:
     return _int_env("AI_LIMITS_TICK", 60)
 
 
-def grace_secs() -> int:
-    # The reset is not instant on the server side, and a wake that lands one second early
-    # just burns the agent's turn on the same error.
-    return _int_env("AI_LIMITS_GRACE", 45)
+def poke_every() -> int:
+    # We never wait for a scraped reset time; we retry the wake this often and watch the
+    # transcript. Low enough that an early reset (an account switch) is found within one
+    # interval; high enough that a poke wasted on a still-limited agent is rare.
+    return _int_env("AI_LIMITS_POKE", 300)
 
 
 def sweep_every() -> int:
@@ -231,10 +235,19 @@ def _sweep_quietly(p: Paths) -> str:
 def loop(p: Paths) -> int:
     """It must be boring: it runs for hours, unattended, through the exact event that kills
     everything else on the machine."""
-    tick, grace, every = tick_secs(), grace_secs(), sweep_every()
-    log(f"warden up (tick {tick}s, grace {grace}s, sweep every {every}s)", p)
+    tick, every, poke = tick_secs(), sweep_every(), poke_every()
+    log(f"warden up (tick {tick}s, sweep every {every}s, poke every {poke}s)", p)
     last_sweep = 0.0
     stop = {"now": False}
+
+    # Per-agent rescue state, in memory: the warden is long-lived, and a restart just
+    # re-baselines (it will poke once more and read the transcript afresh — no harm).
+    attempt_after: dict[str, float] = {}   # do not poke this agent again before this epoch
+    baseline: dict[str, int] = {}          # its end_turn count at our last poke
+
+    def _forget(a: str) -> None:
+        attempt_after.pop(a, None)
+        baseline.pop(a, None)
 
     def _term(_signum, _frame):
         stop["now"] = True
@@ -281,46 +294,54 @@ def loop(p: Paths) -> int:
         if not marked:
             continue
 
-        reset = resets_at(p)
         now = int(time.time())
-        if not reset:
-            # Nobody has rendered a statusline, so nobody knows when the window lifts. Do NOT
-            # invent a number: a wrong guess wakes them into the same wall and burns the first
-            # turn of the new window. Wait and look again — a parked agent still renders.
-            log(f"cut off:{''.join(' ' + m for m in marked)} — but no resets_at on disk yet; "
-                f"waiting (is the statusline wired up?)", p)
-            continue
-        if now < reset + grace:
-            left = reset + grace - now
-            log(f"cut off:{''.join(' ' + m for m in marked)} — sleeping {left // 60}m until "
-                f"the window resets", p)
-            continue
-
+        # RESCUE by ground truth, not by a scraped clock (see the module docstring). No
+        # resets_at gate: poke on a capped interval and watch the transcript for a turn to land.
         for a in marked:
             if not tmux.has_session(p.session(a)):
                 log(f"{a}: gone — dropping its marker", p)
                 p.limited(a).unlink(missing_ok=True)
+                _forget(a)
                 continue
             # The name is the same; is the AGENT? A fresh spawn minted a new sid and never
-            # lived through the limit — it must not be told to "carry on where you were cut
-            # off".
+            # lived through the limit — it must not be told to "carry on where you were cut off".
             when, msid = marker(a, p)
             nsid = _sid(a, p)
             if msid and nsid and msid != nsid:
                 log(f"{a}: session changed since it was cut off — a different agent holds the "
                     f"name; dropping the marker", p)
                 p.limited(a).unlink(missing_ok=True)
+                _forget(a)
                 continue
-            # Still showing the wall? Then the window did not really lift (the 7-day cap can
-            # hold you down long past the 5-hour reset). Leave the marker; try again next tick.
-            if pane_limited(a, p):
-                log(f"{a}: reset time passed but the pane still shows the limit — 7-day cap? "
-                    f"retrying next tick", p)
+            pr = probemod.probe(a, p)
+            # RECOVERED: a turn LANDED since our last poke → the window really reopened. This is
+            # the only signal that survives an account switch — the pane keeps the old wall in
+            # scrollback, but the transcript's end_turn count climbs only when a real turn
+            # completes. It rests on one assumption: a rate-limited turn writes NO end_turn (the
+            # same assumption drive.wait_turn makes), so a poke that errors cannot look like
+            # recovery.
+            #
+            # Only NOW do we mail the WAKE — on this confirmed-working turn. Mailing it at poke
+            # time would lose it: the poke's `!bash $AF_MAIL read` runs even under the limit and
+            # ACKs the letter (the cursor is the ack), while the model turn that would have read
+            # it errors — so the reopened agent would read an empty box and never be told to
+            # resume. Deliver on recovery, and the very next turn carries the instruction.
+            if a in baseline and pr.endturns > baseline[a]:
+                why = f"at {datetime.fromtimestamp(when).strftime('%H:%M')}" if when else "earlier"
+                wake(a, why, p)
+                p.limited(a).unlink(missing_ok=True)
+                _forget(a)
+                log(f"{a}: recovered — a turn landed; woken to pick the work back up", p)
                 continue
-            why = f"at {datetime.fromtimestamp(when).strftime('%H:%M')}" if when else "earlier"
-            wake(a, why, p)
-            p.limited(a).unlink(missing_ok=True)
-            log(f"{a}: woken — told to pick the work back up", p)
+            if now < attempt_after.get(a, 0.0):
+                continue                       # inside the poke interval: wait and keep watching
+            # POKE: trigger a turn to test whether the window reopened — ring only, no WAKE yet
+            # (see above). The doorbell's `!mail read` consumes only mail already in the box,
+            # which a peer's own ring would have consumed anyway, so it adds no new loss.
+            drive.ring(a, p)
+            baseline[a] = pr.endturns
+            attempt_after[a] = now + poke
+            log(f"{a}: poked — watching for a turn to land", p)
             time.sleep(STAGGER)
     log("stopped (signal)", p)
     return 0

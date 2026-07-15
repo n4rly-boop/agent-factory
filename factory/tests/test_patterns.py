@@ -49,6 +49,28 @@ class TestGenerating(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertTrue(patterns.GENERATING.search(line))
 
+    def test_hours_and_minutes_prefix_is_still_generating(self):
+        # A turn past 60s rolls the timer to "(1m 5s · …)", past an hour to "(2h 3m 4s · …)",
+        # and a compaction paints "Coalescing… (7m 12s · …)". All are STILL working: matching
+        # only "(\d+s" read every long turn as idle and silently disarmed the doorbell dedup
+        # for exactly the busy agents it protects. The h/m prefix is optional, so the bare
+        # "(4s · …)" must go on matching too.
+        for line in (
+            "(4s · ↑ 1.2k tokens)",
+            "(1m 5s · …)",
+            "(10m 49s · …)",
+            "Coalescing… (7m 12s · …)",
+            "(2h 3m 4s · …)",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(patterns.GENERATING.search(line), f"missed: {line!r}")
+
+    def test_no_timer_is_not_generating(self):
+        # A pane with only a context readout and no parenthesised timer is idle: nothing to ring.
+        for line in ("Context: 0%", "❯ some prompt with no statusline"):
+            with self.subTest(line=line):
+                self.assertIsNone(patterns.GENERATING.search(line))
+
     def test_agrees_with_the_bash_it_replaces(self):
         # ai.sh:516  _busy(){ ... grep -qE '\([0-9]+s · '; }
         bash = re.compile(r"\([0-9]+s · ")

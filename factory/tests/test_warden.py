@@ -6,6 +6,7 @@ tmux and the doorbell mocked — no pane is touched, nothing is spawned.
 from __future__ import annotations
 
 import json
+import os
 import time
 import unittest
 from unittest import mock
@@ -72,6 +73,35 @@ class WakePath(TempFactory):
             self.assertTrue(warden.pane_limited("w", self.p))
         with mock.patch.object(tmux, "capture_pane", return_value="❯ all clear"):
             self.assertFalse(warden.pane_limited("w", self.p))
+
+
+class PokeInterval(unittest.TestCase):
+    """poke_every is the capped interval between wakes: the warden never waits for a scraped
+    reset clock, it re-pokes this often and watches the transcript. Default 300s; an operator
+    can retune it with AI_LIMITS_POKE, and junk in that env must fall back rather than crash
+    (the warden is a rescuer — a crash there is silent).
+
+    The single-iteration rescue path (a marked agent gets poked; a climbed end_turn count
+    clears the marker) is NOT tested here: that logic lives INLINE in warden.loop(), an
+    hours-long sleep loop with no factored-out step to call, so exercising it would mean
+    mocking tmux/probe/drive/mailbox and re-implementing the loop body in the test. That is
+    too invasive to be a trustworthy check, so it is deliberately skipped.
+    """
+
+    def test_default_is_300(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AI_LIMITS_POKE", None)
+            self.assertEqual(warden.poke_every(), 300)
+
+    def test_env_overrides_the_default(self):
+        with mock.patch.dict(os.environ, {"AI_LIMITS_POKE": "45"}):
+            self.assertEqual(warden.poke_every(), 45)
+
+    def test_junk_env_falls_back_to_the_default(self):
+        for junk in ("notanumber", "", "-5", "3.5"):
+            with self.subTest(junk=junk):
+                with mock.patch.dict(os.environ, {"AI_LIMITS_POKE": junk}):
+                    self.assertEqual(warden.poke_every(), 300)
 
 
 if __name__ == "__main__":
