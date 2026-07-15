@@ -8,7 +8,7 @@ description: >-
   other, revive a killed agent, or list/clean up previously spawned agents and
   their session logs. ALSO use it to stand up a whole TEAM of agents — a LINE — with
   roles and a hierarchy (orchestrator + workers, parallel multi-agent experiments,
-  ablations) — that is `line.sh` with a blueprint.yml. Invoked as `/agent-factory
+  ablations) — that is `af line` with a blueprint.yml. Invoked as `/agent-factory
   plan <goal>` it runs an INTERACTIVE blueprint wizard: it interviews the user,
   proposes the stations and their briefs, and writes the blueprint.yml with them.
   Trigger even if the user just says "spawn an agent", "open another claude", "talk
@@ -23,17 +23,38 @@ with them across many turns. They are NOT subagents: each has its own context
 window and session, persists across your turns until explicitly `down`ed, and can
 be watched live by the human.
 
-- **`line.sh` — a whole line from one `blueprint.yml`.** Roles, chain of command,
+- **`af line` — a whole line from one `blueprint.yml`.** Roles, chain of command,
   per-agent model, enforced delegation. Use this the moment the user wants a *team*
   rather than an agent. See "Lines".
-- **`ai.sh` — a real interactive Claude TUI** in a detached tmux session. You drive
-  it with `tmux send-keys` and read it with `tmux capture-pane`. **Default for a
-  single agent.**
-- **`mail.sh` — the channel between agents.** Mailbox + doorbell + cursor-as-ack.
-  Never type a message into another agent's pane by hand; send it as mail.
+- **`af up` / `af ask` — a real interactive Claude TUI** in a detached tmux session.
+  You drive it with `af say`/`af ask` (which wrap `tmux send-keys`) and read it with
+  `af screen`/`af result`. **Default for a single agent.**
+- **`af post` / `af mail` — the channel between agents.** Mailbox + doorbell +
+  cursor-as-ack. Never type a message into another agent's pane by hand; send it as
+  mail.
 
-Scripts live in `scripts/` next to this file. Reference them by absolute path:
-`bash "$SKILL/scripts/ai.sh" ...`, where `$SKILL` is this skill's dir.
+## Running `af`
+
+Commands here are written as `af <cmd>`. `af` is **`python3 -m af`** — the stdlib-only
+Python core in `factory/af/`. It needs that package importable, so run it either from
+the `factory/` dir or with the dir on `PYTHONPATH`. `$SKILL/scripts` is that dir (the
+installed skill symlinks `scripts/` → the repo's `factory/`):
+
+```bash
+SKILL="$HOME/.claude/skills/agent-factory"
+PYTHONPATH="$SKILL/scripts" python3 -m af up neo     # the canonical form
+```
+
+**The old `*.sh` names still work** — `ai.sh`, `mail.sh`, `line.sh`, `warden.sh`,
+`polling.sh`, `statusline.sh` and the `hooks/*.sh` are now **6-line shims** that set
+`PYTHONPATH` and `exec python3 -m af…` for you, so `bash "$SKILL/scripts/ai.sh" up
+neo` is exactly `af up neo` with zero setup. They are kept on purpose and must stay:
+a spawned agent's **doorbell** types `bash $AF_MAIL read` and its **hooks/statusline**
+are wired by absolute path (`.../scripts/hooks/role-reminder.sh`, `.../statusline.sh`),
+so those paths have to keep resolving. `afctl.sh` is still real bash, not a shim.
+
+Present `af` as the primary surface; reach for a `.sh` name only when you want the
+no-setup shim or are matching an existing call site.
 
 ## Invoked as `/agent-factory plan …` — run the blueprint wizard
 
@@ -55,7 +76,7 @@ window opens. A human who wants to watch runs:
 tmux attach -r -t ai-<slug>-<name>    # -r = READ-ONLY — what you want while you drive it
 ```
 
-Tell the human that command when they ask to see an agent; `ai.sh attach <name>`
+Tell the human that command when they ask to see an agent; `af attach <name>`
 prints it. **Read-only matters:** you drive the agent by typing into its pane with
 `send-keys`, so a human typing into the same pane interleaves keystrokes and
 corrupts the input. One writer at a time.
@@ -66,46 +87,55 @@ accepted and ignored.)
 **`<slug>`** is a short per-project tag (from the working-dir name, or `$AF_SLUG`),
 so agents from different projects never collide in `tmux ls` or in state:
 `ai-linkai-worker`, `ai-inna-scout`. You address agents by the short `<name>`; the
-slug is applied for you. `ai.sh slug` prints it.
+slug is applied for you. `af slug` prints it.
 
-## Single agent — `ai.sh`
+## Single agent — `af`
 
 ```bash
-ai.sh up     [name]          # launch a Claude TUI in a detached tmux session
-ai.sh ask    [name] "text"   # say + wait for the turn to finish + print the result  ← use this
-ai.sh say    [name] "text"   # type + submit, don't wait
-ai.sh wait   [name]          # block until the agent is idle or needs input
-ai.sh screen [name]          # dump the current TUI screen
-ai.sh result [name]          # last completed turn's text (from the session log)
-ai.sh ctx    [name]          # estimated context size (tokens)
-ai.sh compact[name]          # run /compact (idle only)
-ai.sh sweep                  # compact idle agents past their threshold; reap stale
-                             #   busy flags. `post`/`mail` run it for you.
-ai.sh remote [name]          # relaunch with Remote Control so the human drives from the Claude app
-ai.sh approve[name] [1|2|3]  # answer a tool-permission prompt (default 2)
-ai.sh keys   [name] <keys>   # raw tmux keys (Escape, C-c, …)
-ai.sh attach [name]          # print the tmux attach command for a human viewer
-ai.sh down   [name]          # quit the agent + kill its session
-ai.sh list                   # running agents
-ai.sh slug                   # the current project slug
-ai.sh ledger                 # THE status view — see "Spec and revive"
-ai.sh revive [name]          # bring a killed agent back with memory AND role/hooks
-ai.sh revivable              # who can be revived
+af up      [name]          # launch a Claude TUI in a detached tmux session
+af ask     [name] "text"   # say + wait for the turn to finish + print the result  ← use this
+af say     [name] "text"   # type + submit, don't wait
+af wait    [name]          # block until the agent is idle or needs input
+af screen  [name]          # dump the current TUI screen
+af result  [name]          # last completed turn's text (from the session log)
+af ctx     [name]          # estimated context size (tokens)
+af compact [name]          # run /compact (idle only)
+af sweep                   # compact idle agents past their threshold; reap stale
+                           #   busy flags. `post`/`mail` run it for you.
+af remote  [name]          # relaunch with Remote Control so the human drives from the Claude app
+af approve [name] [1|2|3]  # answer a tool-permission prompt (default 2)
+af keys    [name] <keys>   # raw tmux keys (Escape, C-c, …)
+af attach  [name]          # print the tmux attach command for a human viewer
+af down    [name]          # quit the agent + kill its session
+af list                    # running agents
+af slug                    # the current project slug
+af ledger                  # THE status view — see "Spec and revive"
+af revive  [name]          # bring a killed agent back with memory AND role/hooks
+af revivable               # who can be revived
+af probe   <name>          # one look — see below
 ```
 
-Mail (see "Mail" below): `ai.sh post <agent> [--kind K] "text"`, `ai.sh mail`
-(`inbox` is an alias), `ai.sh mailstat`, `ai.sh register-self`,
-`ai.sh unregister-self`.
+Mail (see "Mail" below): `af post <agent> [--kind K] "text"`, `af mail`
+(`inbox` is an alias), `af mailstat`, `af register-self`, `af unregister-self`.
+
+**`af probe <name>` is the single source of truth for an agent's live state** — one
+`capture-pane` + one session-log read yield alive/dead, phase (generating, on a
+permission prompt, idle), context size, and the input box, replacing the nine
+scattered screen-scrapes the old code hand-rolled per call. `ask`, `wait`, `sweep`
+and `ledger` all read it; you rarely call it directly, but it is why they agree.
 
 Typical flow — always `ask`, not `say`, when you want the reply:
 
 ```bash
 SKILL="$HOME/.claude/skills/agent-factory"
-bash "$SKILL/scripts/ai.sh" up neo
-bash "$SKILL/scripts/ai.sh" ask neo "Summarize the README in one line"
+export PYTHONPATH="$SKILL/scripts${PYTHONPATH:+:$PYTHONPATH}"   # scripts/ → the repo's factory/
+python3 -m af up neo
+python3 -m af ask neo "Summarize the README in one line"
 # ... more turns; the agent remembers (same session) ...
-bash "$SKILL/scripts/ai.sh" down neo
+python3 -m af down neo
 ```
+
+(Or, with no setup, the shim: `bash "$SKILL/scripts/ai.sh" ask neo "…"`.)
 
 ### What you must know to drive it well
 
@@ -116,14 +146,14 @@ bash "$SKILL/scripts/ai.sh" down neo
   screen for "stability" never settles. Use `ask`; it already does all of this.
 - **`ask` gives up after `AI_TIMEOUT` seconds (default 300)** and tells you the
   agent is still working — it does not kill the turn. Raise it for long tasks
-  (`AI_TIMEOUT=1800 ai.sh ask …`) or come back with `ai.sh wait` / `ai.sh result`.
+  (`AI_TIMEOUT=1800 af ask …`) or come back with `af wait` / `af result`.
 - **The first turn is slow** (~5–6s of session init after `up`). `ask` waits.
 - **Spawned agents skip permission prompts** (`--dangerously-skip-permissions` on
   `up`/`revive`/`remote`): they run unattended, so otherwise they'd stall forever
   on the first tool gate with nobody to approve. They can read/write/run without
   asking — only spawn them on work you'd let run on its own. `AI_SKIP_PERMS=0`
   restores prompting; then `ask` surfaces `⚠ paused on a permission prompt` and
-  `ai.sh approve <name>` answers it.
+  `af approve <name>` answers it.
 - **After `up`, confirm the agent is alive** (`screen` shows the TUI, or `ask`
   returns) before reporting success.
 - **Don't tear agents down unless asked** — they're meant to be long-lived. Agents
@@ -133,19 +163,19 @@ bash "$SKILL/scripts/ai.sh" down neo
 ### Slash commands inside a spawned agent
 
 It's a real Claude Code TUI, so it takes slash commands — `say` one (e.g.
-`ai.sh say neo "/model"`). Two are wired in as first-class commands because timing
+`af say neo "/model"`). Two are wired in as first-class commands because timing
 matters:
 
-- **`/compact` — `ai.sh compact <name>`.** It refuses **mid-generation or on a
+- **`/compact` — `af compact <name>`.** It refuses **mid-generation or on a
   permission prompt** (keystrokes would interrupt the turn or wrongly answer the
   prompt), so it only ever runs at the idle point between turns. Check context size
-  anytime with `ai.sh ctx` or `ai.sh ledger`. Mostly you don't need to call it — see
+  anytime with `af ctx` or `af ledger`. Mostly you don't need to call it — see
   "Context" below, compaction is automatic.
 - **`/remote-control` — hand the human live control from the Claude app or phone.**
-  `ai.sh remote <name>` relaunches the agent with `--remote-control <name>`,
+  `af remote <name>` relaunches the agent with `--remote-control <name>`,
   **resuming its session so memory survives**, then tells the user to open the
   Claude app (sign-in required). After that the human drives; you can still read
-  along with `ai.sh screen`.
+  along with `af screen`.
 
 ### Context — compaction is AUTOMATIC, on task boundaries
 
@@ -162,22 +192,23 @@ back), and that gates it:
 Absolute token counts; set either to `0` to disable. Per-station in a blueprint:
 `compact_soft:` / `compact_hard:` (in `defaults:` or on one agent).
 
-**Where it fires matters.** `ai.sh` is a script, not a daemon: it can only check an
+**Where it fires matters.** `af` is a command, not a daemon: it can only check an
 agent's context at a moment when it happens to hold control right after that agent's
 turn. `ask` is such a moment (it waited for the turn). A **line** agent is driven by
-*mail* and takes its turns while `ai.sh` isn't even running — so there is no hook
-point, and nothing guards it. **`ai.sh sweep` is that guard**: it walks every agent
+*mail* and takes its turns while no driving `af` is even running — so there is no hook
+point, and nothing guards it. **`af sweep` is that guard**: it walks every agent
 with a mailbox and compacts the ones past threshold, skipping any that is
 mid-generation or paused on a permission prompt (keystrokes would interrupt the turn
-or answer the prompt for the human).
+or answer the prompt for the human). And for a line nobody is driving, the **warden**
+runs `sweep` on a clock (see "The warden").
 
-**You do not have to remember to call it.** `ai.sh post` and `ai.sh mail` — the two
+**You do not have to remember to call it.** `af post` and `af mail` — the two
 commands that touch a line — run a sweep themselves (`AI_SWEEP_OFF=1` disables that).
 `post` sweeps **before** it sends, and skips the recipient — compacting an agent in the
 same breath as handing it a task is a race with nothing to gain. Each agent is judged
 by **its own** thresholds, taken from its spec, not the orchestrator's env.
 
-`ai.sh ledger` deliberately does **not** sweep: it's a look, and silently shrinking an
+`af ledger` deliberately does **not** sweep: it's a look, and silently shrinking an
 agent's memory out from under someone who came to inspect it isn't what "show me the
 line" means. It prints which agents a sweep would compact.
 
@@ -188,27 +219,30 @@ skips whoever is running it.
 For a line's orchestrator station (`orc`) that is usually harmless: when **you** sweep
 from the top session, `orc` is just another station and gets compacted like the rest.
 The gap is the fully autonomous line — `orc` drives the workers by mail and nobody up
-top ever runs `ai.sh`. Then `orc` is the only sweeper, so it is the one agent nothing
+top ever runs `af`. Then `orc` is the only sweeper, so it is the one agent nothing
 guards, and it is the longest-lived agent on the line. For that case `post`/`mail`
 print a warning to `orc` when its own context is past threshold: it has to run
-`/compact` itself, at a safe point of its choosing.
+`/compact` itself, at a safe point of its choosing. (The warden's clock covers the same
+gap from the outside.)
 
-## Lines — `line.sh` (when the user wants a team)
+## Lines — `af line` (when the user wants a team)
 
 **No blueprint yet? Do not write one from the snippet below — run the wizard**
 (`$SKILL/scripts/blueprint-wizard.md`): interview the human, propose the stations, write
 the briefs, validate with `line plan`, then stop. See the top of this file.
 
 ```bash
-line.sh plan   blueprint.yml   # resolved roles/hierarchy/models — no spawn. Show this first.
-line.sh up     blueprint.yml   # generate briefs + settings, spawn every station
-line.sh status blueprint.yml   # alive? context size? unread mail?
-line.sh down   blueprint.yml   # stop the line
-ai.sh   sweep                  # run periodically while the line works — the context guard
+af line plan   blueprint.yml   # resolved roles/hierarchy/models — no spawn. Show this first.
+af line up     blueprint.yml   # generate briefs + settings, spawn every station (+ start the warden)
+af line status blueprint.yml   # alive? context size? unread mail?
+af line down   blueprint.yml   # stop the line
+af sweep                       # the context guard, on demand — the warden also runs it on a clock
 ```
 
-(`line.sh settings <slug> <name> <out>` also exists; it's internal — `ai revive`
-calls it to regenerate a settings file that vanished from under a spec.)
+(`af line up --resume blueprint.yml` brings each station back **on its old session**,
+so a line keeps its memory across a respawn. `af line settings <slug> <name> <out>`
+also exists; it's internal — `af revive` calls it to regenerate a settings file that
+vanished from under a spec.)
 
 ```yaml
 slug: rlhf-exp
@@ -294,9 +328,9 @@ needed to recreate it identically: role env, model, launch flags, appended syste
 prompt, and the settings file that installs its hooks.
 
 ```bash
-ai.sh ledger      # every agent: alive?, model, role, ctx, unread mail, and a LIVE wall check
-ai.sh revivable   # who has a surviving log
-ai.sh revive eval # back with memory AND constitution
+af ledger      # every agent: alive?, model, role, ctx, unread mail, and a LIVE wall check
+af revivable   # who has a surviving log
+af revive eval # back with memory AND constitution
 ```
 
 **`revive` refuses rather than half-restoring.** No spec, a corrupt spec, or a spec
@@ -321,14 +355,15 @@ the cheaper summary.
 ## Mail — how agents talk
 
 ```bash
-ai.sh post <agent> [--kind K] "text"   # mail an agent + ring its doorbell — THE way to talk to one
-ai.sh mail                             # read YOUR mailbox (advancing the cursor acks it)
-ai.sh mailstat                         # unread per mailbox — the ack/retry signal
-ai.sh register-self                    # run INSIDE the orchestrator's tmux: let agents wake you
+af post <agent> [--kind K] "text"   # mail an agent + ring its doorbell — THE way to talk to one
+af mail                             # read YOUR mailbox (advancing the cursor acks it)
+af mailstat                         # unread per mailbox — the ack/retry signal
+af register-self                    # run INSIDE the orchestrator's tmux: let agents wake you
 ```
 
-Kinds: `task`, `blocked`, `question`, `result`, `done`, `fyi`. **`ai.sh post`
-defaults to `task`** (pass `--kind` to override); `mail.sh send` defaults to `fyi`.
+Kinds: `task`, `blocked`, `question`, `result`, `done`, `fyi`. **`af post`
+defaults to `task`** (pass `--kind` to override); the agent-to-agent form
+`bash $AF_MAIL send` defaults to `fyi`.
 
 Three kinds have side effects, and they are what makes the context guard work:
 `task` marks the recipient **busy**, and a `done`/`result` marks it **idle** again —
@@ -338,11 +373,12 @@ soft-compacted). That is how compaction tells a task boundary from a mere turn
 boundary (see "Context"). So don't hand out work as `--kind fyi` either: the agent
 looks idle mid-task and can be compacted out from under itself.
 
-**The push carries a doorbell, not the letter.** `mail.sh` appends the message to
-the recipient's mailbox and types one fixed, path-free command into their pane:
-`!bash $AF_MAIL read`. The payload never goes through the keyboard, so quotes,
-backslashes, regexes and newlines arrive intact. Three properties follow, all
-verified on live agents:
+**The push carries a doorbell, not the letter.** The transport (module `af.mailbox`,
+reachable by agents as `bash $AF_MAIL send/read` — `$AF_MAIL` is the `mail.sh` shim)
+appends the message to the recipient's mailbox and types one fixed, path-free command
+into their pane: `!bash $AF_MAIL read`. The payload never goes through the keyboard,
+so quotes, backslashes, regexes and newlines arrive intact. Three properties follow,
+all verified on live agents:
 
 1. `!cmd` **runs the command and triggers a model turn** — one keystroke burst both
    delivers and wakes.
@@ -354,16 +390,23 @@ verified on live agents:
 **The cursor is the ack.** `mail read` advances it, so a sender can see its message
 is still unread and ring again.
 
+**The mailbox is guarded by a mkdir-directory mutex, not an flock** — and that is
+load-bearing, not incidental. bash and Python both touch the same mailbox files
+during the shim period, and a mkdir lock is the one primitive that excludes *both*:
+an flock taken by the Python side is invisible to a bash writer and vice versa, so
+two writers could interleave and rewind the cursor, re-delivering acked mail. flock
+replaces it only once nothing in bash reads the mailbox anymore.
+
 **Agents escalate to you.** Every spawned agent gets its name, its parent, `$AF_MAIL`
 and standing orders: on a real blocker it can't resolve — a decision only you or the
 human can make, a missing secret, an irreversible action, repeated failure — it mails
 instead of stalling silently. Agents also mail **each other**
-(`mail.sh send --to <peer>`), so work moves between stations without going through
-you. (For a `line.sh` line those orders come from the station's brief and system
-prompt; `AI_NOTIFY_OFF=1`, which `line.sh` sets, only suppresses `ai.sh`'s own
-generic escalation prompt — the mailbox and `$AF_MAIL` are there either way.)
+(`bash $AF_MAIL send --to <peer>`), so work moves between stations without going
+through you. (For a line those orders come from the station's brief and system
+prompt; `AI_NOTIFY_OFF=1`, which `line up` sets, only suppresses `af`'s own generic
+escalation prompt — the mailbox and `$AF_MAIL` are there either way.)
 
-**To be woken directly, run `ai.sh register-self` once from inside the
+**To be woken directly, run `af register-self` once from inside the
 orchestrator's own tmux session.** Launch yourself with all three vars — without
 `AF_SLUG`/`AF_MAILROOT` the orchestrator reads the **wrong mailbox** (slug falls back
 to `proj`) and every reply looks lost:
@@ -373,10 +416,10 @@ tmux new -s <slug>-lead 'AF_MAIL=<skill>/scripts/mail.sh AF_MAILROOT=/tmp/agent-
 ```
 
 **Unregistered, you are not woken at all.** Nothing is typed at you: with no
-registered pane, `mail.sh` resolves the orchestrator to the session
+registered pane, a send resolves the orchestrator to the session
 `ai-<slug>-orchestrator`, which doesn't exist for a human-launched session, so the
 send is **QUEUED**, not delivered. You then only see mail when you go looking
-(`ai.sh mail`), via the unread nudge printed after `ask`/`list`, or via the Stop
+(`af mail`), via the unread nudge printed after `ask`/`list`, or via the Stop
 hook. (There *is* a degraded doorbell — typing a literal path the agent must choose
 to obey — but that is for an orchestrator that IS registered and whose env lacks
 `AF_MAIL`. It is not a fallback for skipping registration.)
@@ -398,17 +441,17 @@ nothing, while a stale "outstanding" flag (a crashed agent, a task queued for an
 that never came up) stalled *every* idle turn by 45 seconds. Hand control back; the
 doorbell is how you hear about it.
 
-## The warden — `warden.sh` (the line, when nobody is driving it)
+## The warden — `af warden` (the line, when nobody is driving it)
 
 ```bash
-warden watch     # started automatically by `line up`; safe to re-run
-warden status    # quota, reset time, who got cut off, last sweep
-warden stop
+af warden watch     # started automatically by `af line up`; safe to re-run
+af warden status    # quota, reset time, who got cut off, last sweep
+af warden stop
 ```
 
-**It runs the context guard on a clock.** `ai sweep` only ever fired from `ai post` /
-`ai mail` / `ai sweep` — i.e. only while the *driving session* was speaking. A line working
-autonomously never goes through those (the agents mail each other via `mail.sh`), so it was
+**It runs the context guard on a clock.** `sweep` only ever fired from `af post` /
+`af mail` / `af sweep` — i.e. only while the *driving session* was speaking. A line working
+autonomously never goes through those (the agents mail each other), so it was
 never compacted at all. Observed: a station reached **767k tokens against a 500k hard
 threshold** overnight, with nothing to trip it. "Automatic" compaction that only fires while
 a human is at the keyboard is a manual command with a misleading name.
@@ -418,7 +461,7 @@ every agent on the machine *and the orchestrator session driving them*, mid-turn
 same instant. So the thing that resumes them cannot be a Claude: there is no Claude left.
 It has to be a process that spends no tokens and does not care about the limit at all.
 
-That is `limits.sh`: a shell loop that sleeps. Two documented signals, no screen-scraping:
+That is the warden: a Python loop that sleeps. Two documented signals, no screen-scraping:
 
 - **`StopFailure` hook** (matcher `rate_limit`, `hooks/limit-hook.sh`) fires at the instant
   a turn is killed by the limit. It cannot block or retry — Claude Code ignores its output
@@ -439,22 +482,22 @@ happened, or it just sits there. The wake-up message says so, and tells it to as
 than guess if it cannot work out where it was.
 
 Settings changes only take effect at launch: an agent spawned before this existed has no
-limit hook and no statusline. Give it one with `ai down <name> && line up --resume <bp>`.
+limit hook and no statusline. Give it one with `af down <name> && af line up --resume <bp>`.
 
-## Timers — `polling.sh` (the same message, on a clock)
+## Timers — `af polling` (the same message, on a clock)
 
 ```bash
-polling start <agent> <minutes> "<message>" [--times N] [--kind K]
-polling stop  [agent]        # no agent = $AF_AGENT: an agent switching ITS OWN timer off
-polling list                 # every timer on this line
-polling status <agent>
+af polling start <agent> <minutes> "<message>" [--times N] [--kind K]
+af polling stop  [agent]        # no agent = $AF_AGENT: an agent switching ITS OWN timer off
+af polling list                 # every timer on this line
+af polling status <agent>
 ```
 
 For an agent that must keep checking something: a deploy that takes twenty minutes, a
 queue that drains, a colleague's branch that will eventually land. Instead of a human
 re-poking it, a timer re-poks it.
 
-**It delivers by MAIL, never by typing.** The naive build — `sleep N; ai say <agent> "…"`
+**It delivers by MAIL, never by typing.** The naive build — `sleep N; af say <agent> "…"`
 in a loop — types into a live TUI on a clock, with no idea whether the agent is mid-turn,
 mid-tool-call, or sitting on a permission prompt. Mail appends to a mailbox (always safe)
 and only rings the doorbell.
@@ -473,13 +516,13 @@ Three ways a timer turns on you, and what stops each:
   the one that knows the wait is over. The first tick tells it so; the rest don't repeat it.
 
 The tick is sent **from whoever started the timer** (you, by default), so the agent's reply
-lands in your `ai mail` and not in some fictional `poll` mailbox nobody reads.
+lands in your `af mail` and not in some fictional `poll` mailbox nobody reads.
 
 ## Cleanup — `afctl.sh`
 
 Every spawned agent runs with a known `--session-id <uuid>` recorded in
 `~/.claude/agent-factory/manifest.tsv`, so factory logs can be purged without ever
-touching the human's own sessions.
+touching the human's own sessions. (`afctl.sh` is still real bash — not a shim.)
 
 ```bash
 afctl.sh list             # the manifest

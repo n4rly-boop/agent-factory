@@ -1,9 +1,9 @@
-# Example: a code-review line. Copy, edit, `line.sh plan` it, then `line.sh up` it.
-# Every key here is read by line.sh; nothing else is. See blueprint-wizard.md.
+# Example: a code-review line. Copy, edit, `af line plan` it, then `af line up` it.
+# Every key here is read by `af line` (factory/af/line.py); nothing else is. See blueprint-wizard.md.
 
 slug: review                    # mailbox + tmux namespace → ai-review-lead, ai-review-sec, …
 work: /abs/path/to/repo/work    # the writable zone. Keep it ABSOLUTE: a relative path is
-                                # resolved against the CWD of `line up`, not of this file.
+                                # resolved against the CWD of `af line up`, not of this file.
 
 defaults:
   model: sonnet

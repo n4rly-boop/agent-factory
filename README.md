@@ -6,15 +6,25 @@ their own shells and talk to them** across many turns. These are real peer
 agents — their own context window and session, persistent until killed — not
 ephemeral subagents.
 
+## How it runs
+
+The whole system is one stdlib-only Python package, **`factory/af/`**, driven as
+`python3 -m af <cmd>` (run from `factory/`, or with it on `PYTHONPATH`). The old
+shell entry points — `ai.sh`, `mail.sh`, `line.sh`, `warden.sh`, `polling.sh`,
+`statusline.sh`, `hooks/*.sh` — are now **6-line shims** that `exec python3 -m af…`,
+kept so that live agents (whose doorbell types `bash $AF_MAIL read` and whose hooks
+are wired by absolute path) and existing muscle memory keep working. `afctl.sh` is
+still real bash. Commands below are written in the primary `af` form.
+
 ## Two flavors
 
 | Tool | What it is | Use when |
 |------|-----------|----------|
-| **`factory/line.sh`** | A whole **production line** of agents from one `blueprint.yml`: roles, chain of command, per-agent model, enforced delegation. | You want a team, not an agent. |
-| **`factory/ai.sh`** | A real interactive Claude **TUI** in a detached tmux session, driven via `tmux send-keys` and read via `tmux capture-pane`. | You want a real, tool-using Claude you can watch and drive. Default. |
-| **`factory/mail.sh`** | The **channel between agents**: mailbox + doorbell + cursor-as-ack. | Agents talking to each other, reliably. |
-| **`factory/warden.sh`** | The line **when nobody is driving it**: runs the context guard on a clock (compaction was never automatic — it only fired when a human spoke), and survives the **account-wide usage limit**, waking the cut-off agents at the exact reset time. Spends no tokens, so the limit cannot kill it. | Always, on any line you leave working. `line up` starts it. |
-| **`factory/polling.sh`** | A **timer**: the same message to one agent every N minutes, delivered as mail. Dies with its agent; skips a tick while the last one is unread; the agent can switch it off itself. | An agent has to keep checking something — a deploy, a queue, a branch that will land. |
+| **`af line`** | A whole **production line** of agents from one `blueprint.yml`: roles, chain of command, per-agent model, enforced delegation. | You want a team, not an agent. |
+| **`af up` / `af ask`** | A real interactive Claude **TUI** in a detached tmux session, driven via `af say`/`af ask` (tmux send-keys) and read via `af screen`/`af result`. | You want a real, tool-using Claude you can watch and drive. Default. |
+| **`af post` / `af mail`** | The **channel between agents**: mailbox + doorbell + cursor-as-ack. | Agents talking to each other, reliably. |
+| **`af warden`** | The line **when nobody is driving it**: runs the context guard on a clock (compaction was never automatic — it only fired when a human spoke), and survives the **account-wide usage limit**, waking the cut-off agents at the exact reset time. Spends no tokens, so the limit cannot kill it. | Always, on any line you leave working. `af line up` starts it. |
+| **`af polling`** | A **timer**: the same message to one agent every N minutes, delivered as mail. Dies with its agent; skips a tick while the last one is unread; the agent can switch it off itself. | An agent has to keep checking something — a deploy, a queue, a branch that will land. |
 | **`factory/afctl.sh`** | Cleanup of spawned agents' session logs via a session-id manifest. | Purge factory logs without touching your manual sessions. |
 
 ## A line, from a blueprint
@@ -55,10 +65,10 @@ agents:
 ```
 
 ```bash
-bash factory/line.sh plan   blueprint.yml   # resolved roles, no spawn
-bash factory/line.sh up     blueprint.yml   # briefs + settings + spawn
-bash factory/line.sh status blueprint.yml   # alive? context size? unread mail?
-bash factory/line.sh down   blueprint.yml
+af line plan   blueprint.yml   # resolved roles, no spawn
+af line up     blueprint.yml   # briefs + settings + spawn
+af line status blueprint.yml   # alive? context size? unread mail?
+af line down   blueprint.yml
 ```
 
 ### You don't have to write the blueprint yourself
@@ -136,11 +146,11 @@ and refuses to spawn rather than hand out enforcement that isn't there.
 `--resume` restores an agent's memory. It does not restore its **constitution** —
 the role env, the model, the appended system prompt, and the `--settings` file that
 installs its hooks. Those lived only in the environment of the process that spawned
-it, and died with it. So `ai revive eval` used to return an agent that remembered
+it, and died with it. So `af revive eval` used to return an agent that remembered
 being `eval` and had no wall, no role-reminder, and possibly the wrong model —
 reporting success, saying nothing.
 
-Every `ai up` now writes a **spec** — one file per agent, in `$HOME` (not `/tmp`,
+Every `af up` now writes a **spec** — one file per agent, in `$HOME` (not `/tmp`,
 which a reboot wipes while the manifest in `$HOME` survives — that combination is
 exactly how you get a green revive with the guards gone):
 
@@ -156,32 +166,32 @@ exactly how you get a green revive with the guards gone):
 
 Raw vs link is one rule: **inline whatever is needed to recreate the agent
 identically** (small, immutable — lose it and the agent comes back wrong); **link
-whatever is big, live, or regenerable** (copy it and the copy rots). `ai revive`
+whatever is big, live, or regenerable** (copy it and the copy rots). `af revive`
 reads the spec back, and if the settings file has gone missing it regenerates it
 rather than reviving an agent whose hooks would simply be absent.
 
 **The spec, not the blueprint, is the source of truth on revive.** The agent's 100k
 of context was built under those rules; handing it a system prompt that its own
 history contradicts is worse than an out-of-date one. To adopt an edited blueprint,
-respawn deliberately (`ai down <name> && line up` — `line up` alone leaves a running
-station untouched, and says so).
+respawn deliberately (`af down <name> && af line up` — `af line up` alone leaves a
+running station untouched, and says so).
 
 **`revive` refuses rather than half-restoring.** No spec, a spec that won't parse, a
 spec with no launch flags, or a settings file whose hooks can't execute — every one of
 those produces an agent that looks healthy and has no wall, so every one of them is a
 refusal with a reason, not a warning you'd scroll past. `AI_FORCE=1` if you really do
-want the memory back without the role. And the `[wall]` column in `ai ledger` is a live
+want the memory back without the role. And the `[wall]` column in `af ledger` is a live
 check of the hooks on disk, not an echo of the spec's own `delegate: required` — the one
 view meant to reveal a missing wall used to be reading the wrong column, and always said
 the wall was there.
 
 One file per agent, so each file has exactly one writer and there is no
 read-modify-write race to lose — the same race that once cost us mail. The single
-view is a *derived* one, `ai ledger`, which joins the specs against the live world
+view is a *derived* one, `af ledger`, which joins the specs against the live world
 (tmux for aliveness, the session log for context size, the mailbox for unread):
 
 ```
-$ ai ledger
+$ af ledger
 NAME       ROLE           MODEL    PARENT        CTX  MAIL STATE  SESSION
 orc        orchestrator   opus     -           142k     0 idle   ● alive
 eval       evaluation     sonnet   orc          38k     2 busy   ● alive  [wall]
@@ -189,26 +199,31 @@ abl1       ablation       haiku    orc          91k     0 idle   ● alive  [wal
 abl2       ablation       haiku    orc            -     1 -      ○ down (revivable)
 ```
 
-`line up` is also idempotent now: a station that is already running is left alone.
+`af line up` is also idempotent now: a station that is already running is left alone.
 It used to tear down every live agent's TUI, mid-task, if you re-ran it after
 editing one brief.
 
 ## Quick start
 
 ```bash
-# Interactive agent (detached tmux session — nothing pops up)
-bash factory/ai.sh up neo
-bash factory/ai.sh ask neo "Summarize the README in one line"
-bash factory/ai.sh ask neo "What did you just say?"   # remembers — same session
-tmux attach -r -t ai-<slug>-neo                  # watch it live, read-only
-bash factory/ai.sh down neo                      # quit + kill the session
+# af is `python3 -m af`; run from factory/ or put it on PYTHONPATH:
+export PYTHONPATH="$PWD/factory${PYTHONPATH:+:$PYTHONPATH}"
 
-# Clean up the session logs the agents created
+# Interactive agent (detached tmux session — nothing pops up)
+python3 -m af up neo
+python3 -m af ask neo "Summarize the README in one line"
+python3 -m af ask neo "What did you just say?"   # remembers — same session
+tmux attach -r -t ai-<slug>-neo                  # watch it live, read-only
+python3 -m af down neo                            # quit + kill the session
+
+# Clean up the session logs the agents created (afctl.sh is still real bash)
 bash factory/afctl.sh purge --dry               # preview
 bash factory/afctl.sh purge                      # delete + clear manifest
 ```
 
-## `ai.sh` commands
+The `.sh` shims work identically with zero setup — `bash factory/ai.sh up neo`.
+
+## `af` commands
 
 ```
 up [name]            launch interactive Claude TUI in a detached tmux session
@@ -236,7 +251,7 @@ list                 list running interactive agents
 - **An agent is a detached tmux session, and nothing else pops up.** To watch one,
   attach: `tmux attach -r -t ai-<slug>-<name>` (`-r` = read-only, which is what you
   want while this session is driving it — two writers on one pane interleave
-  keystrokes and corrupt the input). `ai attach <name>` prints both commands.
+  keystrokes and corrupt the input). `af attach <name>` prints both commands.
   Earlier versions auto-opened a Terminal.app window via AppleScript `do script`.
   That path is **gone**: it only ever worked on Terminal.app and iTerm — never in
   Warp, over ssh, or on Linux — needed macOS Automation permission to not fail
@@ -279,7 +294,8 @@ list                 list running interactive agents
   `~/.claude/agent-factory/manifest.tsv`, so `afctl purge` removes exactly the
   factory logs and never your manual sessions.
 - **Mail is the channel between agents — the push carries a doorbell, not the
-  letter.** `mail.sh` appends the message to the recipient's mailbox
+  letter.** The transport (`af.mailbox`, reached by agents as `bash $AF_MAIL …` —
+  `$AF_MAIL` is the `mail.sh` shim) appends the message to the recipient's mailbox
   (`.ai/<slug>/mail/<agent>.jsonl`) and types one fixed, path-free command into
   their pane: `!bash $AF_MAIL read`. The payload never goes through the keyboard,
   so quotes, backslashes, regexes and newlines survive intact. Three properties
@@ -294,7 +310,10 @@ list                 list running interactive agents
 
   The mailbox **cursor is the ack**: `mail read` advances it, so a sender can see
   its message is still unread and ring again. Nothing is lost if the recipient was
-  dead, busy, or restarted mid-delivery.
+  dead, busy, or restarted mid-delivery. The mailbox is guarded by a **mkdir-directory
+  mutex, not an flock** — bash and Python both touch these files during the shim
+  period, and only a mkdir lock excludes both (an flock taken by one side is invisible
+  to the other, so two writers could interleave and rewind the cursor).
 - **Mailboxes are per-slug.** They used to be one global inbox shared by every
   project on the machine, which meant a session in one repo could be woken with —
   and told to answer — another repo's escalations. (It happened.) `.ai/<slug>/mail/`
@@ -340,16 +359,28 @@ commands it names.
 
 ```
 factory/
-├── line.sh         a whole line from one blueprint.yml (roles, hierarchy, models)
-├── ai.sh           interactive TUI agents (primary)
-├── mail.sh         agent↔agent transport: mailbox + doorbell + cursor-as-ack
-├── polling.sh      timers: the same message to an agent every N minutes, by mail
-├── warden.sh       the unattended line: context guard on a clock + usage-limit rescue
-├── statusline.sh   per-agent status line; also the ONLY source of rate_limits.resets_at
-├── afctl.sh        session-log cleanup (manifest-based)
-└── hooks/
-    ├── role-reminder.sh          restates role + chain of command every prompt
-    ├── delegate-wall.sh          denies a mini-orchestrator's direct edits
-    ├── limit-hook.sh             StopFailure/rate_limit → marks who the limit cut off
-    └── escalation-stop-hook.sh   wakes an idle orchestrator when mail arrives
+├── af/              THE implementation — one stdlib-only Python package, `python3 -m af`
+│   ├── __main__.py  the CLI surface: up/ask/say/…, post/mail, sweep, ledger, + nested
+│   │                  line / warden / polling
+│   ├── probe.py     one look (capture-pane + log read) = the single source of an agent's
+│   │                  live state; ask/wait/sweep/ledger all read it
+│   ├── drive.py     writers into a pane (say/ask/keys/approve) + the doorbell (ring)
+│   ├── lifecycle.py up/down/list/attach/remote/revive/register-self
+│   ├── mailbox.py   the mailbox: append, cursor-as-ack, mkdir-mutex lock, task bookkeeping
+│   ├── mailcli.py   mail.sh's exact CLI (send/read/unread/ring/dump) on the core
+│   ├── postal.py    `af post` / `af mail` (kind=task, autosweep) — the driver side
+│   ├── line.py      the blueprint parser + `line plan/up/status/down/settings`
+│   ├── warden.py    the unattended watcher: context guard on a clock + usage-limit rescue
+│   ├── polling.py   per-agent timers, delivered by mail
+│   ├── sweep.py     the context guard; spec.py, ledger.py, manifest.py, drive helpers
+│   ├── hooks.py     role-reminder / delegate-wall / limit-hook / escalation-stop
+│   ├── statusline.py the ONLY source of rate_limits.resets_at
+│   └── paths.py patterns.py tmux.py nums.py    shared plumbing
+│
+│   # 6-line SHIMS — exec `python3 -m af…`; kept so live agents' doorbell/hooks (wired
+│   # by absolute path) and existing muscle memory keep working:
+├── ai.sh  mail.sh  line.sh  warden.sh  polling.sh  statusline.sh
+├── hooks/role-reminder.sh  delegate-wall.sh  limit-hook.sh  escalation-stop-hook.sh
+│
+└── afctl.sh         session-log cleanup (manifest-based) — still real bash, not a shim
 ```
