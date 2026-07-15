@@ -647,7 +647,8 @@ class HooksOk(TempFactory):
 class Dispatch(HookRun):
     def test_every_hook_the_settings_install_is_dispatchable(self):
         self.assertEqual(sorted(hooks.HOOKS),
-                         ["delegate-wall", "escalation-stop", "limit-hook", "role-reminder"])
+                         ["delegate-wall", "escalation-stop", "limit-hook", "role-reminder",
+                          "session-start"])
 
     def test_an_unknown_hook_is_a_usage_error_not_a_silent_zero(self):
         rc, out, err = self.run_hook("nonesuch")

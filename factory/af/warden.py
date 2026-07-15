@@ -49,7 +49,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import drive, mailbox, patterns, sweep as sweepmod, tmux
+from . import drive, live, mailbox, patterns, sweep as sweepmod, tmux
 from .paths import FACTORY_DIR, Paths, paths
 from .nums import intish
 
@@ -195,6 +195,26 @@ def wake(agent: str, why: str, p: Paths) -> None:
 
 
 # --- the loop -----------------------------------------------------------------------
+def _heal_sids(p: Paths) -> str:
+    """Before every sweep, point each agent's sid file at the session it is ACTUALLY running.
+
+    Claude Code forks the session on --resume, so an agent rescued from a usage limit — or
+    restarted by a human — is now on a new id while its sid file still names the frozen parent.
+    Sweep would then read the parent's stale context (the "compacting an agent already at 0%"
+    loop). This is the same repair heal does by hand; the warden does it on its own clock so a
+    parked, unattended line self-corrects without anyone running a command.
+    """
+    fixed = []
+    for a in line_agents(p):
+        try:
+            new = live.heal_sid_file(a, p)
+        except Exception:
+            new = None
+        if new:
+            fixed.append(f"{a}→{new[:8]}")
+    return ("sid drift corrected: " + ", ".join(fixed)) if fixed else ""
+
+
 def _sweep_quietly(p: Paths) -> str:
     """`sweep` narrates; the warden keeps a log, not a console. Only the lines that mean
     something (a compaction, a warning) are worth a line in it."""
@@ -235,6 +255,9 @@ def loop(p: Paths) -> int:
         # running out of context would lose everything anyway.
         if not sweep_off() and time.time() - last_sweep >= every:
             last_sweep = time.time()
+            healed = _heal_sids(p)          # correct the sid files BEFORE sweep reads them
+            if healed:
+                log(healed, p)
             out = _sweep_quietly(p)
             if out:
                 log(f"sweep: {out}", p)

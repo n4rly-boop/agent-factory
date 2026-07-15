@@ -255,6 +255,16 @@ class TestFlagRegexes(unittest.TestCase):
         self.assertTrue(patterns.SESSION_ID.search("b045d974-cf11-4979-955c-fd3f2ee9d37f"))
         self.assertIsNone(patterns.SESSION_ID.search("b045d974-cf11-4979-955c"))
 
+    def test_context_pct_reads_the_last_render(self):
+        # Two statusline frames in the scrollback; the freshest (last) is the live one.
+        pane = ("link_ai |  git:(x) | [Opus 4.8] Context: 42%\n"
+                "…later…\nlink_ai |  git:(x) | [Opus 4.8] Context: 0%\n")
+        self.assertEqual(patterns.context_pct(pane), 0)
+        self.assertEqual(patterns.context_pct("[Opus 4.8] Context: 12%"), 12)
+
+    def test_context_pct_absent_is_None(self):
+        self.assertIsNone(patterns.context_pct("❯ some prompt with no statusline"))
+
     def test_strip_sid_leaves_no_double_space(self):
         from af import spec
         flags = "--model opus --session-id b045d974-cf11-4979-955c-fd3f2ee9d37f --settings /x.json"

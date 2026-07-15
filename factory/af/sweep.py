@@ -28,6 +28,12 @@ from .nums import intish
 
 SWEEP_LOCK_STALE = 600   # a lock older than this is a corpse — its holder was killed
 
+# At or below this statusline Context%, a /compact has nothing to do and CC rejects it. The
+# threshold is deliberately tiny: it only fires the "empty" skip on an agent CC itself reports
+# as all but empty, never on one that is merely small. Window size is unknown (200k vs 1M), so
+# this stays a percentage guard, not a token conversion.
+EMPTY_PCT = 2
+
 
 def skip_reason(name: str, pr: Probe, *, me: str = "", skip: str = "",
                 last_compacted: int | None = None, now: int | None = None,
@@ -55,6 +61,12 @@ def skip_reason(name: str, pr: Probe, *, me: str = "", skip: str = "",
                      this an unguarded sweep re-compacts an agent that is already
                      compacting (seen live: the warden's first tick re-compacted three
                      agents a manual sweep had just done).
+      empty        — Claude Code's own statusline says the context is near-empty, but the
+                     transcript's last usage record still shows a pre-/clear size. Compacting
+                     bounces ("Not enough messages to compact") and the transcript never
+                     shrinks, so the next sweep re-sends it forever. Believe CC's readout over
+                     the stale estimate. (Seen live: eval and rag pinned at Context 0% while
+                     the transcript read 371k/392k, re-compacted every tick.)
     """
     if name == "orchestrator":
         return "orchestrator"
@@ -70,6 +82,8 @@ def skip_reason(name: str, pr: Probe, *, me: str = "", skip: str = "",
         return "permission"
     if pr.phase == "limited":
         return "limited"
+    if pr.ctxpct is not None and pr.ctxpct <= EMPTY_PCT:
+        return "empty"
     if last_compacted is not None:
         now = int(time.time()) if now is None else now
         if now - last_compacted < cooldown:

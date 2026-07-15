@@ -584,6 +584,51 @@ def limit_hook() -> int:
     return 0
 
 
+# ======================================================================================
+# session-start — SessionStart
+# ======================================================================================
+# Fires on every session start, resume, clear and compact — and crucially, it fires INSIDE
+# the session with its real id. That is the only moment the fork id is knowable from inside
+# claude: `claude --resume <parent>` forks to a new `--session-id`, and this hook is handed
+# that new id in its payload. It writes it to sid-<agent>, so probe/sweep/warden stop reading
+# the frozen parent transcript. Without it, sid-<agent> is written once at spawn and rots the
+# instant the agent is resumed — see af/live.py for the same repair done from the outside.
+#
+# Informational, like limit-hook: Claude Code ignores its output, so it cannot fail the
+# session. A missing session_id, an unreadable env — it writes nothing and returns 0.
+def session_start() -> int:
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        raw = ""
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        return 0
+    sid = str(payload.get("session_id") or "").strip().lower()
+    if not sid:
+        return 0
+
+    p = _state_paths()
+    who = _env("AF_AGENT", "orchestrator")
+    try:
+        p.state.mkdir(parents=True, exist_ok=True)
+        old = ""
+        try:
+            old = p.sid_file(who).read_text(encoding="utf-8").strip()
+        except OSError:
+            old = ""
+        if sid != old:
+            p.sid_file(who).write_text(sid, encoding="utf-8")
+            # The cache maps the OLD sid to a transcript that just became the frozen parent.
+            p.log_cache(who).unlink(missing_ok=True)
+    except OSError:
+        return 0
+    return 0
+
+
 def _state_paths():
     """$AF_ROOT/.ai/$AF_SLUG — with the bash's fallback, not paths.py's.
 
@@ -670,6 +715,7 @@ HOOKS = {
     "delegate-wall": delegate_wall,
     "limit-hook": limit_hook,
     "escalation-stop": escalation_stop,
+    "session-start": session_start,
 }
 
 

@@ -288,10 +288,11 @@ class Rendering(TempFactory):
                        cwd=str(self.root))[0]
         self.assertIn("(25+ lines)", line.entrypoint_md(st, bulk=25))
 
-    def test_settings_json_is_valid_and_installs_three_hooks(self):
+    def test_settings_json_is_valid_and_installs_four_hooks(self):
         import json
         d = json.loads(line.settings_json("s", "w"))
-        self.assertEqual(set(d["hooks"]), {"UserPromptSubmit", "PreToolUse", "StopFailure"})
+        self.assertEqual(set(d["hooks"]),
+                         {"SessionStart", "UserPromptSubmit", "PreToolUse", "StopFailure"})
         self.assertIn("statusLine", d)
 
 

@@ -30,6 +30,10 @@ class Probe:
     ctx: int | None
     endturns: int | None
     inputbox: str | None
+    # Claude Code's own context-fullness readout, scraped from the statusline. None when the
+    # statusline is not in the captured window. It is the truth the transcript estimate goes
+    # stale against after a /clear or /compact — see patterns.CONTEXT_PCT.
+    ctxpct: int | None = None
 
 
 def session_log(agent: str, p: Paths | None = None) -> Path | None:
@@ -177,10 +181,12 @@ def probe(agent: str, p: Paths | None = None) -> Probe:
         return Probe(alive=False, phase="idle", ctx=ctx, endturns=endturns, inputbox=None)
 
     phase = _phase(pane)
+    ctxpct = patterns.context_pct(pane)
     # A modal (permission prompt, resume chooser) REPLACES the input box, but the prompts
     # the human already submitted stay in the scrollback at column 0 — so a box parser run
     # against a modal pane happily returns a prompt from ten turns ago as if it were live.
     # There is no live box to read in those phases; say so.
     box = patterns.input_box(pane) if phase in ("idle", "generating") else None
 
-    return Probe(alive=True, phase=phase, ctx=ctx, endturns=endturns, inputbox=box)
+    return Probe(alive=True, phase=phase, ctx=ctx, endturns=endturns, inputbox=box,
+                 ctxpct=ctxpct)

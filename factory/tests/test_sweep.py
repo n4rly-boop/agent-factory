@@ -17,8 +17,9 @@ from af import drive, sweep as sweepmod
 from af.probe import Probe
 
 
-def _p(alive=True, phase="idle", ctx=300000, endturns=3) -> Probe:
-    return Probe(alive=alive, phase=phase, ctx=ctx, endturns=endturns, inputbox="")
+def _p(alive=True, phase="idle", ctx=300000, endturns=3, ctxpct=None) -> Probe:
+    return Probe(alive=alive, phase=phase, ctx=ctx, endturns=endturns, inputbox="",
+                 ctxpct=ctxpct)
 
 
 class SkipRules(unittest.TestCase):
@@ -51,6 +52,24 @@ class SkipRules(unittest.TestCase):
         # /compact is a model call and the model is what it has run out of. Sending it
         # achieves nothing, forever: the context never drops, so the next tick re-sends it.
         self.assertEqual(sweepmod.skip_reason("worker", _p(phase="limited")), "limited")
+
+    def test_a_cleared_agent_reads_empty_on_the_statusline_and_is_skipped(self):
+        # The transcript still shows a pre-/clear size (fat ctx), but Claude Code's own
+        # statusline says 0%. A /compact would bounce ("Not enough messages to compact") and
+        # the transcript never shrinks — the exact re-send-every-tick loop seen on eval/rag.
+        self.assertEqual(
+            sweepmod.skip_reason("worker", _p(ctx=371336, ctxpct=0)), "empty")
+        self.assertEqual(
+            sweepmod.skip_reason("worker", _p(ctx=392893, ctxpct=2)), "empty")
+
+    def test_a_genuinely_full_agent_with_a_high_pct_is_not_skipped_as_empty(self):
+        # A real, fat agent shows a high percentage — the empty guard must not touch it.
+        self.assertIsNone(sweepmod.skip_reason("worker", _p(ctx=300000, ctxpct=42)))
+
+    def test_no_statusline_in_the_capture_falls_back_to_the_transcript(self):
+        # ctxpct is None when the statusline scrolled out of the captured window: the empty
+        # guard must not fire on absence of evidence.
+        self.assertIsNone(sweepmod.skip_reason("worker", _p(ctx=300000, ctxpct=None)))
 
     def test_cooldown_stops_us_re_compacting_an_agent_that_is_already_compacting(self):
         now = 1_000_000

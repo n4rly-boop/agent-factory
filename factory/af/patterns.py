@@ -38,6 +38,26 @@ USAGE_LIMIT = re.compile(
 #   ❯ 1. Resume from summary   2. Resume full session as-is   3. Don't ask again
 RESUME_CHOOSER = re.compile(r"Resume full session as-is|Resume from summary")
 
+# Claude Code's OWN context-fullness readout, painted into the statusline: "Context: 12%".
+# It is the ground truth the transcript estimate cannot match: after a /clear or /compact,
+# CC resets this to ~0 immediately, but the transcript's last usage record still shows the
+# pre-clear size until the next real turn writes a new one. When the pane says the context is
+# near-empty, no /compact can do anything (CC answers "Not enough messages to compact") —
+# believing the fat transcript there is what makes the warden re-send /compact every tick.
+CONTEXT_PCT = re.compile(r"Context:\s*(\d+)%")
+
+
+def context_pct(pane: str) -> int | None:
+    """The LAST Context% the statusline painted (the freshest render), or None if the
+    statusline is not in the captured window."""
+    hits = CONTEXT_PCT.findall(pane)
+    if not hits:
+        return None
+    try:
+        return int(hits[-1])
+    except ValueError:
+        return None
+
 # The live input box. THREE hand-rolled parsers of this existed (ai.sh:446, mail.sh:121,
 # mail.sh:291) with three different anchorings; this is the one they were all reaching for.
 #

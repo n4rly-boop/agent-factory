@@ -48,13 +48,14 @@ STATUSLINE_SH = FACTORY_DIR / "statusline.sh"
 ROLE_REMINDER = HOOKS_DIR / "role-reminder.sh"
 DELEGATE_WALL = HOOKS_DIR / "delegate-wall.sh"
 LIMIT_HOOK = HOOKS_DIR / "limit-hook.sh"
+SESSION_START = HOOKS_DIR / "session-start.sh"
 
 # Every hook the settings file installs, plus the statusline. A hook that cannot execute
 # FAILS OPEN: Claude Code reports "hook error … status code" and runs the tool anyway. So a
 # delegate-wall without its +x bit is not a wall — it is a wall-shaped hole, and nothing in
 # the agent's output says so. (Observed: an agent sailed straight through a chmod-less wall
 # and wrote the file it was supposed to be denied.)
-PREFLIGHT = (ROLE_REMINDER, DELEGATE_WALL, LIMIT_HOOK, STATUSLINE_SH)
+PREFLIGHT = (ROLE_REMINDER, DELEGATE_WALL, LIMIT_HOOK, SESSION_START, STATUSLINE_SH)
 
 DEFAULT_BULK_LINES = 40
 
@@ -496,10 +497,19 @@ def settings_json(slug: str, name: str) -> str:
     StopFailure/rate_limit fires at the instant a turn is killed by that limit. It cannot
     block or retry (Claude Code ignores its output) — it just leaves the marker that tells the
     warden WHICH agents were cut off mid-work, as opposed to idle and fine.
+
+    SessionStart keeps sid-<agent> honest. Claude Code forks the session on --resume, so the
+    id written once at spawn names a frozen transcript the moment the agent is resumed; this
+    hook fires with the LIVE id on every start/resume and rewrites the sid file, so the warden
+    stops reading a dead context number. af/live.py does the same repair from the outside for
+    agents whose settings predate this hook.
     """
     return f"""{{
   "statusLine": {{ "type": "command", "command": "{STATUSLINE_SH}", "padding": 0 }},
   "hooks": {{
+    "SessionStart": [
+      {{ "hooks": [ {{ "type": "command", "command": "{SESSION_START}", "timeout": 5 }} ] }}
+    ],
     "UserPromptSubmit": [
       {{ "hooks": [ {{ "type": "command", "command": "{ROLE_REMINDER}", "timeout": 5 }} ] }}
     ],
@@ -815,6 +825,16 @@ def cmd_down(bp: str) -> int:
     return 0
 
 
+def cmd_heal(bp: str, dry_run: bool = False, restart_idle: bool = False) -> int:
+    from . import heal as healmod
+    stations = plan(bp)
+    if not stations:
+        print("[heal] blueprint has no agents.")
+        return 0
+    p = _p(stations[0].slug)
+    return healmod.heal(stations, p, healmod.Options(dry_run=dry_run, restart_idle=restart_idle))
+
+
 def cmd_settings(slug: str, name: str, out: str) -> int:
     # Preflights first: `up` refuses to spawn into a fail-open state, and this path had no
     # reason to be the one that quietly hands out a settings file pointing at a hook that
@@ -840,6 +860,14 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("blueprint")
     q = sub.add_parser("down", help="stop every station on the line")
     q.add_argument("blueprint")
+    q = sub.add_parser("heal", help="diagnose every station and repair breakage without "
+                                    "losing context (sid drift, stale settings, crashed agents)")
+    q.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="report what is broken and what would change — touch nothing")
+    q.add_argument("--restart-idle", dest="restart_idle", action="store_true",
+                   help="also restart LIVE-but-idle agents to load regenerated settings "
+                        "(never a busy one; memory kept via --resume)")
+    q.add_argument("blueprint")
     q = sub.add_parser("settings", help="(internal) regenerate one agent's settings file")
     q.add_argument("slug")
     q.add_argument("name")
@@ -858,6 +886,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(a.blueprint)
         if a.cmd == "down":
             return cmd_down(a.blueprint)
+        if a.cmd == "heal":
+            return cmd_heal(a.blueprint, a.dry_run, a.restart_idle)
         if a.cmd == "settings":
             return cmd_settings(a.slug, a.name, a.out)
     except BlueprintError as e:
