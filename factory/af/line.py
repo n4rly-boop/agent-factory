@@ -548,6 +548,12 @@ def entrypoint_md(st: Station, bulk: int) -> str:
         b.append("2. Mail a peer agent that owns the area: `bash $AF_MAIL send --to <agent> "
                  '--kind task "..."`.\n')
         b.append("3. A Task subagent to READ and analyse — never to write (see below).\n\n")
+        b.append("When the delegated task can **check itself** — code that must pass tests, an "
+                 "edit that\nmust not break a build — reach for the skill's `agent.py "
+                 "--write --allow-cmd '<cmd>'`:\nthe worker writes, runs the command, reads "
+                 "the failure and fixes, and hands you an\noutcome instead of a blind first "
+                 "draft. Then verify cheaply — run the same command\nyourself and read `git "
+                 "diff --stat`, not the files.\n\n")
         b.append(f"This is enforced, not advised: a hook blocks your Write/Edit/Bash-writes "
                  f"outside `{st.work}/`,\n")
         b.append("at any size. A Task subagent **inherits the same wall** and is blocked "
