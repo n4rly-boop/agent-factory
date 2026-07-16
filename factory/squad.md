@@ -11,45 +11,54 @@ than one.
 If the skill was invoked with `plan` (with or without a goal after it), or the user
 asks to design a team *with* you rather than hand you a finished blueprint: **read
 `$SKILL/scripts/blueprint-wizard.md` and follow it.** It is an interview protocol —
-you ask, they decide, and a `blueprint.yml` exists only after they approve the
+you ask, they decide, and a `blueprint.json` exists only after they approve the
 resolved plan. Do not improvise a blueprint from the schema snippet below; the wizard
 carries the briefs, the traps, and the validation step.
 
-`$SKILL/scripts/blueprint.example.yml` is a complete, annotated team to copy from.
+`$SKILL/scripts/blueprint.example.json` is a complete team to copy from.
 
-## `af line` — plan, spawn, watch, tear down
+## `af squad` — plan, spawn, watch, tear down
 
 ```bash
-af line plan   blueprint.yml   # resolved roles/hierarchy/models — no spawn. Show this first.
-af line up     blueprint.yml   # generate briefs + settings, spawn every station (+ start the daemons)
-af line status blueprint.yml   # alive? context size? unread mail?
-af line down   blueprint.yml   # stop the team
-af sweep                       # the context guard, on demand — the daemons also run it on a clock
+af squad plan   blueprint.json   # resolved roles/hierarchy/models — no spawn. Show this first.
+af squad up     blueprint.json   # generate briefs + settings, spawn every station (+ start the daemons)
+af squad status blueprint.json   # alive? context size? unread mail?
+af squad down   blueprint.json   # stop the team
+af sweep                         # the context guard, on demand — the daemons also run it on a clock
 ```
 
-(`af line up --resume blueprint.yml` brings each station back **on its old session**,
+(`af squad up --resume blueprint.json` brings each station back **on its old session**,
 so a team keeps its memory across a respawn.)
 
-```yaml
-slug: rlhf-exp
-work: ./work                   # each agent's own scratch/report dir
-defaults:
-  model: sonnet
-  caveman: true                # terse output, enforced by a hook
-  bulk_lines: 40               # what counts as a BULK write (default 40)
-  compact_soft: 200000         # context guard
-agents:
-  orc:  { role: orchestrator, model: opus, delegate: no, brief: "Own the experiment. Dispatch to eval/abl*." }
-  eval: { role: evaluation, parent: orc, brief: "Own metrics, baselines, eval scripts." }
-  abl:  { count: 3, role: ablation, parent: orc, model: haiku, brief: "Test exactly ONE hypothesis." }
+The blueprint is plain JSON — no third-party parser, so `af` stays stdlib-only:
+
+```json
+{
+  "slug": "rlhf-exp",
+  "work": "./work",
+  "defaults": {
+    "model": "sonnet",
+    "caveman": true,
+    "bulk_lines": 40,
+    "compact_soft": 200000
+  },
+  "agents": {
+    "orc":  { "role": "orchestrator", "model": "opus", "delegate": "no", "brief": "Own the experiment. Dispatch to eval/abl*." },
+    "eval": { "role": "evaluation", "parent": "orc", "brief": "Own metrics, baselines, eval scripts." },
+    "abl":  { "count": 3, "role": "ablation", "parent": "orc", "model": "haiku", "brief": "Test exactly ONE hypothesis." }
+  }
+}
 ```
+
+`work` is each agent's own scratch/report dir; `caveman` is terse output, enforced by a hook;
+`bulk_lines` is what counts as a BULK write (default 40); `compact_soft` is the context guard.
 
 `bulk_lines` / `compact_soft` / `compact_hard` are read **from `defaults:`** (and the
 compact pair also per-agent). A top-level `bulk_lines:` is silently ignored.
 
-**`line up` leaves a station that is already running ALONE — it does not apply
-blueprint edits.** Editing a brief and re-running `line up` changes nothing for a
-live agent; `line down` it (or the whole team) first, then `up`.
+**`squad up` leaves a station that is already running ALONE — it does not apply
+blueprint edits.** Editing a brief and re-running `squad up` changes nothing for a
+live agent; `squad down` it (or the whole team) first, then `up`.
 
 Roles are arbitrary — `role:` is a free-text string, `orc`/`eval`/`abl` above are
 just an example. Two keys are load-bearing: the station whose `role:` is
@@ -78,16 +87,17 @@ post <any-station>` stays open — no access control on the human's own channel.
 
 `squad.json` (`~/.claude/agent-factory/specs/<slug>/squad.json`) is the durable,
 flock-guarded record of who is on the team: role, parent, model, live session id,
-status (`planned`/`alive`/`down`/`limited`), and unread-mail count. It replaces the
-old assumption that a `blueprint.yml` is the only truth — stations can come and go
-after `line up` and this stays current.
+status (`planned`/`alive`/`down`/`limited`), and unread-mail count — plus which
+blueprint the team came from and when it was first brought up. It replaces the old
+assumption that the blueprint file is the only truth — stations can come and go
+after `squad up` and this stays current.
 
 It is kept honest two ways: every `af up`/`af down`/session-start/heal path writes
 its own station's row the moment something changes, and the **postmaster** daemon
 (below) reconciles the whole roster against ground truth (tmux, `ps`, mailbox
 counts) on a clock, so a station that died without anyone calling `af down` doesn't
 sit marked "alive" forever. **This is internal state, not (yet) a user-facing
-view** — for a human-readable status, `af ledger` and `af line status` are still the
+view** — for a human-readable status, `af ledger` and `af squad status` are still the
 commands to run; they read specs and live probes directly, the same as always.
 
 ## Making delegation actually happen
@@ -132,7 +142,7 @@ must not touch code itself. A bare `delegate: true` means `advised`. (Aliases ar
 accepted — `hard`/`block`/`wall`/`full` → required; `advise`/`soft`/`nudge`/`1`/`true`/`yes`/`on`
 → advised; `0`/`false`/`off`/`none` → no. Write the canonical three.)
 
-**An unknown value is fatal** — `line up` refuses to spawn the team. (`delegate:
+**An unknown value is fatal** — `squad up` refuses to spawn the team. (`delegate:
 requird` used to mean "no hook at all", i.e. a typo silently produced an unwalled
 agent — failing open past even the default.)
 
@@ -226,13 +236,13 @@ can't wake a session in another.
 
 ## The two daemons that watch an unattended team
 
-Two separate daemons, two separate jobs, both started **with** the team by `af line
+Two separate daemons, two separate jobs, both started **with** the team by `af squad
 up` (idempotent — re-running it does not start a second one of either):
 
 ### The warden — `af warden` (context + the 5-hour limit)
 
 ```bash
-af warden watch                 # line-wide (default): every station of THIS slug
+af warden watch                 # squad-wide (default): every station of THIS slug
 af warden watch --target <sess> # standalone: guard ONE tmux session outside any squad
 af warden status [--target …]
 af warden stop    [--target …]
@@ -251,7 +261,7 @@ session driving them, at the same instant — so the rescuer can't be a Claude, 
 is no Claude left. The warden is a Python loop that spends no tokens: a `StopFailure`
 hook (matcher `rate_limit`) marks who was cut off mid-work, `statusline.sh` is the
 only channel that carries the exact reset time out of a live session, and the warden
-mails each cut-off agent once the window reopens. In line-wide mode it now pokes
+mails each cut-off agent once the window reopens. In squad-wide mode it now pokes
 **only the orchestrator** directly — every other cut-off station just has its
 recovery watched (no keystrokes sent to it); once the orchestrator itself recovers,
 it re-drives the rest of the team by mail, same as any other unattended recovery.

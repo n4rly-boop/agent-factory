@@ -1,325 +1,652 @@
-"""squad.json — the one mutable source of truth for a team.
+"""squad — bring up a whole team of agents from one blueprint.
 
-Today "who is on the team / is it alive / what session is it on / what is its role" is
-scattered across seven places with different truth semantics: the blueprint, per-agent
-spec JSON, tmux session existence, mailbox flag files, `sid-<agent>` files, and the
-append-only manifest. Liveness lives ONLY in tmux, so every status view re-scans tmux+ps
-and throws the answer away; `down` never records that a station left. The blueprint is
-immutable after `line up`.
+The problem it solves: a team's design (who exists, who reports to whom, who may only
+delegate, who gets the cheap model) is the part that is easiest to get wrong and hardest
+to remember. Written as a prompt it decays — you spawn five agents, tell each its role
+once, and thirty turns later nobody remembers they were supposed to delegate. Written as
+a blueprint it is configuration: applied identically to every agent, every time, and
+enforced by hooks rather than hoped for.
 
-This module makes one durable file the source of truth and turns tmux/ps into the
-*reconciler* that corrects it, not the store that replaces it. It lives under the spec
-home — NOT /tmp — so a purge cannot erase the roster, and it is guarded by an `fcntl`
-flock (the mkdir mutex was only needed while bash and Python both wrote the mailbox; the
-squad file is Python-only from birth, so a normal flock is correct).
+    python3 -m af.squad plan   <bp.json>          the resolved team — WITHOUT spawning it
+    python3 -m af.squad up     [--resume] <bp>    briefs + settings + specs, then spawn
+    python3 -m af.squad status <bp.json>          who's alive, context size, unread mail
+    python3 -m af.squad down   <bp.json>          stop every station
+    python3 -m af.squad settings <slug> <name> <out>   regenerate one settings file
 
-Ownership:
-  * `up` / `down`          mutate the roster and status. `down` CAPTURES `live_sid` before
-                           killing the session, so a killed-then-forked agent re-raises on
-                           the transcript that was actually growing, not the frozen parent.
-  * the postmaster daemon  reconciles `status`, `live_sid`, `ctx_tokens`, `unread`.
-  * the SessionStart hook   writes `live_sid` from inside the session.
-
-`live_sid` is the authoritative session id — spec.sid (frozen at spawn) is no longer part
-of the resume fallback chain. The per-agent spec survives only as the immutable revive
-constitution (role, flags, model, appended prompt).
+The blueprint is plain JSON — `af` is stdlib-only on purpose (it runs inside agents' panes
+and in a warden loop that must survive a machine with no venv activated, so a third-party
+parser is not an option), and `json` is the one structured format the standard library
+already reads without guessing.
 """
 
 from __future__ import annotations
 
-import fcntl
+import argparse
+import contextlib
+import io
 import json
 import os
+import shlex
 import sys
 import time
-from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
-from .paths import Paths, paths
+from . import hooks, lifecycle, mailbox, roster, tmux
+from .paths import FACTORY_DIR, Paths, paths
+from .probe import probe as do_probe
+from .nums import intish
 
-# Status is a small closed set of plain strings — not an enum, so a squad.json written by a
-# newer version with an unknown status still round-trips instead of crashing an older reader.
-PLANNED = "planned"   # in the blueprint, not yet spawned
-ALIVE = "alive"       # has a live tmux session
-DOWN = "down"         # spawned once, session gone; live_sid is the resume record
-LIMITED = "limited"   # alive but cut off by the usage limit
-STATUSES = (PLANNED, ALIVE, DOWN, LIMITED)
+HOOKS_DIR = FACTORY_DIR / "hooks"
+STATUSLINE_SH = FACTORY_DIR / "statusline.sh"
+ROLE_REMINDER = HOOKS_DIR / "role-reminder.sh"
+DELEGATE_WALL = HOOKS_DIR / "delegate-wall.sh"
+SPAWN_GATE = HOOKS_DIR / "spawn-gate.sh"
+READ_WALL = HOOKS_DIR / "read-wall.sh"
+LIMIT_HOOK = HOOKS_DIR / "limit-hook.sh"
+SESSION_START = HOOKS_DIR / "session-start.sh"
+
+# Every hook the settings file installs, plus the statusline. A hook that cannot execute
+# FAILS OPEN: Claude Code reports "hook error … status code" and runs the tool anyway. So a
+# delegate-wall without its +x bit is not a wall — it is a wall-shaped hole, and nothing in
+# the agent's output says so. (Observed: an agent sailed straight through a chmod-less wall
+# and wrote the file it was supposed to be denied.)
+PREFLIGHT = (ROLE_REMINDER, DELEGATE_WALL, SPAWN_GATE, READ_WALL, LIMIT_HOOK, SESSION_START,
+             STATUSLINE_SH)
+
+DEFAULT_BULK_LINES = 40
+
+
+# ======================================================================================
+# the blueprint loader
+# ======================================================================================
+class SquadSpecError(Exception):
+    """The blueprint cannot be read, or means something we would have to guess at."""
+
+
+def load_from_string(text: str) -> dict:
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SquadSpecError(f"blueprint is not valid JSON: {e}") from e
+    return doc
+
+
+def load(path: str | Path) -> dict:
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        raise SquadSpecError(f"cannot read blueprint {path}: {e}") from e
+    return load_from_string(text)
+
+
+# ======================================================================================
+# the resolved squad
+# ======================================================================================
+def flag(v: object, default: bool = False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "required", "full", "on")
+
+
+def dlevel(v: object, default: str = "") -> str:
+    """delegate is three-valued, not boolean:
+
+      required  hard wall — every write outside work/ is denied, whatever its size
+      advised   never blocks; a BULK write outside work/ gets a note in the model's context
+                suggesting delegate-to-local-model. The default.
+      ''        no hook at all
+
+    An UNKNOWN value is a hard error, not a shrug. It used to fall through to '' — no hook at
+    all — so `delegate: requird` (typo) on a station meant to be walled spawned with no wall,
+    no advisory and no delegate clause in its prompts, and nothing said a word. A typo
+    maximised the downgrade: it failed open past even the default.
+
+    The alias table itself is hooks.delegate_level — the same one the wall enforces at
+    runtime. Two tables would be two answers to "is this agent walled".
+    """
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return "advised" if v else ""
+    try:
+        lvl = hooks.delegate_level(str(v), strict=True)
+    except hooks.DelegateError:
+        raise SquadSpecError(
+            f"delegate: {v!r} is not one of required | advised | no — refusing to spawn a "
+            f"squad whose enforcement you did not mean.") from None
+    # hooks says "no" where the blueprint has always said "" (= install no hook at all).
+    return "" if lvl == "no" else lvl
 
 
 @dataclass(frozen=True)
 class Station:
-    name: str
-    role: str = ""
-    parent: str = ""
-    model: str = ""
-    delegate: str = ""
-    spawn_flags: str = ""
-    settings_path: str = ""   # the fork-proof identity key: .../lines/<slug>/settings-<name>.json
-    live_sid: str = ""        # AUTHORITATIVE current session id; captured on down
-    status: str = PLANNED
-    spawned: int = 0          # epoch of first spawn, 0 if never
-    ctx_tokens: int = 0       # last measured context size (reconciled)
-    unread: int = 0           # last measured unread mail (reconciled)
-
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name, "role": self.role, "parent": self.parent,
-            "model": self.model, "delegate": self.delegate, "spawn_flags": self.spawn_flags,
-            "settings_path": self.settings_path, "live_sid": self.live_sid,
-            "status": self.status, "spawned": self.spawned,
-            "ctx_tokens": self.ctx_tokens, "unread": self.unread,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Station":
-        return cls(
-            name=str(d.get("name", "")),
-            role=str(d.get("role") or ""),
-            parent=str(d.get("parent") or ""),
-            model=str(d.get("model") or ""),
-            delegate=str(d.get("delegate") or ""),
-            spawn_flags=str(d.get("spawn_flags") or ""),
-            settings_path=str(d.get("settings_path") or ""),
-            live_sid=str(d.get("live_sid") or ""),
-            status=str(d.get("status") or PLANNED),
-            spawned=_intish(d.get("spawned")),
-            ctx_tokens=_intish(d.get("ctx_tokens")),
-            unread=_intish(d.get("unread")),
-        )
-
-
-@dataclass
-class Squad:
     slug: str
-    blueprint: str = ""
-    created: int = 0
-    agents: dict[str, Station] = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return {
-            "slug": self.slug, "blueprint": self.blueprint, "created": self.created,
-            "agents": {n: s.to_dict() for n, s in self.agents.items()},
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict, slug: str) -> "Squad":
-        if not isinstance(d, dict):
-            return cls(slug=slug)
-        agents = {}
-        for n, sd in (d.get("agents") or {}).items():
-            if isinstance(sd, dict):
-                st = Station.from_dict({**sd, "name": sd.get("name") or n})
-                agents[st.name] = st
-        return cls(
-            slug=str(d.get("slug") or slug),
-            blueprint=str(d.get("blueprint") or ""),
-            created=_intish(d.get("created")),
-            agents=agents,
-        )
+    work: str
+    name: str
+    role: str
+    parent: str
+    model: str
+    delegate: str
+    caveman: str
+    soft: str
+    hard: str
+    peers: str
+    brief: str
 
 
-def _intish(v) -> int:
-    try:
-        return int(v or 0)
-    except (TypeError, ValueError):
-        return 0
+def plan(bp: str | Path, cwd: str | None = None) -> list[Station]:
+    """The blueprint, flattened: `count:` expanded, defaults resolved, parents defaulted.
 
-
-# --- persistence ------------------------------------------------------------------
-def load(p: Paths | None = None) -> Squad:
-    """The roster as last written, for READ-ONLY views. Missing/corrupt file → an empty squad
-    for this slug (never an exception): a status view must still render. Do NOT use this to seed
-    a mutation — `edit()` uses `_load_for_edit`, which refuses to overwrite a corrupt file."""
-    p = p or paths()
-    try:
-        raw = p.squad_file.read_text(encoding="utf-8")
-    except OSError:
-        return Squad(slug=p.slug)
-    try:
-        return Squad.from_dict(json.loads(raw), p.slug)
-    except Exception:
-        return Squad(slug=p.slug)
-
-
-def _load_for_edit(p: Paths) -> Squad:
-    """Seed a mutation. A MISSING file is a fresh team → empty roster. A file that EXISTS but
-    will not parse is dangerous: `load`'s silent-empty would let the next write persist an empty
-    roster over real state, destroying every station's live_sid. So quarantine the bad file
-    (rename aside, data preserved) and start fresh — never silently clobber it."""
-    try:
-        raw = p.squad_file.read_text(encoding="utf-8")
-    except OSError:
-        return Squad(slug=p.slug)
-    try:
-        return Squad.from_dict(json.loads(raw), p.slug)
-    except Exception:
-        bad = p.squad_file.with_name(f"squad.json.bad-{int(time.time())}")
-        try:
-            os.replace(p.squad_file, bad)
-        except OSError:
-            pass
-        print(f"[squad] ⚠ {p.squad_file} was unparseable — quarantined to {bad.name}; "
-              f"starting a fresh roster", file=sys.stderr)
-        return Squad(slug=p.slug)
-
-
-def _write(sq: Squad, p: Paths) -> None:
-    """Atomic replace so a reader never sees a half-written roster; the caller holds the
-    lock (via `edit`)."""
-    p.specdir.mkdir(parents=True, exist_ok=True)
-    tmp = p.squad_file.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(sq.to_dict(), indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, p.squad_file)
-
-
-@contextmanager
-def edit(p: Paths | None = None) -> Iterator[Squad]:
-    """Read-modify-write the roster under an exclusive flock. Mutate the yielded Squad; it is
-    written atomically on a clean exit (a body that raises skips the write, so a failed mutation
-    leaves the file untouched). The lock file lives beside squad.json and is only ever held by
-    Python, so a plain fcntl flock is enough — no mkdir mutex.
-
-    NOT REENTRANT: each call opens a fresh fd, and flock keys on the open file description, so a
-    nested `edit()` (or any `squad.*` mutation called from inside an `edit()` body) deadlocks
-    against itself. Do all mutations against the single yielded Squad; never call a mutator from
-    within a body."""
-    p = p or paths()
-    p.specdir.mkdir(parents=True, exist_ok=True)
-    lock = p.squad_lock
-    with lock.open("w", encoding="utf-8") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        try:
-            sq = _load_for_edit(p)
-            yield sq
-            _write(sq, p)
-        finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-
-
-# --- mutations (all lock internally) ----------------------------------------------
-def upsert(p: Paths | None = None, *, name: str, **fields) -> Station:
-    """Create or update a station. Only the fields passed are changed; the rest survive, so a
-    reconcile that sets `live_sid` does not clobber `role`, and a re-spawn that sets `status`
-    does not clobber a measured `ctx_tokens`."""
-    p = p or paths()
-    with edit(p) as sq:
-        cur = sq.agents.get(name) or Station(name=name)
-        sq.agents[name] = replace(cur, name=name, **fields)
-        return sq.agents[name]
-
-
-def mark_up(name: str, p: Paths | None = None, **fields) -> Station:
-    """Record a station as freshly spawned and ALIVE. Stamps `spawned` on the first transition
-    so reconcile can tell DOWN from PLANNED without depending on a caller to set it. Extra
-    fields (settings_path, live_sid, role, model, …) are applied in the same write. `status`
-    and `spawned` are owned here and ignored if passed."""
-    p = p or paths()
-    fields.pop("status", None)
-    fields.pop("spawned", None)
-    with edit(p) as sq:
-        cur = sq.agents.get(name) or Station(name=name)
-        sq.agents[name] = replace(
-            cur, name=name, status=ALIVE, spawned=(cur.spawned or now()), **fields)
-        return sq.agents[name]
-
-
-def set_status(name: str, status: str, p: Paths | None = None) -> None:
-    upsert(p, name=name, status=status)
-
-
-def set_live_sid(name: str, sid: str, p: Paths | None = None) -> None:
-    """Called by the SessionStart hook and by reconcile. A blank sid is ignored — losing the
-    only resume record to a transient read miss is the failure this store exists to prevent."""
-    if not sid:
-        return
-    upsert(p, name=name, live_sid=sid)
-
-
-def mark_down(name: str, live_sid: str | None = None, p: Paths | None = None) -> None:
-    """Record that a station's session is gone. If a live_sid is supplied (captured by `down`
-    just before it killed the pane) it is written, so re-raise resumes the transcript that was
-    actually growing — the frozen-parent bug's fix. A blank live_sid leaves the last known one
-    intact rather than erasing the resume record."""
-    p = p or paths()
-    with edit(p) as sq:
-        cur = sq.agents.get(name) or Station(name=name)
-        sq.agents[name] = replace(
-            cur, name=name, status=DOWN,
-            live_sid=(live_sid or cur.live_sid),
-        )
-
-
-def remove(name: str, p: Paths | None = None) -> None:
-    """Drop a station from the roster entirely (a blueprint edit that deletes it). Distinct
-    from mark_down, which keeps the record so the agent can be revived."""
-    p = p or paths()
-    with edit(p) as sq:
-        sq.agents.pop(name, None)
-
-
-def get(name: str, p: Paths | None = None) -> Station | None:
-    return load(p).agents.get(name)
-
-
-def stations(p: Paths | None = None) -> list[Station]:
-    return list(load(p).agents.values())
-
-
-# --- reconcile --------------------------------------------------------------------
-def reconcile(p: Paths | None = None) -> Squad:
-    """Correct the stored roster against ground truth: tmux for liveness, `ps` argv for the
-    real (post-fork) session id, the mailbox for unread. This is what the postmaster runs on
-    its tick so a parked, unattended team's state stays honest without anyone driving it.
-
-    Imports are local to keep this module importable with no tmux/mailbox dependency (the hook
-    that only writes live_sid must not drag in the world).
+    Resolved HERE and nowhere else, so `squad plan` shows exactly what `squad up` will do —
+    and so a blueprint that dies on station 3 spawns nothing at all. (The bash streamed its
+    rows and `up` read them as they came: a validation failure on the third station had
+    already spawned the first two.)
     """
-    from . import tmux, live as livemod, mailbox
+    doc = load(bp)
+    if not isinstance(doc, dict):
+        raise SquadSpecError("blueprint is not a mapping")
+    cwd = cwd or os.environ.get("AF_CWD") or os.getcwd()
+    slug = doc.get("slug") or os.path.basename(cwd)
+    # The delegate-wall compares Claude's ALWAYS-ABSOLUTE file_path against this, so a
+    # relative "./work" would block every agent from writing its own report — and then tell
+    # it to write its report. Resolve once, here.
+    work = os.path.abspath(os.path.join(cwd, str(doc.get("work") or "./work")))
+    d = doc.get("defaults") or {}
+    agents = doc.get("agents") or {}
+    if not isinstance(d, dict) or not isinstance(agents, dict):
+        raise SquadSpecError("`defaults:` and `agents:` must be mappings")
 
-    p = p or paths()
-    # Compute ground truth OUTSIDE the lock: live_sid shells out to `ps -A` and walks the whole
-    # projects tree, and holding the exclusive flock across that (once per station) would stall
-    # every other writer — the SessionStart hook, up, down. Snapshot ps once, resolve everything,
-    # then take the lock only for the fast apply.
-    snap = livemod._ps()
-    computed: dict[str, tuple[bool, str, int]] = {}
-    for name, st in load(p).agents.items():
-        try:
-            alive = tmux.has_session(p.session(name))
-        except Exception:
-            alive = st.status in (ALIVE, LIMITED)
-        try:
-            new_sid = livemod.live_sid(name, p, ps_out=snap) if alive else ""
-        except Exception:
-            new_sid = ""
-        try:
-            unread = mailbox.unread(name, p)
-        except Exception:
-            unread = st.unread
-        computed[name] = (alive, new_sid or "", unread)
+    names: list[tuple[str, dict]] = []
+    for name, cfg in agents.items():
+        cfg = cfg or {}
+        if not isinstance(cfg, dict):
+            raise SquadSpecError(f"agent {name!r} must be a mapping of settings")
+        n = int(cfg.get("count") or 1)
+        for i in range(n):
+            nm = f"{name}{i + 1}" if cfg.get("count") else name
+            # `orchestrator` is the reserved name of the SESSION that drives the squad. A
+            # station called that would share its mailbox (orchestrator.jsonl) and would be
+            # taken for the orchestrator by the sweep guard — it would start compacting its
+            # own peers, and never be compacted itself. Give the role, not the name.
+            if nm == "orchestrator":
+                raise SquadSpecError(
+                    "'orchestrator' is a reserved agent name (it is the mailbox of the "
+                    "session driving the squad). Name the station something else and give it "
+                    "`role: orchestrator`.")
+            names.append((nm, cfg))
 
-    with edit(p) as sq:
-        for name, st in sq.agents.items():
-            if name not in computed:
-                continue  # added between snapshot and apply — next tick catches it
-            alive, new_sid, unread = computed[name]
-            # Preserve the resume record when the process is gone; only advance live_sid to a
-            # real, currently-running session.
-            live_sid_val = new_sid or st.live_sid
-            if alive:
-                # A limit marker outranks plain "alive": the warden owns clearing it.
-                status = LIMITED if p.limited(name).is_file() else ALIVE
-            else:
-                # Ever spawned (stamped) or holding a resume record → DOWN, not PLANNED. A
-                # station that was never spawned and has no sid is still just planned.
-                status = DOWN if (st.spawned or st.live_sid) else PLANNED
-            sq.agents[name] = replace(
-                st, status=status, live_sid=live_sid_val, unread=unread,
-            )
-    return load(p)
+    allnames = [n for n, _ in names]
+    # The squad's own orchestrator, by ROLE not by name. The default parent used to be the
+    # literal 'orc' — my own example name, leaked into the code. Name your top station 'boss'
+    # and every other station reported to a nonexistent 'orc': mail into a mailbox nobody
+    # reads, and not one error anywhere.
+    orch = next((n for n, c in names if (c.get("role") or "worker") == "orchestrator"), "")
+
+    out: list[Station] = []
+    for nm, cfg in names:
+        role = str(cfg.get("role") or "worker")
+        parent = str(cfg.get("parent") or ("" if role == "orchestrator" else orch))
+        model = str(cfg.get("model") or d.get("model") or "")
+        delegate = dlevel(cfg.get("delegate"), dlevel(d.get("delegate"), "advised"))
+        caveman = "1" if flag(cfg.get("caveman"), flag(d.get("caveman"))) else ""
+        soft = str(cfg.get("compact_soft") or d.get("compact_soft") or "")
+        hard = str(cfg.get("compact_hard") or d.get("compact_hard") or "")
+        brief = str(cfg.get("brief") or "").strip()
+        peers = ",".join(p for p in allnames if p != nm)
+        out.append(Station(slug=str(slug), work=work, name=nm, role=role, parent=parent,
+                           model=model, delegate=delegate, caveman=caveman, soft=soft,
+                           hard=hard, peers=peers, brief=brief))
+    return out
 
 
-def now() -> int:
-    return int(time.time())
+def bulk_lines(bp: str | Path) -> int:
+    """The advisory threshold. Read from `defaults:` ONLY — a top-level `bulk_lines:` is
+    ignored, exactly as the bash ignored it (`(yaml…).get("defaults").get("bulk_lines")`).
+    Kept rather than fixed: `squad up` and the hooks must agree on where the number lives,
+    and the hooks read AF_BULK_LINES out of the env this function fills.
+    """
+    try:
+        d = load(bp).get("defaults") or {}
+    except SquadSpecError:
+        return _env_bulk()
+    v = str((d.get("bulk_lines") if isinstance(d, dict) else "") or "")
+    n = intish(v, None)
+    return n if n is not None else _env_bulk()
+
+
+def _env_bulk() -> int:
+    v = (os.environ.get("AF_BULK_LINES") or "").strip()
+    return intish(v, DEFAULT_BULK_LINES)
+
+
+# ======================================================================================
+# what each station is handed
+# ======================================================================================
+def settings_json(slug: str, name: str) -> str:
+    """A settings file per agent: same hooks for everyone, but they read the agent's ENV, so
+    one file shape covers every role. Written per-agent anyway because the agents share a cwd
+    — a project-level .claude/settings.json could not give them different rules.
+
+    statusLine is not decoration: it is the ONLY channel that carries
+    rate_limits.five_hour.resets_at out of a live session. No CLI reports it. Without it the
+    warden knows an agent was cut off by the usage limit but not when the limit lifts — and a
+    rescuer that has to guess the time wakes the agent into the same wall.
+
+    StopFailure/rate_limit fires at the instant a turn is killed by that limit. It cannot
+    block or retry (Claude Code ignores its output) — it just leaves the marker that tells the
+    warden WHICH agents were cut off mid-work, as opposed to idle and fine.
+
+    SessionStart keeps sid-<agent> honest. Claude Code forks the session on --resume, so the
+    id written once at spawn names a frozen transcript the moment the agent is resumed; this
+    hook fires with the LIVE id on every start/resume and rewrites the sid file, so the warden
+    stops reading a dead context number. af/live.py does the same repair from the outside for
+    agents whose settings predate this hook.
+    """
+    return f"""{{
+  "statusLine": {{ "type": "command", "command": "{STATUSLINE_SH}", "padding": 0 }},
+  "hooks": {{
+    "SessionStart": [
+      {{ "hooks": [ {{ "type": "command", "command": "{SESSION_START}", "timeout": 5 }} ] }}
+    ],
+    "UserPromptSubmit": [
+      {{ "hooks": [ {{ "type": "command", "command": "{ROLE_REMINDER}", "timeout": 5 }} ] }}
+    ],
+    "PreToolUse": [
+      {{ "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {{ "type": "command", "command": "{DELEGATE_WALL}", "timeout": 5 }},
+          {{ "type": "command", "command": "{SPAWN_GATE}", "timeout": 5 }}
+        ] }},
+      {{ "matcher": "Read",
+        "hooks": [ {{ "type": "command", "command": "{READ_WALL}", "timeout": 5 }} ] }}
+    ],
+    "StopFailure": [
+      {{ "matcher": "rate_limit",
+        "hooks": [ {{ "type": "command", "command": "{LIMIT_HOOK}", "timeout": 5 }} ] }}
+    ]
+  }}
+}}
+"""
+
+
+def write_settings(slug: str, name: str, out: str | Path) -> Path:
+    """Importable, because `revive` needs it: a settings file can be deleted from under a
+    spec, and reviving without it means reviving without hooks — i.e. without the wall, with
+    nothing saying so. lifecycle._regen_settings shells out to `bash squad.sh settings` today;
+    this is what kills that shell-out."""
+    f = Path(out)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(settings_json(slug, name), encoding="utf-8")
+    return f
+
+
+def entrypoint_md(st: Station, bulk: int) -> str:
+    b = []
+    b.append(f"# {st.name} — {st.role}\n\n")
+    b.append(f"## Who you are\n\nYou are `{st.name}`, the **{st.role}** station on this "
+             f"squad.\n\n")
+    if st.parent:
+        b.append(f"You report to `{st.parent}`. Send it your results; escalate blockers to "
+                 f"it.\n\n")
+    b.append(f"## Who you can reach\n\nPeers: {st.peers or 'none'}\n\n```bash\n"
+             f"bash $AF_MAIL send --to <agent> --kind <question|blocked|result|done|fyi> "
+             f'"..."\nbash $AF_MAIL read      # your inbox (mail is also pushed to you '
+             f"automatically)\n```\n\n")
+    if st.delegate == "required":
+        b.append("## How you work — you are a MINI-ORCHESTRATOR (hard wall)\n\n")
+        b.append("You do **not** do the work yourself. You dispatch it and verify what comes "
+                 "back:\n\n")
+        b.append("1. `delegate-to-local-model` skill — **the** way to get a file written. "
+                 "Free, runs in\n   its own process, keeps the work off your context.\n")
+        b.append("2. Mail a peer agent that owns the area: `bash $AF_MAIL send --to <agent> "
+                 '--kind task "..."`.\n')
+        b.append("3. A Task subagent to READ and analyse — never to write (see below).\n\n")
+        b.append("When the delegated task can **check itself** — code that must pass tests, an "
+                 "edit that\nmust not break a build — reach for the skill's `agent.py "
+                 "--write --allow-cmd '<cmd>'`:\nthe worker writes, runs the command, reads "
+                 "the failure and fixes, and hands you an\noutcome instead of a blind first "
+                 "draft. Then verify cheaply — run the same command\nyourself and read `git "
+                 "diff --stat`, not the files.\n\n")
+        b.append(f"This is enforced, not advised: a hook blocks your Write/Edit/Bash-writes "
+                 f"outside `{st.work}/`,\n")
+        b.append("at any size. A Task subagent **inherits the same wall** and is blocked "
+                 "identically —\nverified. Do not try to route a write through one; you will "
+                 "just loop.\n\n")
+        b.append("Verify everything that comes back. Never trust bulk output unread.\n\n")
+    elif st.delegate == "advised":
+        b.append("## How you work — you are a MINI-ORCHESTRATOR\n\n")
+        b.append("Your job is to **dispatch and verify**, not to type out volume yourself.\n\n")
+        b.append("Delegate the work that is bulk or mechanical — many items to convert or "
+                 "classify,\nboilerplate, spec-code, first drafts, big logs to read — and "
+                 "cheaply checkable:\n\n")
+        b.append("1. `delegate-to-local-model` skill — free, runs in its own process, keeps "
+                 "the tokens\n   off your context. This is the main one.\n")
+        b.append("2. Mail the peer agent that owns the area: `bash $AF_MAIL send --to <agent> "
+                 '--kind task "..."`.\n\n')
+        b.append("**Small, surgical edits you just make yourself.** A three-line fix does not "
+                 "need an\nexternal model — delegating it costs more than doing it. A hook "
+                 f"will note it if a\nwrite looks like bulk ({bulk}+ lines) outside "
+                 f"`{st.work}/`; it does not block you, it is telling\nyou the cheaper route "
+                 "exists.\n\n")
+        b.append("Always verify what comes back. Never trust bulk output unread.\n\n")
+    b.append(f"## Your report\n\nWrite it to `{st.work}/{st.name}.md`. One file, kept current "
+             f"— it is how the squad sees your work.\n\n")
+    b.append("## Your brief\n\n")
+    b.append(st.brief)
+    b.append("\n")
+    return "".join(b)
+
+
+def write_entrypoint(st: Station, bulk: int) -> Path:
+    d = Path(st.work)
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"entrypoint-{st.name}.md"
+    f.write_text(entrypoint_md(st, bulk), encoding="utf-8")
+    return f
+
+
+def sysprompt(st: Station, ep: Path) -> str:
+    """The invariant goes in the SYSTEM PROMPT (it survives compaction); the full brief goes
+    in the entrypoint file (too long to repeat, and re-readable)."""
+    s = f"You are '{st.name}', the {st.role} station on the '{st.slug}' squad."
+    if st.parent:
+        s += f" You report to '{st.parent}'."
+    s += (f" Read {ep} NOW - it is your brief, your chain of command and your working rules "
+          f"- then follow it.")
+    # NOT "…or a Task subagent": a Task subagent runs in the same process, inherits the same
+    # --settings, and is blocked by the same wall (verified). Advertising it as a route sends
+    # the agent into a loop it cannot exit.
+    if st.delegate == "required":
+        s += (" You are a mini-orchestrator: you do NOT do work directly. To get a file "
+              "WRITTEN, use the delegate-to-local-model skill (it runs in its own process) or "
+              "mail the peer who owns the area; a Task subagent inherits your wall and cannot "
+              "write. Then verify the result. A hook enforces this.")
+    # advised: say what to delegate AND what not to. Tell an agent only "delegate" and it
+    # delegates one-line fixes to an external LLM — which is what the old default did.
+    if st.delegate == "advised":
+        s += (" You are a mini-orchestrator: delegate work that is bulk or mechanical (many "
+              "items, boilerplate, spec-code, first drafts, big logs) via the "
+              "delegate-to-local-model skill, or mail the peer who owns the area - then "
+              "verify what comes back. Small surgical edits you make yourself; delegating a "
+              "three-line fix costs more than doing it.")
+    if st.caveman == "1":
+        s += (" Answer tersely - drop articles, filler and hedging; keep every technical fact "
+              "exact.")
+    return s
+
+
+# ======================================================================================
+# preflight
+# ======================================================================================
+def preflight() -> bool:
+    bad = False
+    for h in PREFLIGHT:
+        if not h.is_file():
+            print(f"[squad] FATAL: missing hook {h}")
+            bad = True
+            continue
+        if not os.access(h, os.X_OK):
+            try:
+                os.chmod(h, h.stat().st_mode | 0o111)
+            except OSError:
+                pass
+        if not os.access(h, os.X_OK):
+            print(f"[squad] FATAL: hook not executable and chmod failed: {h}")
+            bad = True
+    if bad:
+        print("[squad] refusing to spawn — enforcement hooks would fail open.")
+        return False
+    return True
+
+
+# ======================================================================================
+# commands
+# ======================================================================================
+def _p(slug: str) -> Paths:
+    return paths(slug)
+
+
+def cmd_plan(bp: str) -> int:
+    stations = plan(bp)
+    print(f"{'NAME':<10} {'ROLE':<14} {'MODEL':<8} {'PARENT':<8} {'DELEGATE':<9} PEERS")
+    for s in stations:
+        print(f"{s.name:<10} {s.role:<14} {s.model or 'default':<8} {s.parent or '-':<8} "
+              f"{s.delegate or '-':<9} {s.peers}")
+    return 0
+
+
+def _resume_flag(st: Station, p: Paths) -> tuple[str, str]:
+    """--resume, but only on a session we can PROVE is still there.
+
+    This is the only way to give a constitution to an agent that already has a memory. A
+    station with no recorded sid, or whose log has been purged, is spawned FRESH and SAID SO
+    — a silent fresh spawn under a flag that promised continuity is how you lose a day's
+    context and only notice tomorrow.
+    """
+    from . import manifest
+    try:
+        sid = p.sid_file(st.name).read_text(encoding="utf-8").strip()
+    except OSError:
+        sid = ""
+    if sid and manifest.session_log_exists(sid, p):
+        return f"--resume {sid} ", sid
+    if sid:
+        print(f"[squad] {st.name:<10} ⚠ session {sid} recorded but its log is GONE — spawning "
+              f"FRESH (no memory)")
+    else:
+        print(f"[squad] {st.name:<10} ⚠ no recorded session — spawning FRESH (no memory)")
+    return "", ""
+
+
+def cmd_up(bp: str, resume: bool = False) -> int:
+    if not preflight():
+        return 1
+    try:
+        stations = plan(bp)
+    except SquadSpecError as e:
+        print(f"[squad] FATAL: {e}", file=sys.stderr)
+        print("[squad] blueprint did not validate — nothing was spawned.")
+        return 1
+    if not stations:
+        print("[squad] blueprint has no agents.")
+        return 1
+
+    bulk = bulk_lines(bp)
+    slug = stations[0].slug
+    p = _p(slug)
+    n = skipped = 0
+
+    for st in stations:
+        dlabel = {"required": "  [wall]", "advised": "  [advise]"}.get(st.delegate, "")
+        # `up` kills any existing session for the name before relaunching. Run `squad up` twice
+        # — a habit, after an edit to one station's brief — and it would tear down the whole
+        # live squad, every agent's TUI, mid-task. Alive stays alive.
+        if tmux.has_session(p.session(st.name)):
+            # Left alone means NOTHING was applied: not the brief, not the settings, not the
+            # spec. Say that. Reporting "already running" next to a blueprint you just edited
+            # reads as "your edit is live", and it is not.
+            print(f"[squad] {st.name:<10} {st.role:<14} {st.model or 'default':<8} already "
+                  f"running — LEFT ALONE (blueprint edits NOT applied)")
+            print(f"[squad]            to apply them:  af down {st.name} && af squad up {bp}")
+            if not p.spec_file(st.name).is_file():
+                print(f"[squad]            ⚠ it has no spec (spawned by an older version) — it "
+                      f"would revive with NO role and NO hooks")
+            skipped += 1
+            continue
+
+        ep = write_entrypoint(st, bulk)
+        stf = p.settings_file(st.name)
+        write_settings(slug, st.name, stf)
+        if not hooks.hooks_ok(stf):
+            # preflight already passed, so this is the belt: a settings file that installs no
+            # runnable hook is an agent with no wall and nothing saying so.
+            print(f"[squad] FATAL: settings for {st.name} install hooks that would FAIL OPEN "
+                  f"({stf}) — not spawning it.", file=sys.stderr)
+            continue
+
+        rflag, sid = _resume_flag(st, p) if resume else ("", "")
+        flags = (f"{rflag}--settings {stf} "
+                 f"{f'--model {st.model} ' if st.model else ''}"
+                 f"--append-system-prompt {shlex.quote(sysprompt(st, ep))} "
+                 f"{os.environ.get('AI_CLAUDE_FLAGS', '')}").strip()
+
+        env = dict(os.environ)
+        env.update({
+            "AF_SLUG": slug, "AF_ROLE": st.role, "AF_PARENT": st.parent, "AF_PEERS": st.peers,
+            "AF_DELEGATE": st.delegate, "AF_BULK_LINES": str(bulk), "AF_CAVEMAN": st.caveman,
+            "AF_WORK": st.work,
+            "AI_COMPACT_SOFT": st.soft or os.environ.get("AI_COMPACT_SOFT", "") or "200000",
+            "AI_COMPACT_HARD": st.hard or os.environ.get("AI_COMPACT_HARD", "") or "500000",
+            "AI_CLAUDE_FLAGS": flags,
+            "AI_NOTIFY_OFF": "1",
+        })
+        # lifecycle.up narrates a spawn (`ai up` did too, and squad.sh threw it away with
+        # >/dev/null 2>&1). Its stdout is noise here — but its stderr is NOT: those are the
+        # "spec could not be written / it will revive with no wall" warnings, and bash was
+        # silently eating them. They go to the operator.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            lifecycle.up(st.name, p, env)
+
+        if tmux.has_session(p.session(st.name)):
+            tail = f"{'← ' + st.parent if st.parent else ''}{dlabel}" \
+                   f"{f'  [resumed {sid}]' if rflag else ''}"
+            print(f"[squad] {st.name:<10} {st.role:<14} {st.model or 'default':<8} {tail}")
+            n += 1
+        else:
+            print(f"[squad] {st.name:<10} FAILED TO LAUNCH — check: python3 -m af up {st.name}")
+            sys.stderr.write(buf.getvalue())
+
+    # squad.json is the one file that also answers "where did this team come from, and
+    # when": no separate line.json, no second writer to keep in sync.
+    roster.set_meta(str(Path(bp).resolve()), int(time.time()), p)
+
+    skipmsg = f", {skipped} left alone (already running)" if skipped else ""
+    print(f"[squad] {n} stations up{skipmsg}. attach: tmux attach -t ai-{slug}-<name>")
+    print('[squad] talk to the squad:  af post <agent> "…"   |   read replies:  af mail   |   '
+          "see it all:  af ledger")
+
+    # Start the limit watcher WITH the squad, not after it. The account-wide usage limit kills
+    # every agent and the orchestrator session at the same instant — there is nobody left to
+    # start a rescuer once it lands. It has to already be running, and it has to be something
+    # that spends no tokens. Idempotent: re-running `squad up` does not start a second one.
+    from . import warden
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        warden.watch(p=p)
+    for ln in out.getvalue().splitlines():
+        print(f"[squad] {ln}")
+
+    # The postmaster is the squad's OTHER daemon — squad.json reconciliation and the mail
+    # ring-catch, on a much shorter clock than the warden's five-minute one. Started
+    # alongside it for the same reason: a team working unattended never calls a
+    # command, so nothing else will ever start it. Idempotent, like warden.watch.
+    from . import postmaster
+    out2 = io.StringIO()
+    with contextlib.redirect_stdout(out2):
+        postmaster.watch(p=p)
+    for ln in out2.getvalue().splitlines():
+        print(f"[squad] {ln}")
+    return 0
+
+
+def cmd_status(bp: str) -> int:
+    stations = plan(bp)
+    p = _p(stations[0].slug) if stations else paths()
+    for st in stations:
+        pr = do_probe(st.name, p)
+        alive = "up" if pr.alive else "down"
+        ctx = pr.ctx if (pr.alive and pr.ctx) else 0
+        print(f"  {st.name:<10} {alive:<5} ctx={str(ctx):<9} unread={mailbox.unread(st.name, p)}")
+    return 0
+
+
+def cmd_down(bp: str) -> int:
+    stations = plan(bp)
+    p = _p(stations[0].slug) if stations else paths()
+    for st in stations:
+        with contextlib.redirect_stdout(io.StringIO()):
+            lifecycle.down(st.name, p)
+        print(f"[squad] {st.name} down")
+    return 0
+
+
+def cmd_heal(bp: str, dry_run: bool = False, restart_idle: bool = False) -> int:
+    from . import heal as healmod
+    stations = plan(bp)
+    if not stations:
+        print("[heal] blueprint has no agents.")
+        return 0
+    p = _p(stations[0].slug)
+    return healmod.heal(stations, p, healmod.Options(dry_run=dry_run, restart_idle=restart_idle))
+
+
+def cmd_settings(slug: str, name: str, out: str) -> int:
+    # Preflights first: `up` refuses to spawn into a fail-open state, and this path had no
+    # reason to be the one that quietly hands out a settings file pointing at a hook that
+    # cannot execute.
+    if not preflight():
+        return 1
+    f = write_settings(slug, name, out)
+    print(f"[squad] wrote {f}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="af.squad", description="bring up a squad of agents")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("plan", help="the resolved squad, without spawning it")
+    q.add_argument("blueprint")
+    q = sub.add_parser("up", help="generate briefs + settings and spawn every station")
+    q.add_argument("--resume", "--adopt", dest="resume", action="store_true",
+                   help="bring each station back ON ITS OLD SESSION (memory kept)")
+    q.add_argument("blueprint")
+    q = sub.add_parser("status", help="who's alive, context size, unread mail")
+    q.add_argument("blueprint")
+    q = sub.add_parser("down", help="stop every station on the squad")
+    q.add_argument("blueprint")
+    q = sub.add_parser("heal", help="diagnose every station and repair breakage without "
+                                    "losing context (sid drift, stale settings, crashed agents)")
+    q.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="report what is broken and what would change — touch nothing")
+    q.add_argument("--restart-idle", dest="restart_idle", action="store_true",
+                   help="also restart LIVE-but-idle agents to load regenerated settings "
+                        "(never a busy one; memory kept via --resume)")
+    q.add_argument("blueprint")
+    q = sub.add_parser("settings", help="(internal) regenerate one agent's settings file")
+    q.add_argument("slug")
+    q.add_argument("name")
+    q.add_argument("out")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    a = build_parser().parse_args(argv)
+    try:
+        if a.cmd == "plan":
+            return cmd_plan(a.blueprint)
+        if a.cmd == "up":
+            return cmd_up(a.blueprint, a.resume)
+        if a.cmd == "status":
+            return cmd_status(a.blueprint)
+        if a.cmd == "down":
+            return cmd_down(a.blueprint)
+        if a.cmd == "heal":
+            return cmd_heal(a.blueprint, a.dry_run, a.restart_idle)
+        if a.cmd == "settings":
+            return cmd_settings(a.slug, a.name, a.out)
+    except SquadSpecError as e:
+        # A blueprint that does not validate must STOP the command, not decorate it. (`squad
+        # plan` printed its header, printed the FATAL to stderr — and still exited 0, so
+        # `squad plan && squad up` sailed on into `up`.)
+        print(f"[squad] FATAL: {e}", file=sys.stderr)
+        return 1
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

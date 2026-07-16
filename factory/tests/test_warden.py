@@ -60,10 +60,10 @@ class WakePath(TempFactory):
         self.assertIn("cut your turn off", msgs[0].body)
         self.assertIn("ask, rather than guessing", msgs[0].body)
 
-    def test_line_agents_scopes_to_this_slug(self):
+    def test_squad_agents_scopes_to_this_slug(self):
         with mock.patch.object(tmux, "list_sessions",
                                return_value=["ai-aftest-w", "ai-other-x", "ai-aftest-boss"]):
-            self.assertEqual(sorted(warden.line_agents(self.p)), ["boss", "w"])
+            self.assertEqual(sorted(warden.squad_agents(self.p)), ["boss", "w"])
 
     def test_pane_still_limited_blocks_the_wake(self):
         # The 7-day cap can hold you down long past the 5-hour reset; a pane still showing the
@@ -105,33 +105,33 @@ class PokeOnlyOrchestrator(TempFactory):
 
     def test_find_orchestrator_reads_squad_role(self):
         # When squad.json has a station with role="orchestrator", that is the answer.
-        from af import squad
+        from af import roster
         orc_st = mock.Mock()
         orc_st.name = "orc"
         orc_st.role = "orchestrator"
         w_st = mock.Mock()
         w_st.name = "w"
         w_st.role = "worker"
-        with mock.patch.object(squad, "stations", return_value=[orc_st, w_st]):
+        with mock.patch.object(roster, "stations", return_value=[orc_st, w_st]):
             self.assertEqual(warden._find_orchestrator(self.p), "orc")
 
     def test_find_orchestrator_fallback_to_name(self):
-        # If squad has no record, fall back to a literally-named "orc" or "orchestrator".
-        from af import squad
-        with mock.patch.object(squad, "stations", return_value=[]):
+        # If the roster has no record, fall back to a literally-named "orc" or "orchestrator".
+        from af import roster
+        with mock.patch.object(roster, "stations", return_value=[]):
             with mock.patch.object(tmux, "list_sessions",
                                    return_value=["ai-aftest-orc", "ai-aftest-w"]):
                 self.assertEqual(warden._find_orchestrator(self.p), "orc")
 
     def test_find_orchestrator_returns_none_when_no_orc(self):
-        from af import squad
+        from af import roster
         w_st = mock.Mock()
         w_st.name = "w"
         w_st.role = "worker"
         c_st = mock.Mock()
         c_st.name = "coder"
         c_st.role = "worker"
-        with mock.patch.object(squad, "stations", return_value=[w_st, c_st]):
+        with mock.patch.object(roster, "stations", return_value=[w_st, c_st]):
             with mock.patch.object(tmux, "list_sessions",
                                    return_value=["ai-aftest-w", "ai-aftest-coder"]):
                 self.assertIsNone(warden._find_orchestrator(self.p))

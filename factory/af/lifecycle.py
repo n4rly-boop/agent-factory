@@ -23,8 +23,8 @@ import sys
 import time
 import uuid
 
-from . import drive, hooks, live as livemod, mailbox, manifest, patterns, spec as specmod, squad, tmux
-from .paths import LINE_SH, MAIL_SH, POLL_SH, Paths, paths
+from . import drive, hooks, live as livemod, mailbox, manifest, patterns, roster, spec as specmod, tmux
+from .paths import MAIL_SH, POLL_SH, Paths, paths
 
 RESUME_WATCH_TICKS = 24     # 12s of watching for the resume chooser
 RESUME_WATCH_SLEEP = 0.5
@@ -198,7 +198,7 @@ def up(name: str = "claude", p: Paths | None = None, env: dict | None = None) ->
     # stays authoritative during the migration, so a squad-write failure must never fail a
     # spawn — the roster is a convenience view that self-heals on the next reconcile.
     try:
-        squad.mark_up(
+        roster.mark_up(
             name, p, live_sid=sid, settings_path=sp.settings, spawn_flags=basefl,
             model=sp.model, role=e.get("AF_ROLE", ""), parent=e.get("AF_PARENT", ""),
             delegate=e.get("AF_DELEGATE", ""),
@@ -239,7 +239,7 @@ def down(name: str = "claude", p: Paths | None = None) -> int:
     tmux.kill_session(p.session(name))
     _rm_dead_state(name, p)
     try:
-        squad.mark_down(name, captured or None, p)
+        roster.mark_down(name, captured or None, p)
     except Exception:
         pass
     print(f"[af] '{name}' down — session killed.")
@@ -340,7 +340,7 @@ def revive(name: str = "claude", sid: str = "", p: Paths | None = None) -> int:
         # any fork, so it names the transcript that was actually growing. Preferred over the
         # sid file (written once at spawn, rots on resume) and the spec's frozen spawn-time id.
         try:
-            st = squad.get(name, p)
+            st = roster.get(name, p)
             sid = st.live_sid if st else ""
         except Exception:
             sid = ""
@@ -379,7 +379,7 @@ def revive(name: str = "claude", sid: str = "", p: Paths | None = None) -> int:
     # Memory without a constitution is the wrong agent. The SPEC — not the blueprint — is
     # the source of truth: the agent's 100k of context was built under THESE rules, and
     # reviving it under rules that have since changed hands it a system prompt its own
-    # history contradicts. To adopt an edited blueprint, respawn (`line up`), don't revive.
+    # history contradicts. To adopt an edited blueprint, respawn (`squad up`), don't revive.
     if sf.is_file():
         try:
             sp = specmod.read(name, p)
@@ -391,7 +391,7 @@ def revive(name: str = "claude", sid: str = "", p: Paths | None = None) -> int:
             print(f"[af] refusing to revive '{name}': {err}")
             print(f"[af]   A spec that won't load means no role, no hooks, no model, no "
                   f"system prompt.")
-            print(f"[af]   Fix or delete {sf}, or respawn the line. Deliberate? "
+            print(f"[af]   Fix or delete {sf}, or respawn the squad. Deliberate? "
                   f"AI_FORCE=1 af revive {name}")
             if not force:
                 return 1
@@ -439,11 +439,11 @@ def revive(name: str = "claude", sid: str = "", p: Paths | None = None) -> int:
 
 
 def _regen_settings(name: str, out: str, p: Paths) -> None:
-    """Regenerate the settings file a revive found missing. The generator is line.py's, the
-    same one `line up` writes with — byte-identical output, and no bash shell-out."""
+    """Regenerate the settings file a revive found missing. The generator is squad.py's, the
+    same one `squad up` writes with — byte-identical output, and no bash shell-out."""
     try:
-        from . import line
-        line.write_settings(p.slug, name, out)
+        from . import squad
+        squad.write_settings(p.slug, name, out)
     except Exception:
         pass
 

@@ -1,4 +1,4 @@
-"""heal — walk a line, find what broke, put it back WITHOUT losing context.
+"""heal — walk a squad, find what broke, put it back WITHOUT losing context.
 
 The failures this repairs, in the order it is safe to repair them:
 
@@ -81,7 +81,7 @@ def _has_session_start(settings_path: str) -> bool:
 
 def diagnose(name: str, p: Paths, ps_out: str, probe_fn=None) -> Finding:
     """Read-only. Everything heal knows about one agent, from tmux, the process table, the
-    sid file and the settings file. `ps_out` is passed in (one scan for the whole line);
+    sid file and the settings file. `ps_out` is passed in (one scan for the whole squad);
     `probe_fn` is injectable so tests need no live pane."""
     session_alive = tmux.has_session(p.session(name))
     lsid = live.live_sid(name, p, ps_out=ps_out)
@@ -125,7 +125,7 @@ def repair(f: Finding, slug: str, p: Paths, opts: Options) -> list[str]:
     """Apply the safe repairs for one finding. Returns the actions taken (or, in dry-run, the
     actions that WOULD be taken). Ordered so the sid file is correct before anything resumes
     on it."""
-    from . import line as linemod
+    from . import squad as squadmod
 
     acts: list[str] = []
     dry = opts.dry_run
@@ -145,7 +145,7 @@ def repair(f: Finding, slug: str, p: Paths, opts: Options) -> list[str]:
         if dry:
             acts.append(f"WOULD regenerate settings ({why})")
         else:
-            linemod.write_settings(slug, f.name, f.settings_path)
+            squadmod.write_settings(slug, f.name, f.settings_path)
             ok = hooks.hooks_ok(f.settings_path, quiet=True)
             acts.append(f"regenerated settings ({why}){'' if ok else ' — STILL FAIL-OPEN'}")
             # A live agent keeps running its OLD in-memory settings until it restarts.
@@ -154,7 +154,7 @@ def repair(f: Finding, slug: str, p: Paths, opts: Options) -> list[str]:
                     acts.append(_restart(f.name, p, dry))
                 else:
                     acts.append("↳ restart to load it (live agent still on old hooks) — "
-                                "af down " + f.name + " && af line up --resume <bp>, or "
+                                "af down " + f.name + " && af squad up --resume <bp>, or "
                                 "rerun heal with --restart-idle")
 
     # 3. crashed / down — revive on the recorded session. Context preserved via --resume.
@@ -219,7 +219,7 @@ def _fmt(f: Finding) -> str:
 
 def heal(stations, p: Paths, opts: Options) -> int:
     """Walk every station, diagnose it, repair it. `stations` is the parsed blueprint — the
-    record of who is SUPPOSED to be on the line."""
+    record of who is SUPPOSED to be on the squad."""
     slug = stations[0].slug if stations else p.slug
     ps_out = live._ps()
     ps_has_claude = "claude" in ps_out
@@ -228,7 +228,7 @@ def heal(stations, p: Paths, opts: Options) -> int:
               "agents are down (would risk reviving live ones).")
         return 1
 
-    print(f"[heal] line '{slug}' — {len(stations)} station(s)"
+    print(f"[heal] squad '{slug}' — {len(stations)} station(s)"
           f"{'  (dry-run — nothing will change)' if opts.dry_run else ''}")
     healed = broke = 0
     for st in stations:

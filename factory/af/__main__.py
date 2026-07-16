@@ -205,9 +205,9 @@ def cmd_unread(a: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_line(a: argparse.Namespace) -> int:
-    from . import line
-    return line.main(a.rest)
+def cmd_squad(a: argparse.Namespace) -> int:
+    from . import squad
+    return squad.main(a.rest)
 
 
 def cmd_warden(a: argparse.Namespace) -> int:
@@ -307,7 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("revivable", help="downed agents with a surviving log").set_defaults(fn=cmd_revivable)
     sub.add_parser("list", help="list running interactive agents").set_defaults(fn=cmd_list)
-    sub.add_parser("ledger", help="one view of the line: role, model, ctx, mail, alive?").set_defaults(fn=cmd_ledger)
+    sub.add_parser("ledger", help="one view of the squad: role, model, ctx, mail, alive?").set_defaults(fn=cmd_ledger)
     sub.add_parser("register-self", help="let agents WAKE this session by mail").set_defaults(fn=cmd_register)
     sub.add_parser("unregister-self", help="stop agents from waking this session").set_defaults(fn=cmd_unregister)
 
@@ -342,13 +342,13 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--skip", default="", help="an agent the caller is about to touch")
     q.set_defaults(fn=cmd_sweep)
 
-    # A whole line, the context guard, and per-agent timers each own a nested command tree
-    # (`af line up …`, `af warden watch`, `af polling start …`). Their parsers live in their
+    # A whole squad, the context guard, and per-agent timers each own a nested command tree
+    # (`af squad up …`, `af warden watch`, `af polling start …`). Their parsers live in their
     # own modules; here they are one passthrough each, so the module stays the single owner
     # of its own arg grammar.
-    q = sub.add_parser("line", help="a team from a blueprint.yml (plan/up/status/down)")
+    q = sub.add_parser("squad", help="a team from a blueprint (plan/up/status/down)")
     q.add_argument("rest", nargs=argparse.REMAINDER)
-    q.set_defaults(fn=cmd_line)
+    q.set_defaults(fn=cmd_squad)
 
     q = sub.add_parser("warden", help="the context guard + usage-limit rescue (watch/status/stop)")
     q.add_argument("rest", nargs=argparse.REMAINDER)

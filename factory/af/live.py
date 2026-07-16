@@ -312,9 +312,9 @@ def heal_sid_file(agent: str, p: Paths | None = None, ps_out: str | None = None)
     # fork, so revive (which prefers squad) would resume the frozen parent. Only for a station
     # already on the roster; imported locally to avoid a cycle; never fatal.
     try:
-        from . import squad
-        if squad.get(agent, p) is not None:
-            squad.set_live_sid(agent, live, p)
+        from . import roster
+        if roster.get(agent, p) is not None:
+            roster.set_live_sid(agent, live, p)
     except Exception:
         pass
     return live

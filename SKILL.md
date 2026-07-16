@@ -6,11 +6,11 @@ description: >-
   whenever the user wants to launch/spawn/open another agent or "a second
   Claude", drive or chat with a peer/worker agent, run agents that talk to each
   other, revive a killed agent, or list/clean up previously spawned agents and
-  their session logs. ALSO use it to stand up a whole TEAM of agents — a LINE — with
+  their session logs. ALSO use it to stand up a whole TEAM of agents — a SQUAD — with
   roles and a hierarchy (orchestrator + workers, parallel multi-agent experiments,
-  ablations) — that is `af line` with a blueprint.yml. Invoked as `/agent-factory
+  ablations) — that is `af squad` with a blueprint. Invoked as `/agent-factory
   plan <goal>` it runs an INTERACTIVE blueprint wizard: it interviews the user,
-  proposes the stations and their briefs, and writes the blueprint.yml with them.
+  proposes the stations and their briefs, and writes the blueprint with them.
   Trigger even if the user just says "spawn an agent", "open another claude", "talk
   to it", "kill that agent", "design a team of agents", or "clean up the agent
   logs" without naming this skill.
@@ -32,7 +32,7 @@ changes when there is more than one.
 - **`af up` / `af ask` — a real interactive Claude TUI** in a detached tmux session.
   You drive it with `af say`/`af ask` (which wrap `tmux send-keys`) and read it with
   `af screen`/`af result`. **Default for a single agent.**
-- **`af line` — a whole team from one `blueprint.yml`.** Roles, chain of command,
+- **`af squad` — a whole team from one blueprint (JSON).** Roles, chain of command,
   per-agent model, enforced delegation. See `squad.md`.
 
 ## Running `af`
@@ -47,7 +47,7 @@ SKILL="$HOME/.claude/skills/agent-factory"
 PYTHONPATH="$SKILL/scripts" python3 -m af up neo     # the canonical form
 ```
 
-**The old `*.sh` names still work** — `ai.sh`, `mail.sh`, `line.sh`, `warden.sh`,
+**The old `*.sh` names still work** — `ai.sh`, `mail.sh`, `squad.sh`, `warden.sh`,
 `polling.sh`, `statusline.sh` and the `hooks/*.sh` are now **6-line shims** that set
 `PYTHONPATH` and `exec python3 -m af…` for you, so `bash "$SKILL/scripts/ai.sh" up
 neo` is exactly `af up neo` with zero setup. They are kept on purpose and must stay:

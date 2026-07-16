@@ -140,12 +140,12 @@ class TestSpecErrors(TempFactory):
         for name in ("orc", "qa", "lead"):
             af_spec.write(af_spec.Spec(slug="aftest", name=name, cwd="/x", sid="",
                                        spawned=0, flags=""), self.p)
-        (self.p.specdir / "line.json").write_text("{}")          # must not be mistaken for an agent
+        (self.p.specdir / "squad.json").write_text("{}")         # must not be mistaken for an agent
         self.assertEqual(af_spec.all_specs(self.p), ["lead", "orc", "qa"])
 
     def test_spec_file_is_never_the_bare_name(self):
-        # An agent literally named "line" must not collide with line.json.
-        self.assertEqual(self.p.spec_file("line").name, "agent-line.json")
+        # An agent literally named "squad" must not collide with squad.json.
+        self.assertEqual(self.p.spec_file("squad").name, "agent-squad.json")
 
 
 if __name__ == "__main__":

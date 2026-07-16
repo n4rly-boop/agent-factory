@@ -5,7 +5,7 @@ tick loop) — see tests/test_warden.py for the sibling conventions this file ma
 `durable_state` (pidfile/logfile) lives under SPEC_HOME, not AF_ROOT, so — like
 tests/test_manifest.py — every test here redirects af.paths.SPEC_HOME into the temp
 factory. Nothing touches the real ~/.claude/agent-factory, no real subprocess is spawned
-(subprocess.Popen is always mocked), and no real tmux/ps is touched (squad.reconcile and
+(subprocess.Popen is always mocked), and no real tmux/ps is touched (roster.reconcile and
 drive.ring are always mocked or bypassed).
 """
 
@@ -20,7 +20,7 @@ from unittest import mock
 
 from support import TempFactory   # imported first: it puts the af package on sys.path
 
-from af import drive, mailbox, postmaster, squad
+from af import drive, mailbox, postmaster, roster
 from af import paths as af_paths
 
 
@@ -186,8 +186,8 @@ class TestRingCatch(PostmasterTest):
 
     def setUp(self):
         super().setUp()
-        squad.mark_up("qa", self.p)
-        squad.mark_up("rag", self.p)
+        roster.mark_up("qa", self.p)
+        roster.mark_up("rag", self.p)
 
     def _run(self, total_map, unread_map, last_total, ring_ok=None):
         ring_ok = ring_ok or {}
@@ -344,7 +344,7 @@ class TestLoop(PostmasterTest):
         fake_time = self.FakeTime(on_sleep)
 
         with mock.patch.object(postmaster, "time", fake_time), \
-             mock.patch.object(squad, "reconcile") as fake_reconcile, \
+             mock.patch.object(roster, "reconcile") as fake_reconcile, \
              mock.patch.object(postmaster, "_ring_catch", return_value=[]) as fake_ring_catch:
             rc = postmaster.loop(self.p)
 
@@ -368,7 +368,7 @@ class TestLoop(PostmasterTest):
         fake_time = self.FakeTime(on_sleep)
 
         with mock.patch.object(postmaster, "time", fake_time), \
-             mock.patch.object(squad, "reconcile", side_effect=RuntimeError("boom")), \
+             mock.patch.object(roster, "reconcile", side_effect=RuntimeError("boom")), \
              mock.patch.object(postmaster, "_ring_catch", return_value=[]) as fake_ring_catch:
             rc = postmaster.loop(self.p)
 
@@ -382,7 +382,7 @@ class TestLoop(PostmasterTest):
 
         fake_time = self.FakeTime(on_sleep)
         with mock.patch.object(postmaster, "time", fake_time), \
-             mock.patch.object(squad, "reconcile") as fake_reconcile, \
+             mock.patch.object(roster, "reconcile") as fake_reconcile, \
              mock.patch.object(postmaster, "_ring_catch") as fake_ring_catch:
             rc = postmaster.loop(self.p)
 

@@ -1,16 +1,16 @@
-"""warden — the thing that watches a line WHEN NOBODY IS DRIVING IT.
+"""warden — the thing that watches a squad WHEN NOBODY IS DRIVING IT.
 
-    python3 -m af.warden watch     start it for this line (detached; safe to re-run)
+    python3 -m af.warden watch     start it for this squad (detached; safe to re-run)
     python3 -m af.warden watch --target <session>  guard a single tmux session (standalone)
     python3 -m af.warden stop
     python3 -m af.warden status     quota, reset time, who got cut off, when it last swept
 
-Two jobs, and they are the same job: keep the line alive through the hours when no human and
+Two jobs, and they are the same job: keep the squad alive through the hours when no human and
 no orchestrator is issuing commands.
 
   1. CONTEXT. `sweep` compacts agents past their threshold — but it only ever ran from
-     `post` / `mail` / `sweep`, i.e. only when the DRIVING session spoke. An autonomous line
-     does not go through those: its agents mail each other, and mail never swept. So a line
+     `post` / `mail` / `sweep`, i.e. only when the DRIVING session spoke. An autonomous squad
+     does not go through those: its agents mail each other, and mail never swept. So a squad
      left to work overnight was never compacted AT ALL. Observed, and it is why this file
      exists: a station reached 767k tokens against a 500k HARD threshold, with nothing to
      trip it. "Automatic" compaction that only fires while a human is at the keyboard is not
@@ -26,7 +26,7 @@ HOW IT RESCUES. It marks WHO was cut off, then wakes them by GROUND TRUTH — ne
     pane is read as a BELT: a hook that fails to fire (wrong version, lost +x) fails SILENTLY,
     and a rescue system that quietly does not rescue is worse than none.
   * WHEN — it does NOT wait for a reset time. The statusline's resets_at was a PROPHECY: true
-    only for the account that rendered it, and a line's agents get moved between accounts, so a
+    only for the account that rendered it, and a squad's agents get moved between accounts, so a
     reset time can name a window that has already lifted (or one that never applied). Instead
     the warden POKES a cut-off agent on a capped interval and watches its TRANSCRIPT. A turn
     that LANDS (the end_turn count climbs) is the only honest proof the window reopened — the
@@ -202,8 +202,8 @@ def pane_limited_target(target: str) -> bool:
     return bool(pane and patterns.USAGE_LIMIT.search(pane))
 
 
-def line_agents(p: Paths) -> list[str]:
-    """Every agent of THIS line that has a session."""
+def squad_agents(p: Paths) -> list[str]:
+    """Every agent of THIS squad that has a session."""
     pfx = f"ai-{p.slug}-"
     return [s[len(pfx):] for s in tmux.list_sessions() if s.startswith(pfx)]
 
@@ -253,10 +253,10 @@ def _heal_sids(p: Paths) -> str:
     restarted by a human — is now on a new id while its sid file still names the frozen parent.
     Sweep would then read the parent's stale context (the "compacting an agent already at 0%"
     loop). This is the same repair heal does by hand; the warden does it on its own clock so a
-    parked, unattended line self-corrects without anyone running a command.
+    parked, unattended squad self-corrects without anyone running a command.
     """
     fixed = []
-    for a in line_agents(p):
+    for a in squad_agents(p):
         try:
             new = live.heal_sid_file(a, p)
         except Exception:
@@ -283,18 +283,18 @@ def _find_orchestrator(p: Paths) -> str | None:
     """Find the orchestrator station name for this slug.
 
     Primary: read from squad.json's Station.role field.
-    Fallback: if squad has no record, check for a station literally named "orc" or
+    Fallback: if the roster has no record, check for a station literally named "orc" or
     "orchestrator" (defensive fallback only).
     Returns None if no orchestrator can be identified."""
     try:
-        from . import squad
-        for st in squad.stations(p):
+        from . import roster
+        for st in roster.stations(p):
             if st.role == "orchestrator":
                 return st.name
     except Exception:
         pass
     # Defensive fallback: check for literally-named orchestrator
-    for a in line_agents(p):
+    for a in squad_agents(p):
         if a in ("orc", "orchestrator"):
             return a
     return None
@@ -344,7 +344,7 @@ def loop(p: Paths) -> int:
                 log(f"sweep: {out}", p)
 
         marked: list[str] = []
-        for a in line_agents(p):
+        for a in squad_agents(p):
             # Hook marker: this agent was cut off MID-TURN. That is the case that needs a
             # wake; an agent that was idle when the limit landed lost nothing.
             if p.limited(a).is_file():
@@ -558,14 +558,14 @@ def _standalone_wake(target: str, why: str) -> None:
 def watch(p: Paths | None = None, target: str | None = None) -> int:
     if target is not None:
         return _watch_standalone(target)
-    return _watch_line(p)
+    return _watch_squad(p)
 
 
-def _watch_line(p: Paths | None = None) -> int:
+def _watch_squad(p: Paths | None = None) -> int:
     p = p or paths()
     pid = _pid(p)
     if _live(pid):
-        print(f"[warden] already watching line '{p.slug}' (pid {pid}). Stop it first: "
+        print(f"[warden] already watching squad '{p.slug}' (pid {pid}). Stop it first: "
               f"af warden stop")
         return 0
     p.durable_state.mkdir(parents=True, exist_ok=True)
@@ -577,7 +577,7 @@ def _watch_line(p: Paths | None = None) -> int:
     # it: the longest-lived, least-guarded station, exactly the 767k-overnight case. Scrub it.
     for k in ("AF_AGENT", "AF_ROLE"):
         env.pop(k, None)
-    # The warden is a child of whatever spawned the line, but it must OUTLIVE it: the usage
+    # The warden is a child of whatever spawned the squad, but it must OUTLIVE it: the usage
     # limit kills the orchestrator too, and a watcher in its process group would die with it.
     env["PYTHONPATH"] = os.pathsep.join(
         x for x in (str(FACTORY_DIR), env.get("PYTHONPATH", "")) if x)
@@ -587,10 +587,10 @@ def _watch_line(p: Paths | None = None) -> int:
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     pidfile(p).write_text(str(proc.pid), encoding="utf-8")
-    print(f"[warden] watching line '{p.slug}' (pid {proc.pid}).")
+    print(f"[warden] watching squad '{p.slug}' (pid {proc.pid}).")
     print(f"[warden]   compacts agents past their threshold every "
           f"{sweep_every() // 60}m — with or without you")
-    print("[warden]   and wakes the line when the usage limit resets. It spends no tokens, "
+    print("[warden]   and wakes the squad when the usage limit resets. It spends no tokens, "
           "so the limit cannot kill it.")
     print(f"[warden]   log: {logfile(p)}")
     return 0
@@ -638,14 +638,14 @@ def _watch_standalone(target: str) -> int:
 def stop(p: Paths | None = None, target: str | None = None) -> int:
     if target is not None:
         return _stop_standalone(target)
-    return _stop_line(p)
+    return _stop_squad(p)
 
 
-def _stop_line(p: Paths | None = None) -> int:
+def _stop_squad(p: Paths | None = None) -> int:
     p = p or paths()
     pid = _pid(p)
     if not pid:
-        print(f"[warden] not watching line '{p.slug}'.")
+        print(f"[warden] not watching squad '{p.slug}'.")
         return 0
     with contextlib.suppress(OSError):
         os.kill(pid, signal.SIGTERM)
@@ -691,7 +691,7 @@ def _status_line(p: Paths | None = None) -> int:
         print("                 (without it the watcher cannot know WHEN to wake anyone)")
 
     any_ = False
-    for a in line_agents(p):
+    for a in squad_agents(p):
         if not p.limited(a).is_file():
             continue
         when, _sidv = marker(a, p)
@@ -743,10 +743,10 @@ def _status_standalone(target: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="af.warden", description="the line's unattended watcher")
+    ap = argparse.ArgumentParser(prog="af.warden", description="the squad's unattended watcher")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    watch_p = sub.add_parser("watch", help="start the watcher for this line (safe to re-run)")
+    watch_p = sub.add_parser("watch", help="start the watcher for this squad (safe to re-run)")
     watch_p.add_argument("--target", type=str, default=None,
                          help="standalone mode: guard a single tmux session by name")
 
