@@ -199,7 +199,7 @@ def role_reminder() -> int:
     parent = _env("AF_PARENT", "orchestrator")
     # An orchestrator's parent is the human, not another orchestrator. Without this,
     # AF_PARENT's default makes the top station report to a station that does not exist.
-    if role == "orchestrator" and not os.environ.get("AF_PARENT"):
+    if role == "orchestrator" and not _env("AF_PARENT"):
         parent = ("the human, directly in chat (do NOT mail an 'orchestrator' — "
                   "no such station)")
     peers = _env("AF_PEERS")
@@ -313,7 +313,7 @@ def _bulk_lines() -> int:
     it here would have made the same blueprint behave differently under the two runtimes.
     Only non-numeric and negative values fall back to the default.
     """
-    v = (os.environ.get("AF_BULK_LINES") or "").strip()
+    v = _env("AF_BULK_LINES").strip()
     return intish(v, DEFAULT_BULK)
 
 
@@ -946,7 +946,11 @@ def escalation_stop() -> int:
     from . import mailbox
     from .paths import paths
 
-    p = paths()                                    # AF_SLUG, else slugify(basename(AF_CWD))
+    # If launched with `<slug> <agent>` args (identity bound), read that agent's mailbox under
+    # the argv slug — fork-proof, like every other hook. With no args this is the human
+    # orchestrator's own Stop: keep the env/cwd-derived slug, which is correct for it.
+    # (Not installed by settings_json today; this keeps it safe if a Stop hook is ever added.)
+    p = _state_paths() if _IDENT is not None else paths()
     who = _env("AF_AGENT", "orchestrator")         # unset in an orchestrator session
 
     if mailbox.unread(who, p) <= 0:

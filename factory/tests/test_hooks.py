@@ -131,6 +131,19 @@ class IdentityFromSpec(TempFactory):
         self.assertIn("lead,qa,ops", out)
         self.assertNotIn("eval,annotator", out)
 
+    def test_orchestrator_parent_override_ignores_a_contaminated_AF_PARENT(self):
+        # The orchestrator's spec has no AF_PARENT (it reports to the human). A fork onto a
+        # pool descended from a WORKER carries that worker's AF_PARENT in the env. The
+        # "report to the human" override must fire on the SPEC's empty parent, not be
+        # suppressed by the env's — else the orchestrator is told to report to a station.
+        self._spec("inna", "orc", {"AF_ROLE": "orchestrator", "AF_PEERS": "lead,qa"})
+        contaminated = {"AF_SLUG": "aae1", "AF_AGENT": "orc", "AF_ROLE": "orchestrator",
+                        "AF_PARENT": "some-other-orc", "AF_PEERS": "eval"}
+        rc, out, err = self._run("role-reminder", ["inna", "orc"], contaminated)
+        self.assertEqual(rc, 0)
+        self.assertIn("the human", out)
+        self.assertNotIn("some-other-orc", out)
+
     def test_delegate_wall_measures_against_the_spec_work_dir_not_the_env(self):
         # Contaminated env points AF_WORK at another squad's dir; the spec says /inna/work.
         # A write into /inna/work must be allowed (the agent's own zone), proving the wall

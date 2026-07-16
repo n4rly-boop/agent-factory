@@ -257,7 +257,10 @@ def settings_json(slug: str, name: str) -> str:
     and passed through verbatim, so args cannot be swapped underneath it; the hook resolves
     the rest from the spec those args name. See af.hooks._bind_identity.
     """
-    ident = f"{shlex.quote(slug)} {shlex.quote(name)}"
+    # Shell-quote (the command runs in a shell) THEN JSON-escape (it is interpolated into a
+    # hand-rolled JSON string). Slug is slugified and names are tame in practice, but a `"` in
+    # either would otherwise inject a raw quote and produce invalid settings JSON.
+    ident = json.dumps(f"{shlex.quote(slug)} {shlex.quote(name)}")[1:-1]
     return f"""{{
   "statusLine": {{ "type": "command", "command": "{STATUSLINE_SH} {ident}", "padding": 0 }},
   "hooks": {{
@@ -422,44 +425,53 @@ def _p(slug: str) -> Paths:
     return paths(slug)
 
 
-def _slug_taken_by_other(slug: str, bp_resolved: str) -> bool:
-    """True if `slug` already belongs to a DIFFERENT squad — one whose recorded blueprint is
-    not this one. That is the case a fresh `up` must not sit on top of: same slug = same
-    mailboxes, same specdir, same state dir, so a new team under a reused slug inherits the
-    old team's unread mail, stale specs and reports. (Exactly what put another squad's 84
-    old letters under a brand-new orc.)
-
-    A slug with NO squad.json is free — return False. A squad.json whose blueprint MATCHES
-    ours is our own team coming back (a re-run, a --resume, a partial heal) — also False, so
-    those keep working unchanged. Anything else — a different blueprint, or an old squad.json
-    from before the blueprint field existed — is another squad, so bump."""
+def _slug_owner(slug: str) -> str:
+    """The blueprint path recorded in this slug's squad.json, or "" if the slug has no squad
+    (no file, unreadable, or an old squad.json from before the blueprint field). "" means
+    BOTH "free" and "cannot prove it is ours" — the caller separates those."""
     try:
-        recorded = roster.load(_p(slug)).blueprint
+        return roster.load(_p(slug)).blueprint or ""
     except Exception:
-        return False
-    if not recorded:
-        # No squad.json / nothing recorded → the specdir is empty of a prior team. Free.
-        return _p(slug).squad_file.is_file()
-    return recorded != bp_resolved
+        return ""
+
+
+def _slug_is_free(slug: str) -> bool:
+    """No squad has ever been materialised under this slug — no squad.json at all. A fresh
+    `up` may take it without clobbering another team's mailboxes/specs/state."""
+    return not _p(slug).squad_file.is_file()
+
+
+def _slug_candidates(base: str):
+    yield base
+    for i in range(1, 1000):
+        yield f"{base}{i}"
 
 
 def _resolve_slug(base: str, bp_resolved: str) -> str:
-    """`base`, or `base1`/`base2`/… — the first that is free or already ours. Bounded so a
-    pathological run cannot spin forever; 999 reused slugs for one base is not a real team.
+    """Where THIS blueprint's team lives, as one slug — the same answer for `up` and for
+    every command after it, so they never address different squads.
 
-    The SAME function serves `up` and every other command. For `up` it means "where should
-    this team live" (the base if free, its own bumped slug if it already has one, a new bump
-    if the base belongs to someone else). For `down`/`status`/`heal`/`add` it means "where
-    DOES this team live" — and the answer is identical, because a team that was bumped to
-    `base1` on `up` recorded our blueprint there, so `base` reads as another's and `base1`
-    reads as ours: the walk lands on `base1` again. A team that never came up returns the
-    base, and operating on an empty slug is a harmless no-op."""
-    if not _slug_taken_by_other(base, bp_resolved):
-        return base
-    for i in range(1, 1000):
-        cand = f"{base}{i}"
-        if not _slug_taken_by_other(cand, bp_resolved):
-            return cand
+    TWO passes, and the order is the fix for a real orphaning bug:
+
+      1. OURS WINS. Scan base, base1, base2, … and return the first slug whose recorded
+         blueprint IS this one. A team bumped to `base1` on `up` recorded us there; it must
+         keep being found at `base1` for the rest of its life — including after the FOREIGN
+         squad that forced the bump is torn down and `base` falls free again. A one-pass
+         "first free or ours" walk returned that newly-free `base` instead, so `squad down`
+         targeted an empty slug and left the real team at `base1` running. Preferring ours
+         over free closes that.
+      2. NO EXISTING TEAM → pick a home for a fresh `up`: the first slug that is free, or
+         (base taken by another) the first bump past it that is free. `down`/`status` on a
+         team that was never brought up land here too and get `base`; operating on an empty
+         slug is a harmless no-op.
+    """
+    for slug in _slug_candidates(base):
+        if _slug_owner(slug) == bp_resolved:
+            return slug                      # pass 1: our team, wherever it landed
+    for slug in _slug_candidates(base):
+        owner = _slug_owner(slug)
+        if not owner and _slug_is_free(slug):
+            return slug                      # pass 2: a genuinely empty slug
     raise SquadSpecError(f"every slug from {base!r} to {base}999 is taken by another squad")
 
 

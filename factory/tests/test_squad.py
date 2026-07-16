@@ -335,6 +335,23 @@ class AutoSlug(TempFactory):
         stations = squad.plan(f)
         self.assertEqual(squad._effective_paths(f, stations).slug, "proj1")
 
+    def test_ours_wins_over_a_freed_base_slug(self):
+        # The orphaning bug: foreign squad forced us to proj1, then the foreign proj is torn
+        # down (its squad.json deleted) so proj falls free. down/status/heal must STILL find
+        # our team at proj1 — a "first free or ours" walk would grab the now-free proj and
+        # leave the live proj1 team unaddressable.
+        f = self._bp_for("proj")
+        resolved = str(Path(f).resolve())
+        self._occupy("proj1", resolved)                # ours, bumped; proj has NO squad.json
+        self.assertEqual(squad._resolve_slug("proj", resolved), "proj1")
+        stations = squad.plan(f)
+        self.assertEqual(squad._effective_paths(f, stations).slug, "proj1")
+
+    def test_a_fresh_up_still_takes_the_free_base_when_nothing_is_ours(self):
+        # No team of ours anywhere → the base is free and must be used, not bumped.
+        f = self._bp_for("proj")
+        self.assertEqual(squad._resolve_slug("proj", str(Path(f).resolve())), "proj")
+
 
 if __name__ == "__main__":
     unittest.main()
