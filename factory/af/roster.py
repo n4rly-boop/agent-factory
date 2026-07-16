@@ -18,7 +18,8 @@ Ownership:
                            killing the session, so a killed-then-forked agent re-raises on
                            the transcript that was actually growing, not the frozen parent.
   * the postmaster daemon  reconciles `status`, `live_sid`, `ctx_tokens`, `unread`.
-  * the SessionStart hook   writes `live_sid` from inside the session.
+  * the SessionStart hook   writes `live_sid` from inside the session, and bumps `compacts`
+                            when its payload's `source` is "compact".
 
 `live_sid` is the authoritative session id — spec.sid (frozen at spawn) is no longer part
 of the resume fallback chain. The per-agent spec survives only as the immutable revive
@@ -62,6 +63,7 @@ class Station:
     spawned: int = 0          # epoch of first spawn, 0 if never
     ctx_tokens: int = 0       # last measured context size (reconciled)
     unread: int = 0           # last measured unread mail (reconciled)
+    compacts: int = 0         # count of SessionStart(source="compact") events seen
 
     def to_dict(self) -> dict:
         return {
@@ -70,6 +72,7 @@ class Station:
             "settings_path": self.settings_path, "live_sid": self.live_sid,
             "status": self.status, "spawned": self.spawned,
             "ctx_tokens": self.ctx_tokens, "unread": self.unread,
+            "compacts": self.compacts,
         }
 
     @classmethod
@@ -87,6 +90,7 @@ class Station:
             spawned=_intish(d.get("spawned")),
             ctx_tokens=_intish(d.get("ctx_tokens")),
             unread=_intish(d.get("unread")),
+            compacts=_intish(d.get("compacts")),
         )
 
 
@@ -247,6 +251,16 @@ def set_live_sid(name: str, sid: str, p: Paths | None = None) -> None:
     if not sid:
         return
     upsert(p, name=name, live_sid=sid)
+
+
+def bump_compacts(name: str, p: Paths | None = None) -> None:
+    """Called by the SessionStart hook when its payload's `source` is "compact" — one more
+    real compaction has happened to this agent, whoever drove it (`af sweep`, an operator's
+    `af compact`, or the agent typing /compact itself)."""
+    p = p or paths()
+    with edit(p) as sq:
+        cur = sq.agents.get(name) or Station(name=name)
+        sq.agents[name] = replace(cur, name=name, compacts=cur.compacts + 1)
 
 
 def mark_down(name: str, live_sid: str | None = None, p: Paths | None = None) -> None:

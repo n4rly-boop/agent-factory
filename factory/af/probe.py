@@ -34,6 +34,10 @@ class Probe:
     # statusline is not in the captured window. It is the truth the transcript estimate goes
     # stale against after a /clear or /compact — see patterns.CONTEXT_PCT.
     ctxpct: int | None = None
+    # The model that actually answered the last turn, read off the transcript itself — not
+    # the spec's model, which is what was PASSED at spawn and never updates after a runtime
+    # /model switch. "" when the transcript has no usage-bearing assistant record yet.
+    model: str = ""
 
 
 def session_log(agent: str, p: Paths | None = None) -> Path | None:
@@ -83,7 +87,14 @@ _ASSISTANT = b'"assistant"'
 
 
 def _scan_log(f: Path) -> tuple[int | None, int]:
-    """(ctx, endturns) from one streaming pass over the transcript.
+    """(ctx, endturns) — the 2-tuple contract every existing caller/test relies on. A thin
+    view over _scan_log_full(); see there for the real work and for `model`."""
+    ctx, endturns, _model = _scan_log_full(f)
+    return ctx, endturns
+
+
+def _scan_log_full(f: Path) -> tuple[int | None, int, str]:
+    """(ctx, endturns, model) from one streaming pass over the transcript.
 
     ctx  = input + cache_read + cache_creation of the LAST assistant record that carries
            usage — i.e. the whole prompt the model last saw. Output tokens are not part of
@@ -105,6 +116,7 @@ def _scan_log(f: Path) -> tuple[int | None, int]:
     try/except, which is what bash reached for `grep` to avoid.
     """
     ctx: int | None = None
+    model = ""
     endturns = 0
     last_usage: bytes | None = None
     try:
@@ -129,21 +141,25 @@ def _scan_log(f: Path) -> tuple[int | None, int]:
                 if isinstance(msg, dict) and msg.get("stop_reason") == "end_turn":
                     endturns += 1
     except OSError:
-        return None, 0
+        return None, 0, ""
 
     if last_usage is not None:
         try:
             rec = json.loads(last_usage)
-            usage = ((rec.get("message") or {}).get("usage")) or {}
+            msg = (rec.get("message") or {})
+            usage = msg.get("usage") or {}
             if isinstance(usage, dict) and usage:
                 ctx = (
                     int(usage.get("input_tokens") or 0)
                     + int(usage.get("cache_read_input_tokens") or 0)
                     + int(usage.get("cache_creation_input_tokens") or 0)
                 )
+            # Same record: the model that actually produced it, whatever a runtime /model
+            # switch changed it to since spawn — this is the last one that answered.
+            model = str(msg.get("model") or "")
         except Exception:
             ctx = None
-    return ctx, endturns
+    return ctx, endturns, model
 
 
 def _phase(pane: str) -> Phase:
@@ -173,12 +189,13 @@ def probe(agent: str, p: Paths | None = None) -> Probe:
     # endturns is a COUNT: its zero is 0, not None. Every caller compares it with an
     # integer (`> base` to decide a turn landed), and a fresh agent whose log does not
     # exist yet is the common case, not the exotic one.
-    ctx, endturns = _scan_log(log) if log else (None, 0)
+    ctx, endturns, model = _scan_log_full(log) if log else (None, 0, "")
 
     if pane is None:
         # A down agent still has a transcript, and its size is exactly what `ledger` and
         # `revive` want to know before bringing it back.
-        return Probe(alive=False, phase="idle", ctx=ctx, endturns=endturns, inputbox=None)
+        return Probe(alive=False, phase="idle", ctx=ctx, endturns=endturns, inputbox=None,
+                      model=model)
 
     phase = _phase(pane)
     ctxpct = patterns.context_pct(pane)
@@ -189,7 +206,7 @@ def probe(agent: str, p: Paths | None = None) -> Probe:
     box = patterns.input_box(pane) if phase in ("idle", "generating") else None
 
     return Probe(alive=True, phase=phase, ctx=ctx, endturns=endturns, inputbox=box,
-                 ctxpct=ctxpct)
+                 ctxpct=ctxpct, model=model)
 
 
 def probe_target(target: str, sid: str | None = None) -> Probe:
@@ -201,22 +218,23 @@ def probe_target(target: str, sid: str | None = None) -> Probe:
     """
     pane = tmux.capture_pane(target)
     # For standalone targets, we can optionally read the log if we have a sid
-    ctx, endturns = None, 0
+    ctx, endturns, model = None, 0, ""
     if sid:
         from .paths import PROJECTS
         # Find the log file for this sid
         for root, _dirs, files in os.walk(PROJECTS):
             if f'{sid}.jsonl' in files:
                 log_path = Path(root) / f'{sid}.jsonl'
-                ctx, endturns = _scan_log(log_path)
+                ctx, endturns, model = _scan_log_full(log_path)
                 break
 
     if pane is None:
-        return Probe(alive=False, phase='idle', ctx=ctx, endturns=endturns, inputbox=None)
+        return Probe(alive=False, phase='idle', ctx=ctx, endturns=endturns, inputbox=None,
+                      model=model)
 
     phase = _phase(pane)
     ctxpct = patterns.context_pct(pane)
     box = patterns.input_box(pane) if phase in ('idle', 'generating') else None
 
     return Probe(alive=True, phase=phase, ctx=ctx, endturns=endturns, inputbox=box,
-                 ctxpct=ctxpct)
+                 ctxpct=ctxpct, model=model)
