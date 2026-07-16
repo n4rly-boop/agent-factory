@@ -31,7 +31,7 @@ import os
 import shlex
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import hooks, lifecycle, mailbox, roster, tmux
@@ -246,28 +246,39 @@ def settings_json(slug: str, name: str) -> str:
     hook fires with the LIVE id on every start/resume and rewrites the sid file, so the warden
     stops reading a dead context number. af/live.py does the same repair from the outside for
     agents whose settings predate this hook.
+
+    EVERY hook command carries `<slug> <name>`. That argument pair is this file's whole
+    reason for being per-agent: it is the ONLY channel that survives a fork. Claude Code
+    forks a session onto a process claimed from a machine-global spare pool, and that pool
+    carries the env of whichever session started the daemon — possibly another squad's, or a
+    dead one's. Hooks that read identity from $AF_* alone therefore judge the agent as
+    whoever the pool used to be (observed: `inna`'s orc forking onto an `aae1` spare and
+    every later hook seeing AF_SLUG=aae1). The settings file is written per agent at spawn
+    and passed through verbatim, so args cannot be swapped underneath it; the hook resolves
+    the rest from the spec those args name. See af.hooks._bind_identity.
     """
+    ident = f"{shlex.quote(slug)} {shlex.quote(name)}"
     return f"""{{
-  "statusLine": {{ "type": "command", "command": "{STATUSLINE_SH}", "padding": 0 }},
+  "statusLine": {{ "type": "command", "command": "{STATUSLINE_SH} {ident}", "padding": 0 }},
   "hooks": {{
     "SessionStart": [
-      {{ "hooks": [ {{ "type": "command", "command": "{SESSION_START}", "timeout": 5 }} ] }}
+      {{ "hooks": [ {{ "type": "command", "command": "{SESSION_START} {ident}", "timeout": 5 }} ] }}
     ],
     "UserPromptSubmit": [
-      {{ "hooks": [ {{ "type": "command", "command": "{ROLE_REMINDER}", "timeout": 5 }} ] }}
+      {{ "hooks": [ {{ "type": "command", "command": "{ROLE_REMINDER} {ident}", "timeout": 5 }} ] }}
     ],
     "PreToolUse": [
       {{ "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
         "hooks": [
-          {{ "type": "command", "command": "{DELEGATE_WALL}", "timeout": 5 }},
-          {{ "type": "command", "command": "{SPAWN_GATE}", "timeout": 5 }}
+          {{ "type": "command", "command": "{DELEGATE_WALL} {ident}", "timeout": 5 }},
+          {{ "type": "command", "command": "{SPAWN_GATE} {ident}", "timeout": 5 }}
         ] }},
       {{ "matcher": "Read",
-        "hooks": [ {{ "type": "command", "command": "{READ_WALL}", "timeout": 5 }} ] }}
+        "hooks": [ {{ "type": "command", "command": "{READ_WALL} {ident}", "timeout": 5 }} ] }}
     ],
     "StopFailure": [
       {{ "matcher": "rate_limit",
-        "hooks": [ {{ "type": "command", "command": "{LIMIT_HOOK}", "timeout": 5 }} ] }}
+        "hooks": [ {{ "type": "command", "command": "{LIMIT_HOOK} {ident}", "timeout": 5 }} ] }}
     ]
   }}
 }}
@@ -411,6 +422,55 @@ def _p(slug: str) -> Paths:
     return paths(slug)
 
 
+def _slug_taken_by_other(slug: str, bp_resolved: str) -> bool:
+    """True if `slug` already belongs to a DIFFERENT squad — one whose recorded blueprint is
+    not this one. That is the case a fresh `up` must not sit on top of: same slug = same
+    mailboxes, same specdir, same state dir, so a new team under a reused slug inherits the
+    old team's unread mail, stale specs and reports. (Exactly what put another squad's 84
+    old letters under a brand-new orc.)
+
+    A slug with NO squad.json is free — return False. A squad.json whose blueprint MATCHES
+    ours is our own team coming back (a re-run, a --resume, a partial heal) — also False, so
+    those keep working unchanged. Anything else — a different blueprint, or an old squad.json
+    from before the blueprint field existed — is another squad, so bump."""
+    try:
+        recorded = roster.load(_p(slug)).blueprint
+    except Exception:
+        return False
+    if not recorded:
+        # No squad.json / nothing recorded → the specdir is empty of a prior team. Free.
+        return _p(slug).squad_file.is_file()
+    return recorded != bp_resolved
+
+
+def _resolve_slug(base: str, bp_resolved: str) -> str:
+    """`base`, or `base1`/`base2`/… — the first that is free or already ours. Bounded so a
+    pathological run cannot spin forever; 999 reused slugs for one base is not a real team.
+
+    The SAME function serves `up` and every other command. For `up` it means "where should
+    this team live" (the base if free, its own bumped slug if it already has one, a new bump
+    if the base belongs to someone else). For `down`/`status`/`heal`/`add` it means "where
+    DOES this team live" — and the answer is identical, because a team that was bumped to
+    `base1` on `up` recorded our blueprint there, so `base` reads as another's and `base1`
+    reads as ours: the walk lands on `base1` again. A team that never came up returns the
+    base, and operating on an empty slug is a harmless no-op."""
+    if not _slug_taken_by_other(base, bp_resolved):
+        return base
+    for i in range(1, 1000):
+        cand = f"{base}{i}"
+        if not _slug_taken_by_other(cand, bp_resolved):
+            return cand
+    raise SquadSpecError(f"every slug from {base!r} to {base}999 is taken by another squad")
+
+
+def _effective_paths(bp: str, stations: list[Station]) -> Paths:
+    """The Paths the LIVE team uses — base slug resolved to its bumped variant if `up` moved
+    it. Every command past `up` goes through here so they all address the same squad."""
+    if not stations:
+        return paths()
+    return _p(_resolve_slug(stations[0].slug, str(Path(bp).resolve())))
+
+
 def cmd_plan(bp: str) -> int:
     stations = plan(bp)
     print(f"{'NAME':<10} {'ROLE':<14} {'MODEL':<8} {'PARENT':<8} {'DELEGATE':<9} PEERS")
@@ -521,7 +581,12 @@ def cmd_up(bp: str, resume: bool = False) -> int:
         return 1
 
     bulk = bulk_lines(bp)
-    slug = stations[0].slug
+    bp_resolved = str(Path(bp).resolve())
+    slug = _resolve_slug(stations[0].slug, bp_resolved)
+    if slug != stations[0].slug:
+        print(f"[squad] slug '{stations[0].slug}' is another squad's — using '{slug}' so this "
+              f"team gets its own mailboxes, specs and state.")
+        stations = [replace(st, slug=slug) for st in stations]
     p = _p(slug)
     n = skipped = 0
 
@@ -583,7 +648,10 @@ def cmd_add(bp: str, name: str, resume: bool = False) -> int:
               f"first, then run `squad add` again.", file=sys.stderr)
         return 1
 
-    p = _p(st.slug)
+    # Address the LIVE team, which may sit under a bumped slug (see _resolve_slug). Re-stamp
+    # the station so its own settings/env carry that slug, not the blueprint's base.
+    p = _effective_paths(bp, stations)
+    st = replace(st, slug=p.slug)
     bulk = bulk_lines(bp)
     outcome = _spawn_station(st, p, bp, bulk, resume)
     if outcome == "failed":
@@ -660,7 +728,7 @@ def cmd_remove(bp: str, name: str) -> int:
 
 def cmd_status(bp: str) -> int:
     stations = plan(bp)
-    p = _p(stations[0].slug) if stations else paths()
+    p = _effective_paths(bp, stations)
     for st in stations:
         pr = do_probe(st.name, p)
         alive = "up" if pr.alive else "down"
@@ -671,11 +739,30 @@ def cmd_status(bp: str) -> int:
 
 def cmd_down(bp: str) -> int:
     stations = plan(bp)
-    p = _p(stations[0].slug) if stations else paths()
+    p = _effective_paths(bp, stations)
     for st in stations:
         with contextlib.redirect_stdout(io.StringIO()):
             lifecycle.down(st.name, p)
         print(f"[squad] {st.name} down")
+
+    # The daemons come up WITH the squad (see cmd_up) so they must go down with it. They did
+    # not: `up` started them, `down` stopped nothing, and each pair outlived the team it was
+    # hired to watch — looping, re-reconciling a roster of dead stations and ring-catching
+    # mailboxes with no panes behind them, until something killed them by hand. Found three
+    # wardens stacked up this way on one machine, one per slug ever brought up, none ever
+    # stopped. Both stops are idempotent and say nothing when there is no daemon to stop.
+    from . import postmaster, warden
+    for mod in (warden, postmaster):
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                mod.stop(p=p)
+        except Exception as e:      # a daemon that will not die must not fail the teardown
+            print(f"[squad] could not stop {mod.__name__.rsplit('.', 1)[-1]}: {e}",
+                  file=sys.stderr)
+            continue
+        for ln in out.getvalue().splitlines():
+            print(f"[squad] {ln}")
     return 0
 
 
@@ -685,7 +772,7 @@ def cmd_heal(bp: str, dry_run: bool = False, restart_idle: bool = False) -> int:
     if not stations:
         print("[heal] blueprint has no agents.")
         return 0
-    p = _p(stations[0].slug)
+    p = _effective_paths(bp, stations)
     return healmod.heal(stations, p, healmod.Options(dry_run=dry_run, restart_idle=restart_idle))
 
 

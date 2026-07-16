@@ -227,13 +227,20 @@ def _sid(agent: str, p: Paths) -> str:
 
 
 # --- waking -------------------------------------------------------------------------
-def wake(agent: str, why: str, p: Paths) -> None:
+def wake(agent: str, why: str, p: Paths, dedup_key: str = "") -> None:
     """By MAIL, never by typing the message itself: the doorbell is one fixed token-free
     line, and the letter lands in the mailbox whatever state the pane is in.
 
-    From `orchestrator`, so the agent's reply lands where the human reads it."""
+    From `orchestrator`, so the agent's reply lands where the human reads it.
+
+    `dedup_key` identifies the LIMIT EPISODE, not the call. The caller drops the agent's
+    marker only after this returns, so a warden killed in between (a reboot, a TERM, a crash)
+    re-enters the same episode on its next tick, sees the same recovery, and mails a second
+    identical WAKE — "carry on where you were cut off", twice, into an agent that already did.
+    A key keyed on the episode makes the retry a no-op instead."""
     try:
-        mailbox.send(agent, WAKE.format(why=why), kind="task", frm="orchestrator", p=p)
+        mailbox.send(agent, WAKE.format(why=why), kind="task", frm="orchestrator", p=p,
+                     dedup_key=dedup_key or None)
     except (OSError, ValueError) as e:
         log(f"{agent}: could not mail the wake-up ({e})", p)
         return
@@ -399,7 +406,9 @@ def loop(p: Paths) -> int:
             # resume. Deliver on recovery, and the very next turn carries the instruction.
             if a in baseline and pr.endturns > baseline[a]:
                 why = f"at {datetime.fromtimestamp(when).strftime('%H:%M')}" if when else "earlier"
-                wake(a, why, p)
+                # The episode, not the attempt: (agent, when it was cut off, which session).
+                # Stable across a warden restart mid-rescue; different for the next real limit.
+                wake(a, why, p, dedup_key=f"wake:{a}:{when}:{msid}")
                 p.limited(a).unlink(missing_ok=True)
                 _forget(a)
                 log(f"{a}: recovered — a turn landed; woken to pick the work back up", p)

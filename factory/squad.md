@@ -68,6 +68,17 @@ compact pair also per-agent). A top-level `bulk_lines:` is silently ignored.
 blueprint edits.** Editing a brief and re-running `squad up` changes nothing for a
 live agent; `squad down` it (or the whole team) first, then `up`.
 
+**The slug is the whole namespace — mailboxes, specs, state all live under it — so two
+different squads must never share one.** If the blueprint's `slug` already belongs to
+ANOTHER squad (a `squad.json` there records a different blueprint path), `squad up`
+bumps to `slug1`, `slug2`, … and says so, giving the new team its own everything
+instead of inheriting the old team's unread mail and stale specs. Your own squad coming
+back (a re-run, `--resume`, `heal`) keeps its slug — `down`/`status`/`heal`/`add` all
+resolve to the bumped slug automatically, so you keep passing the same blueprint.
+
+**`squad down` stops the team's daemons too** (the warden and postmaster that `squad
+up` started), not only its stations — they do not outlive the team.
+
 Roles are arbitrary — `role:` is a free-text string, `orc`/`eval`/`abl` above are
 just an example. Two keys are load-bearing: the station whose `role:` is
 `orchestrator` is the default `parent` for everyone else, and `count: N` expands a

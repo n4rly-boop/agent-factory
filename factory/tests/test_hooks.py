@@ -95,6 +95,65 @@ class HookRun(TempFactory):
 
 
 # ======================================================================================
+# identity from spec, not from the (fork-contaminated) environment
+# ======================================================================================
+class IdentityFromSpec(TempFactory):
+    """A hook must judge the agent by its own spec, reached via the `<slug> <agent>` args in
+    its settings file — NOT by the inherited env, which after a fork onto a pooled process
+    can belong to a different squad entirely. This is the fix for the live incident where
+    `inna`'s orc forked onto an `aae1` spare and every hook read AF_SLUG=aae1,
+    AF_PEERS=eval,annotator."""
+
+    def _spec(self, slug, name, env):
+        from af import spec as specmod
+        from af.paths import paths as _paths
+        p = _paths(slug)
+        specmod.write(specmod.Spec(slug=slug, name=name, cwd="/x", sid="s", spawned=1,
+                                   flags="--model opus", env=env), p)
+
+    def _run(self, hook, argv_ident, contaminated_env, payload=None):
+        raw = json.dumps(payload or {})
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, contaminated_env), \
+                mock.patch.object(sys, "stdin", io.StringIO(raw)), \
+                mock.patch.object(sys, "stdout", out), \
+                mock.patch.object(sys, "stderr", err), \
+                mock.patch("af.tmux.capture_pane", return_value=None):
+            rc = hooks.main([hook, *argv_ident])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_role_reminder_takes_peers_from_the_spec_not_the_env(self):
+        self._spec("inna", "orc", {"AF_ROLE": "orchestrator", "AF_PEERS": "lead,qa,ops"})
+        contaminated = {"AF_SLUG": "aae1", "AF_AGENT": "orc", "AF_ROLE": "orchestrator",
+                        "AF_PEERS": "eval,annotator", "AF_WORK": "/aae1/work"}
+        rc, out, err = self._run("role-reminder", ["inna", "orc"], contaminated)
+        self.assertEqual(rc, 0)
+        self.assertIn("lead,qa,ops", out)
+        self.assertNotIn("eval,annotator", out)
+
+    def test_delegate_wall_measures_against_the_spec_work_dir_not_the_env(self):
+        # Contaminated env points AF_WORK at another squad's dir; the spec says /inna/work.
+        # A write into /inna/work must be allowed (the agent's own zone), proving the wall
+        # read the spec, not the env.
+        self._spec("inna", "coder", {"AF_ROLE": "coder", "AF_DELEGATE": "required",
+                                     "AF_WORK": "/inna/work"})
+        contaminated = {"AF_SLUG": "aae1", "AF_AGENT": "coder", "AF_DELEGATE": "required",
+                        "AF_WORK": "/aae1/work"}
+        ev = write_ev("/inna/work/out.txt", BULK_BODY)
+        rc, out, err = self._run("delegate-wall", ["inna", "coder"], contaminated, ev)
+        self.assertEqual(rc, 0, "a write into the spec's own work dir must be allowed")
+        self.assertNotIn("BLOCKED", err)
+
+    def test_a_missing_spec_falls_back_to_the_env(self):
+        # No spec written. The args name an agent whose spec cannot be read, so identity
+        # falls back to the environment — the old behaviour, deliberately preserved.
+        contaminated = {"AF_ROLE": "worker", "AF_PEERS": "a,b,c", "AF_AGENT": "ghost"}
+        rc, out, err = self._run("role-reminder", ["inna", "ghost"], contaminated)
+        self.assertEqual(rc, 0)
+        self.assertIn("a,b,c", out)
+
+
+# ======================================================================================
 # delegate-wall: the advisory level
 # ======================================================================================
 class Advised(HookRun):

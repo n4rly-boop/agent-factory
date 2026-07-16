@@ -28,12 +28,15 @@ What was actually missing, per the redesign doc:
      reads, so a read and a fresh arrival landing in the same tick window could otherwise
      mask each other and strand a message permanently (see `_ring_catch`).
 
-  3. DEDUP. `mailbox.send(..., dedup_key=...)` (new, see af.mailbox) lets a caller that
-     might retry send idempotently — a stable key makes a second send with the same key
-     return the already-sent message instead of appending a duplicate. Not yet wired into
-     any caller (this daemon's own ring-catch only retypes the doorbell; it never
-     re-sends mail), but it is the primitive a future retry-prone sender — the warden's
-     wake, a polling tick — reaches for instead of inventing its own guard.
+  3. DEDUP. `mailbox.send(..., dedup_key=...)` (see af.mailbox) lets a caller that might
+     retry send idempotently — a stable key makes a second send with the same key return
+     the already-sent message instead of appending a duplicate. Wired into the two senders
+     that can genuinely repeat themselves, each keyed on the EVENT rather than the attempt:
+     the warden's limit-rescue wake (`wake:<agent>:<when>:<sid>` — the limit episode) and a
+     polling tick (`poll:<agent>:<sid>:<n>` — the tick number). This daemon needs none: its
+     ring-catch only retypes the doorbell, it never re-sends mail. Callers that cannot
+     retry — a human's `af post`, an agent composing a fresh message — pass nothing and pay
+     neither the lock nor the scan.
 
 One process per slug, like the warden — but this is the HOT path (short tick, cheap
 per-tick work: one `ps -A` call via roster.reconcile, one unread count per mailbox) where
