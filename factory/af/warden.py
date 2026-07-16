@@ -1,13 +1,14 @@
 """warden — the thing that watches a line WHEN NOBODY IS DRIVING IT.
 
     python3 -m af.warden watch     start it for this line (detached; safe to re-run)
+    python3 -m af.warden watch --target <session>  guard a single tmux session (standalone)
     python3 -m af.warden stop
     python3 -m af.warden status     quota, reset time, who got cut off, when it last swept
 
 Two jobs, and they are the same job: keep the line alive through the hours when no human and
 no orchestrator is issuing commands.
 
-  1. CONTEXT. `sweep` compacts idle agents past their threshold — but it only ever ran from
+  1. CONTEXT. `sweep` compacts agents past their threshold — but it only ever ran from
      `post` / `mail` / `sweep`, i.e. only when the DRIVING session spoke. An autonomous line
      does not go through those: its agents mail each other, and mail never swept. So a line
      left to work overnight was never compacted AT ALL. Observed, and it is why this file
@@ -53,7 +54,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import drive, live, mailbox, patterns, probe as probemod, sweep as sweepmod, tmux
-from .paths import FACTORY_DIR, Paths, paths
+from .paths import FACTORY_DIR, Paths, paths, SPEC_HOME
 from .nums import intish
 
 
@@ -94,24 +95,59 @@ STAGGER = 10   # seconds between wakes: four agents starting at the same instant
 
 
 # --- state ------------------------------------------------------------------------
+# pidfile/logfile under durable_state (not /tmp) so a /tmp purge cannot drop the pidfile
+# mid-run and spawn a second warden with no coordination — the same bug postmaster.py's
+# own module docstring documents.
+def _standalone_dir(target: str) -> Path:
+    """Durable state dir for a standalone warden watching one target."""
+    return SPEC_HOME / "state" / "_standalone" / target
+
+
 def pidfile(p: Paths) -> Path:
-    return p.state / "warden.pid"
+    return p.durable_state / "warden.pid"
 
 
 def logfile(p: Paths) -> Path:
-    return p.state / "warden.log"
+    return p.durable_state / "warden.log"
+
+
+def _standalone_pidfile(target: str) -> Path:
+    d = _standalone_dir(target)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "warden.pid"
+
+
+def _standalone_logfile(target: str) -> Path:
+    d = _standalone_dir(target)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "warden.log"
 
 
 def log(msg: str, p: Paths) -> None:
-    p.state.mkdir(parents=True, exist_ok=True)
+    p.durable_state.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%m-%d %H:%M:%S")
     with logfile(p).open("a", encoding="utf-8") as f:
+        f.write(f"[warden {stamp}] {msg}\n")
+
+
+def _standalone_log(msg: str, target: str) -> None:
+    d = _standalone_dir(target)
+    d.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%m-%d %H:%M:%S")
+    with _standalone_logfile(target).open("a", encoding="utf-8") as f:
         f.write(f"[warden {stamp}] {msg}\n")
 
 
 def _pid(p: Paths) -> int:
     try:
         return int(pidfile(p).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _standalone_pid(target: str) -> int:
+    try:
+        return int(_standalone_pidfile(target).read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return 0
 
@@ -160,6 +196,12 @@ def pane_limited(agent: str, p: Paths) -> bool:
     return bool(pane and patterns.USAGE_LIMIT.search(pane))
 
 
+def pane_limited_target(target: str) -> bool:
+    """Check if a standalone target's pane shows the usage limit."""
+    pane = tmux.capture_pane(target)
+    return bool(pane and patterns.USAGE_LIMIT.search(pane))
+
+
 def line_agents(p: Paths) -> list[str]:
     """Every agent of THIS line that has a session."""
     pfx = f"ai-{p.slug}-"
@@ -198,6 +240,11 @@ def wake(agent: str, why: str, p: Paths) -> None:
     drive.ring(agent, p)
 
 
+def _poke_target(target: str) -> None:
+    """Poke a standalone target by typing the doorbell into its pane."""
+    drive.ring_target(target, DOORBELL)
+
+
 # --- the loop -----------------------------------------------------------------------
 def _heal_sids(p: Paths) -> str:
     """Before every sweep, point each agent's sid file at the session it is ACTUALLY running.
@@ -232,6 +279,27 @@ def _sweep_quietly(p: Paths) -> str:
     return " ".join(keep)
 
 
+def _find_orchestrator(p: Paths) -> str | None:
+    """Find the orchestrator station name for this slug.
+
+    Primary: read from squad.json's Station.role field.
+    Fallback: if squad has no record, check for a station literally named "orc" or
+    "orchestrator" (defensive fallback only).
+    Returns None if no orchestrator can be identified."""
+    try:
+        from . import squad
+        for st in squad.stations(p):
+            if st.role == "orchestrator":
+                return st.name
+    except Exception:
+        pass
+    # Defensive fallback: check for literally-named orchestrator
+    for a in line_agents(p):
+        if a in ("orc", "orchestrator"):
+            return a
+    return None
+
+
 def loop(p: Paths) -> int:
     """It must be boring: it runs for hours, unattended, through the exact event that kills
     everything else on the machine."""
@@ -264,8 +332,8 @@ def loop(p: Paths) -> int:
 
         # THE CONTEXT GUARD, on a clock. `sweep` itself is the careful one: it skips agents
         # that are generating, agents on a permission prompt, agents out of quota and agents
-        # below their threshold; it compacts a BUSY agent only past the HARD line, where
-        # running out of context would lose everything anyway.
+        # below their threshold; it compacts any sweepable agent past its threshold,
+        # busy or idle — no distinction is made.
         if not sweep_off() and time.time() - last_sweep >= every:
             last_sweep = time.time()
             healed = _heal_sids(p)          # correct the sid files BEFORE sweep reads them
@@ -295,6 +363,9 @@ def loop(p: Paths) -> int:
             continue
 
         now = int(time.time())
+        # Find the orchestrator — only it gets actively poked
+        orchestrator = _find_orchestrator(p)
+
         # RESCUE by ground truth, not by a scraped clock (see the module docstring). No
         # resets_at gate: poke on a capped interval and watch the transcript for a turn to land.
         for a in marked:
@@ -335,27 +406,169 @@ def loop(p: Paths) -> int:
                 continue
             if now < attempt_after.get(a, 0.0):
                 continue                       # inside the poke interval: wait and keep watching
-            # POKE: trigger a turn to test whether the window reopened — ring only, no WAKE yet
-            # (see above). The doorbell's `!mail read` consumes only mail already in the box,
-            # which a peer's own ring would have consumed anyway, so it adds no new loss.
-            drive.ring(a, p)
-            baseline[a] = pr.endturns
-            attempt_after[a] = now + poke
-            log(f"{a}: poked — watching for a turn to land", p)
-            time.sleep(STAGGER)
+
+            # POKE-ONLY-ORCHESTRATOR: only the orchestrator gets actively poked (typed into).
+            # Non-orchestrator agents still get their baseline tracked via probe() (cheap,
+            # read-only, no keystrokes) so their marker can be cleared the moment a turn
+            # naturally lands for them (e.g. once the revived orchestrator re-tasks them by mail).
+            if a == orchestrator:
+                # POKE: trigger a turn to test whether the window reopened — ring only, no WAKE yet
+                # (see above). The doorbell's `!mail read` consumes only mail already in the box,
+                # which a peer's own ring would have consumed anyway, so it adds no new loss.
+                drive.ring(a, p)
+                baseline[a] = pr.endturns
+                attempt_after[a] = now + poke
+                log(f"{a}: poked — watching for a turn to land", p)
+                time.sleep(STAGGER)
+            else:
+                # Non-orchestrator: just record baseline, never poke.
+                # The orchestrator will re-drive them by mail once it recovers.
+                baseline[a] = pr.endturns
+                attempt_after[a] = now + poke
+                log(f"{a}: baseline recorded (not orchestrator — waiting for orchestrator to re-drive)", p)
     log("stopped (signal)", p)
     return 0
 
 
+def _standalone_loop(target: str) -> int:
+    """Loop for standalone mode: guard a single tmux session by session id."""
+    tick, every, poke = tick_secs(), sweep_every(), poke_every()
+    _standalone_log(f"standalone warden up for '{target}' (tick {tick}s, sweep every {every}s, poke every {poke}s)", target)
+    last_sweep = 0.0
+    stop = {"now": False}
+
+    # Resolve the session id once at startup
+    sid = live.sid_in_pane(target)
+    if sid is None:
+        _standalone_log(f"no --session-id/--resume found in pane '{target}' — cannot track", target)
+        return 1
+
+    attempt_after: dict[str, float] = {}
+    baseline: dict[str, int] = {}
+
+    def _forget() -> None:
+        attempt_after.clear()
+        baseline.clear()
+
+    def _term(_signum, _frame):
+        stop["now"] = True
+
+    for s in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(s, _term)
+
+    while not stop["now"]:
+        time.sleep(tick)
+        if not _standalone_pidfile(target).is_file():
+            _standalone_log("stopped (pidfile removed)", target)
+            return 0
+
+        # Check session still exists
+        if not tmux.has_session(target):
+            _standalone_log(f"session '{target}' gone — stopping", target)
+            return 0
+
+        # Re-resolve sid (in case of fork)
+        current_sid = live.sid_in_pane(target)
+        if current_sid is None:
+            _standalone_log(f"lost session id for '{target}' — stopping", target)
+            return 0
+
+        # Context guard: compact if needed
+        if not sweep_off() and time.time() - last_sweep >= every:
+            last_sweep = time.time()
+            # For standalone, we use drive.maybe_autocompact directly against the target
+            # rather than going through sweep.sweep() which is squad/mailbox-shaped
+            try:
+                pr = probemod.probe_target(target, current_sid)
+                if pr.alive and pr.phase not in ("generating", "permission", "limited"):
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        drive.maybe_autocompact_target(target, current_sid, nowait=True)
+                    out = " ".join(l for l in buf.getvalue().splitlines() if "compact" in l or "⚠" in l)
+                    if out:
+                        _standalone_log(f"sweep: {out}", target)
+            except Exception as e:
+                _standalone_log(f"sweep failed: {e}", target)
+
+        # Check for limit marker (standalone uses a file under the standalone dir)
+        limited_file = _standalone_dir(target) / "limited"
+        marked = False
+
+        if limited_file.is_file():
+            marked = True
+        elif pane_limited_target(target):
+            limited_file.write_text(f"{int(time.time())}\t{current_sid}\tpane\n", encoding="utf-8")
+            _standalone_log(f"limit detected on the PANE (the StopFailure hook did not fire — check it)", target)
+            marked = True
+
+        if not marked:
+            continue
+
+        now = int(time.time())
+
+        # Read marker
+        try:
+            cols = limited_file.read_text(encoding="utf-8").split("\t")
+            when = intish(cols[0], 0) if cols else 0
+            msid = cols[1].strip() if len(cols) > 1 else ""
+        except OSError:
+            when, msid = 0, ""
+
+        # Check if session changed since cutoff
+        if msid and current_sid and msid != current_sid:
+            _standalone_log(f"session changed since cutoff — a different agent holds the name; dropping the marker", target)
+            limited_file.unlink(missing_ok=True)
+            _forget()
+            continue
+
+        pr = probemod.probe_target(target)
+
+        # RECOVERED: a turn landed since our last poke
+        if "target" in baseline and pr.endturns > baseline["target"]:
+            why = f"at {datetime.fromtimestamp(when).strftime('%H:%M')}" if when else "earlier"
+            # For standalone, we type the WAKE message directly into the pane
+            _standalone_wake(target, why)
+            limited_file.unlink(missing_ok=True)
+            _forget()
+            _standalone_log(f"recovered — a turn landed; woken to pick the work back up", target)
+            continue
+
+        if now < attempt_after.get("target", 0.0):
+            continue
+
+        # POKE: trigger a turn to test whether the window reopened
+        _poke_target(target)
+        baseline["target"] = pr.endturns
+        attempt_after["target"] = now + poke
+        _standalone_log(f"poked — watching for a turn to land", target)
+
+    _standalone_log("stopped (signal)", target)
+    return 0
+
+
+def _standalone_wake(target: str, why: str) -> None:
+    """Type the WAKE message directly into the standalone target's pane."""
+    msg = WAKE.format(why=why)
+    # Type the message into the pane
+    drive.say_target(target, msg)
+
+
 # --- commands -----------------------------------------------------------------------
-def watch(p: Paths | None = None) -> int:
+def watch(p: Paths | None = None, target: str | None = None) -> int:
+    if target is not None:
+        return _watch_standalone(target)
+    return _watch_line(p)
+
+
+def _watch_line(p: Paths | None = None) -> int:
     p = p or paths()
     pid = _pid(p)
     if _live(pid):
         print(f"[warden] already watching line '{p.slug}' (pid {pid}). Stop it first: "
               f"af warden stop")
         return 0
-    p.state.mkdir(parents=True, exist_ok=True)
+    p.durable_state.mkdir(parents=True, exist_ok=True)
 
     env = dict(os.environ)
     env.update({"AF_ROOT": str(p.root), "AF_SLUG": p.slug, "AF_CWD": str(p.cwd)})
@@ -375,7 +588,7 @@ def watch(p: Paths | None = None) -> int:
     )
     pidfile(p).write_text(str(proc.pid), encoding="utf-8")
     print(f"[warden] watching line '{p.slug}' (pid {proc.pid}).")
-    print(f"[warden]   compacts idle agents past their threshold every "
+    print(f"[warden]   compacts agents past their threshold every "
           f"{sweep_every() // 60}m — with or without you")
     print("[warden]   and wakes the line when the usage limit resets. It spends no tokens, "
           "so the limit cannot kill it.")
@@ -383,7 +596,52 @@ def watch(p: Paths | None = None) -> int:
     return 0
 
 
-def stop(p: Paths | None = None) -> int:
+def _watch_standalone(target: str) -> int:
+    """Start a standalone warden for a single tmux session."""
+    # Check tmux session exists
+    if not tmux.has_session(target):
+        print(f"[warden] no such tmux session '{target}' — the warden only guards a live "
+              f"tmux session, wrap yours in tmux first.")
+        return 1
+
+    # Check for existing standalone warden
+    pid = _standalone_pid(target)
+    if _live(pid):
+        print(f"[warden] already watching '{target}' (pid {pid}). Stop it first: "
+              f"af warden stop --target {target}")
+        return 0
+
+    # Check for session id
+    sid = live.sid_in_pane(target)
+    if sid is None:
+        print(f"[warden] no --session-id/--resume found in that pane's claude process — "
+              f"relaunch it with an explicit --session-id so the warden can track it across "
+              f"a fork, e.g.: claude --session-id $(uuidgen)")
+        return 1
+
+    # Start the standalone loop
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        x for x in (str(FACTORY_DIR), env.get("PYTHONPATH", "")) if x)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "af.warden", "_standalone_loop", target],
+        cwd=os.getcwd(), env=env, start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    _standalone_dir(target).mkdir(parents=True, exist_ok=True)
+    _standalone_pidfile(target).write_text(str(proc.pid), encoding="utf-8")
+    print(f"[warden] watching '{target}' (pid {proc.pid}, sid {sid[:8]}…).")
+    print(f"[warden]   log: {_standalone_logfile(target)}")
+    return 0
+
+
+def stop(p: Paths | None = None, target: str | None = None) -> int:
+    if target is not None:
+        return _stop_standalone(target)
+    return _stop_line(p)
+
+
+def _stop_line(p: Paths | None = None) -> int:
     p = p or paths()
     pid = _pid(p)
     if not pid:
@@ -396,7 +654,25 @@ def stop(p: Paths | None = None) -> int:
     return 0
 
 
-def status(p: Paths | None = None) -> int:
+def _stop_standalone(target: str) -> int:
+    pid = _standalone_pid(target)
+    if not pid:
+        print(f"[warden] not watching '{target}'.")
+        return 0
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGTERM)
+    _standalone_pidfile(target).unlink(missing_ok=True)
+    print(f"[warden] watcher for '{target}' stopped.")
+    return 0
+
+
+def status(p: Paths | None = None, target: str | None = None) -> int:
+    if target is not None:
+        return _status_standalone(target)
+    return _status_line(p)
+
+
+def _status_line(p: Paths | None = None) -> int:
     p = p or paths()
     pid = _pid(p)
     if _live(pid):
@@ -436,13 +712,55 @@ def status(p: Paths | None = None) -> int:
     return 0
 
 
+def _status_standalone(target: str) -> int:
+    pid = _standalone_pid(target)
+    if _live(pid):
+        print(f"[warden] watcher for '{target}': LIVE (pid {pid})")
+    else:
+        print(f"[warden] watcher for '{target}': not running — start it: af warden watch --target {target}")
+
+    sid = live.sid_in_pane(target)
+    if sid:
+        print(f"  session id   : {sid}")
+    else:
+        print("  session id   : unknown")
+
+    limited_file = _standalone_dir(target) / "limited"
+    if limited_file.is_file():
+        print("  cut off      : yes")
+    else:
+        print("  cut off      : no")
+
+    lf = _standalone_logfile(target)
+    print(f"  log          : {lf}")
+    if lf.is_file():
+        tail = [l for l in lf.read_text(encoding="utf-8", errors="replace").splitlines()
+                if "sweep:" in l]
+        print(f"  last sweep   : {tail[-1] if tail else 'nothing to compact yet'}")
+    else:
+        print("  last sweep   : never")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="af.warden", description="the line's unattended watcher")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("watch", help="start the watcher for this line (safe to re-run)")
-    sub.add_parser("stop", help="stop it")
-    sub.add_parser("status", help="quota, reset time, who got cut off, last sweep")
+
+    watch_p = sub.add_parser("watch", help="start the watcher for this line (safe to re-run)")
+    watch_p.add_argument("--target", type=str, default=None,
+                         help="standalone mode: guard a single tmux session by name")
+
+    stop_p = sub.add_parser("stop", help="stop it")
+    stop_p.add_argument("--target", type=str, default=None,
+                        help="stop the standalone watcher for this target")
+
+    status_p = sub.add_parser("status", help="quota, reset time, who got cut off, last sweep")
+    status_p.add_argument("--target", type=str, default=None,
+                          help="status for a standalone target")
+
     sub.add_parser("_loop", help=argparse.SUPPRESS)
+    sl_p = sub.add_parser("_standalone_loop", help=argparse.SUPPRESS)
+    sl_p.add_argument("target", type=str, help="tmux session target")
     return ap
 
 
@@ -450,13 +768,15 @@ def main(argv: list[str] | None = None) -> int:
     a = build_parser().parse_args(argv)
     p = paths()
     if a.cmd == "watch":
-        return watch(p)
+        return watch(p, target=getattr(a, "target", None))
     if a.cmd == "stop":
-        return stop(p)
+        return stop(p, target=getattr(a, "target", None))
     if a.cmd == "status":
-        return status(p)
+        return status(p, target=getattr(a, "target", None))
     if a.cmd == "_loop":
         return loop(p)
+    if a.cmd == "_standalone_loop":
+        return _standalone_loop(a.target)
     return 1
 
 

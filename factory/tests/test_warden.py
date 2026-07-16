@@ -75,6 +75,68 @@ class WakePath(TempFactory):
             self.assertFalse(warden.pane_limited("w", self.p))
 
 
+class PidfileLocation(TempFactory):
+    """The warden's pidfile/logfile must be under durable_state (not /tmp) so a /tmp purge
+    cannot drop the pidfile mid-run and spawn a second warden with no coordination."""
+
+    def test_pidfile_is_under_durable_state(self):
+        # durable_state is under SPEC_HOME (~/.claude/agent-factory/state/<slug>),
+        # NOT under AF_ROOT (default /tmp/agent-factory).
+        pf = warden.pidfile(self.p)
+        self.assertTrue(str(pf).startswith(str(self.p.durable_state)))
+        self.assertEqual(pf.name, "warden.pid")
+
+    def test_logfile_is_under_durable_state(self):
+        lf = warden.logfile(self.p)
+        self.assertTrue(str(lf).startswith(str(self.p.durable_state)))
+        self.assertEqual(lf.name, "warden.log")
+
+    def test_pidfile_is_not_under_state(self):
+        # The old location was p.state / "warden.pid" (under AF_ROOT, default /tmp).
+        # It must NOT be there anymore.
+        pf = warden.pidfile(self.p)
+        self.assertFalse(str(pf).startswith(str(self.p.state)))
+
+
+class PokeOnlyOrchestrator(TempFactory):
+    """The rescue loop only actively pokes the orchestrator. Non-orchestrator agents
+    get their baseline tracked via probe() (read-only) but are never ring()'d or mailed
+    a WAKE message by the warden itself."""
+
+    def test_find_orchestrator_reads_squad_role(self):
+        # When squad.json has a station with role="orchestrator", that is the answer.
+        from af import squad
+        orc_st = mock.Mock()
+        orc_st.name = "orc"
+        orc_st.role = "orchestrator"
+        w_st = mock.Mock()
+        w_st.name = "w"
+        w_st.role = "worker"
+        with mock.patch.object(squad, "stations", return_value=[orc_st, w_st]):
+            self.assertEqual(warden._find_orchestrator(self.p), "orc")
+
+    def test_find_orchestrator_fallback_to_name(self):
+        # If squad has no record, fall back to a literally-named "orc" or "orchestrator".
+        from af import squad
+        with mock.patch.object(squad, "stations", return_value=[]):
+            with mock.patch.object(tmux, "list_sessions",
+                                   return_value=["ai-aftest-orc", "ai-aftest-w"]):
+                self.assertEqual(warden._find_orchestrator(self.p), "orc")
+
+    def test_find_orchestrator_returns_none_when_no_orc(self):
+        from af import squad
+        w_st = mock.Mock()
+        w_st.name = "w"
+        w_st.role = "worker"
+        c_st = mock.Mock()
+        c_st.name = "coder"
+        c_st.role = "worker"
+        with mock.patch.object(squad, "stations", return_value=[w_st, c_st]):
+            with mock.patch.object(tmux, "list_sessions",
+                                   return_value=["ai-aftest-w", "ai-aftest-coder"]):
+                self.assertIsNone(warden._find_orchestrator(self.p))
+
+
 class PokeInterval(unittest.TestCase):
     """poke_every is the capped interval between wakes: the warden never waits for a scraped
     reset clock, it re-pokes this often and watches the transcript. Default 300s; an operator

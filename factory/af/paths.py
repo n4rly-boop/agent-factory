@@ -158,6 +158,25 @@ class Paths:
         return self.specdir / "line.json"
 
     @property
+    def squad_file(self) -> Path:
+        """The one mutable source of truth for a team — durable (under the spec home, NOT
+        /tmp, so a purge cannot erase the roster) and flock-guarded. Replaces line.json plus
+        the scattered sid-/state- files as the answer to 'who is on the team, is it alive,
+        what session is it on'. See af.squad."""
+        return self.specdir / "squad.json"
+
+    @property
+    def squad_lock(self) -> Path:
+        return self.specdir / ".squad.lock"
+
+    @property
+    def durable_state(self) -> Path:
+        """A per-slug state dir that survives a /tmp purge — for the warden pidfile and other
+        handles that must not vanish under a running daemon (the /tmp-purge -> two-wardens
+        window). Distinct from `state`, which stays in AF_ROOT for the bash-era files."""
+        return SPEC_HOME / "state" / self.slug
+
+    @property
     def manifest(self) -> Path:
         return SPEC_HOME / "manifest.tsv"
 

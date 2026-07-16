@@ -13,6 +13,8 @@ Two halves:
 
         python3 -m af.hooks role-reminder     # UserPromptSubmit
         python3 -m af.hooks delegate-wall     # PreToolUse: Write|Edit|MultiEdit|NotebookEdit|Bash
+        python3 -m af.hooks spawn-gate        # PreToolUse: Bash — only the orchestrator spawns (`af up`/`af revive`)
+        python3 -m af.hooks read-wall         # PreToolUse: Read — deny huge unbounded reads
         python3 -m af.hooks limit-hook        # StopFailure, matcher rate_limit
         python3 -m af.hooks escalation-stop   # Stop
 
@@ -30,6 +32,7 @@ Two halves:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -176,6 +179,19 @@ def role_reminder() -> int:
     if _env("AF_CAVEMAN") == "1":
         out.append(" Answer in caveman: drop articles/filler/hedging, keep every technical "
                    "fact exact.")
+
+    # C — context cost made visible EVERY turn, not stated once and forgotten (same reasoning
+    # as the rest of this hook's own docstring). Read Claude Code's OWN printed percentage off
+    # the pane — ground truth, the same source probe() already trusts — not a re-derived
+    # estimate. Silent on any failure: a nudge must never be the reason a prompt breaks.
+    try:
+        from . import tmux, patterns
+        pane = tmux.capture_pane(_state_paths().session(agent))
+        pct = patterns.context_pct(pane) if pane is not None else None
+        if pct is not None:
+            out.append(f" Context: {pct}%.")
+    except Exception:
+        pass
 
     sys.stdout.write("".join(out) + "\n")
     return 0
@@ -533,6 +549,206 @@ def delegate_wall() -> int:
 
 
 # ======================================================================================
+# spawn-gate — PreToolUse on Bash
+# ======================================================================================
+# The ONE hard topology invariant: only the orchestrator spawns full agents. A worker that
+# can `af up` its own sub-team makes the tree a convention nobody enforces — same reasoning
+# as delegate-wall (a rule stated in a prompt decays; a rule checked at the tool boundary
+# does not), so this is built exactly the same way: PreToolUse on Bash, inspect the command
+# about to run, judge, say nothing when there is nothing to say.
+#
+# A router, not a sandbox — same disclaimer as delegate_wall's own docstring. It catches the
+# direct, ordinary ways an agent invokes its own CLI (`af up`, `af revive`, `python3 -m af
+# up`, `(af up)`, `FOO=bar af up`); it does not chase an agent that shells out through
+# `eval`, `sh -c '...'`, or a base64-encoded command to hide the invocation — those are
+# genuinely a wrapper script hiding the call, out of scope for a routing enforcer the same
+# way `bash_write_targets` doesn't chase them for writes either.
+#
+# "(" / ")" are split points too: `(af up)`/`$(af up)` must not dodge the gate just because
+# a subshell wraps it — a subshell is not obfuscation, it's how a human writes an ordinary
+# command every day.
+_SHELL_SEPS = (";", "&&", "||", "|", "&", "(", ")")
+
+# `FOO=bar af up` / `AF_SLUG=child af up` — a leading VAR=value is an ordinary env override
+# on a command, not an attempt to hide it; it must not let the real command dodge the gate.
+_ASSIGNMENT = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Both are the same capability: `af revive` calls straight into `lifecycle.up()`, same as
+# `af up` does — a station that can't run `af up` must not be able to route around the gate
+# through `af revive` instead.
+_SPAWN_SUBCOMMANDS = ("up", "revive")
+
+
+def _spawns_full_agent(cmd: str) -> bool:
+    """Does this command spawn a full agent (`af up` / `af revive`, directly, via `python -m
+    af`, or via a path to the same shim) AS A COMMAND, not merely CONTAIN those words?
+    `echo af up` must not match — same false-positive shape the module's own
+    `bash_write_targets` docstring warns about for scanning tokens without regard to
+    position. So it only counts as the START of a subcommand, split on the shell's own
+    separators, same tokenizer (shlex + punctuation_chars) `bash_write_targets` already uses
+    for the same reason."""
+    import shlex
+
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return False  # unbalanced quotes — cannot reason, say nothing
+
+    segs: list[list[str]] = [[]]
+    for t in toks:
+        if t in _SHELL_SEPS:
+            segs.append([])
+        else:
+            segs[-1].append(t)
+
+    for seg in segs:
+        while seg and _ASSIGNMENT.match(seg[0]):
+            seg = seg[1:]
+        if not seg:
+            continue
+        if seg[0] in ("python3", "python") and len(seg) >= 3 and seg[1] == "-m" \
+                and seg[2] in ("af", "af.__main__"):
+            if len(seg) >= 4 and seg[3] in _SPAWN_SUBCOMMANDS:
+                return True
+            continue
+        base = seg[0].rsplit("/", 1)[-1]
+        if base == "af" and len(seg) >= 2 and seg[1] in _SPAWN_SUBCOMMANDS:
+            return True
+    return False
+
+
+def spawn_gate() -> int:
+    try:
+        payload = _stdin_json()
+    except ValueError:
+        return 0  # cannot read the payload → nothing to judge, say nothing (not our wall to fail-closed)
+    tool = str(payload.get("tool_name") or "")
+    if tool != "Bash":
+        return 0
+    tin = payload.get("tool_input")
+    tin = tin if isinstance(tin, dict) else {}
+    cmd = str(tin.get("command") or "")
+    if not cmd or not _spawns_full_agent(cmd):
+        return 0
+
+    role = _env("AF_ROLE")
+    if role == "orchestrator":
+        return 0  # the root — the one station allowed to spawn full agents
+
+    # Every other station, INCLUDING one with no AF_ROLE at all (a bare, unmanaged session
+    # is not part of any squad's topology, so `af up`/`af revive` there is a human driving
+    # the CLI directly, not a sub-agent spawning a sub-team — nothing to gate).
+    if not role:
+        return 0
+
+    agent = _env("AF_AGENT", "this agent")
+    print(f"BLOCKED by the factory's spawn-gate: '{agent}' is not the orchestrator and must "
+          f"not spawn a full agent (af up / af revive).\n\n"
+          f"Below the root, use a Task subagent or delegate-to-local-model instead — mail "
+          f"the orchestrator if a new full station is genuinely needed.", file=sys.stderr)
+    return 2
+
+
+# ======================================================================================
+# read-wall — PreToolUse on Read, with a one-shot escape hatch (`af read-force <path>`)
+# ======================================================================================
+# Reading a huge file straight into the window is the single biggest context sink, and
+# nothing today stops it. This denies an UNBOUNDED Read (no `limit`) of a file over
+# AF_READ_WALL_LINES lines — a bounded read (`offset`/`limit`) is normal, targeted work and
+# always passes. Read's own schema has no field to carry "skip this deny", so the escape is
+# a preceding CLI command instead: `af read-force <path>` drops a ONE-SHOT token that this
+# hook consumes (deletes) the moment it lets a read through — it never becomes a standing
+# allowlist entry.
+#
+# Fails OPEN on any error (a stat that raises, a hook payload it cannot parse): a false
+# negative here just lets one big read through, same as today; a false positive would block
+# ordinary work on every crash. Not the same choice as delegate-wall/spawn-gate, which guard
+# invariants worth failing closed for — this is a nudge toward the cheaper path, not a wall.
+DEFAULT_READ_WALL_LINES = 500
+
+
+def _read_force_dir() -> Path:
+    return Path(_env("AF_ROOT", "/tmp/agent-factory")) / "read-force"
+
+
+def _read_force_abs(path: str) -> str:
+    """Claude Code's Read tool always supplies an ABSOLUTE `file_path`. `af read-force` runs
+    as a Bash call in the same agent's shell, so making a relative argument absolute against
+    THIS process's cwd (the same cwd the agent itself is in) is what makes the two sides key
+    to the same hash — without this, `af read-force notes.txt` silently never matches Read's
+    own absolute path and the escape hatch never fires."""
+    return _norm(path if os.path.isabs(path) else os.path.join(os.getcwd(), path))
+
+
+def _read_force_key(path: str) -> str:
+    import hashlib
+    return hashlib.sha1(_read_force_abs(path).encode("utf-8")).hexdigest()
+
+
+def read_force(path: str) -> int:
+    """`af read-force <path>` — the escape hatch: the next unbounded Read of this exact path
+    is allowed once, then the wall re-arms."""
+    if not path:
+        print("[af] usage: af read-force <path>", file=sys.stderr)
+        return 1
+    abs_path = _read_force_abs(path)
+    d = _read_force_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / _read_force_key(path)).write_text(abs_path, encoding="utf-8")
+    print(f"[af] one-shot read-force set for {abs_path} — the next unbounded Read passes, "
+          f"then it re-arms.")
+    return 0
+
+
+def read_wall() -> int:
+    try:
+        payload = _stdin_json()
+    except ValueError:
+        return 0
+    if str(payload.get("tool_name") or "") != "Read":
+        return 0
+    tin = payload.get("tool_input")
+    tin = tin if isinstance(tin, dict) else {}
+    path = str(tin.get("file_path") or "")
+    if not path or tin.get("limit"):     # bounded reads (limit set) always pass
+        return 0
+
+    tok = _read_force_dir() / _read_force_key(path)
+    try:
+        tok.unlink()          # unlink() itself is the check: POSIX guarantees only ONE
+        return 0              # concurrent caller ever succeeds — no is_file()-then-unlink
+    except FileNotFoundError: # race window, no second read ever slips through as "forced"
+        pass
+    except OSError:
+        return 0              # some other race (dir gone mid-call) — not our business either
+
+    try:
+        with open(path, "rb") as f:
+            n = sum(1 for _ in f)
+    except OSError:
+        return 0                          # can't stat it → not our business, say nothing
+
+    limit = intish((_env("AF_READ_WALL_LINES") or "").strip(), DEFAULT_READ_WALL_LINES)
+    if limit == 0 or n <= limit:
+        return 0
+
+    print(f"""BLOCKED by the factory's read-wall: {path} is {n} lines (over {limit}) and this
+would read it in whole, unbounded.
+
+Do it one of these ways instead:
+  1. bounded pages — pass offset/limit and read it in pieces.
+  2. delegate-to-local-model skill (or a Task subagent) — get back a distilled slice
+     instead of the raw file.
+  3. af read-force {path} — a ONE-SHOT override if you genuinely need the whole file this
+     time; it consumes itself on the next read and the wall re-arms.
+
+Then verify what came back. Do not retry this exact read.""", file=sys.stderr)
+    return 2
+
+
+# ======================================================================================
 # limit-hook — StopFailure, matcher rate_limit
 # ======================================================================================
 # Fires at the exact moment a turn is killed by the subscription usage limit. It is
@@ -626,6 +842,16 @@ def session_start() -> int:
             p.log_cache(who).unlink(missing_ok=True)
     except OSError:
         return 0
+    # Keep the durable roster's authoritative live_sid current from inside the session — the
+    # one moment the post-fork id is knowable here. Only for a station already on the roster
+    # (never create one: `who` defaults to "orchestrator", who is not a squad member), and
+    # never let it fail the hook.
+    try:
+        from . import squad
+        if squad.get(who, p) is not None:
+            squad.set_live_sid(who, sid, p)
+    except Exception:
+        pass
     return 0
 
 
@@ -713,6 +939,8 @@ def escalation_stop() -> int:
 HOOKS = {
     "role-reminder": role_reminder,
     "delegate-wall": delegate_wall,
+    "spawn-gate": spawn_gate,
+    "read-wall": read_wall,
     "limit-hook": limit_hook,
     "escalation-stop": escalation_stop,
     "session-start": session_start,
@@ -730,9 +958,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return fn()
     except Exception as e:                         # noqa: BLE001 — deliberately total
-        # FAIL CLOSED, and only the wall can fail closed: an exception in delegate-wall must
-        # never become an allowed write. The other three cannot block anything by design, so
-        # for them a crash is a crash — say so on stderr and get out of the agent's way.
+        # FAIL CLOSED, and only a wall can fail closed: an exception in delegate-wall or
+        # spawn-gate must never become an allowed write / an allowed spawn. The other hooks
+        # cannot block anything by design, so for them a crash is a crash — say so on stderr
+        # and get out of the agent's way.
         print(f"[af.hooks:{name}] {type(e).__name__}: {e}", file=sys.stderr)
         if name == "delegate-wall":
             try:
@@ -745,6 +974,19 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             # `advised` never blocks, by definition — a broken advisory is a missing nudge,
             # not a missing wall. Allow, having said so on stderr.
+        if name == "spawn-gate":
+            # The one cheap signal that can decide this without re-doing the work that just
+            # crashed: AF_ROLE. The orchestrator (or a bare, unmanaged session outside any
+            # squad's topology) must never be blocked by a broken hook — failing closed there
+            # would stop the root from doing its one job. Any OTHER role is exactly the case
+            # this gate exists to stop, and that much is still known even though the rest of
+            # the payload could not be judged — so THAT fails closed.
+            role = _env("AF_ROLE")
+            if role and role != "orchestrator":
+                print("spawn-gate: DENIED — the gate itself failed, and a gate that cannot "
+                      "decide must not allow a non-orchestrator to spawn. Retry; if it "
+                      "persists, this hook is broken.", file=sys.stderr)
+                return 2
         return 0
 
 

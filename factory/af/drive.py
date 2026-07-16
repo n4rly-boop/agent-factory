@@ -108,10 +108,10 @@ def ctx(agent: str, p: Paths | None = None) -> int:
 
 
 def mid_task(agent: str, p: Paths | None = None) -> bool:
-    """Is the agent mid-TASK (not merely mid-turn)? The flag file, which is what BASH
-    believes — both implementations must agree on this or they compact different agents.
-    (mailbox.task_state() folds the same answer out of the mail itself and cannot go
-    stale; it becomes the source of truth the day nothing in bash reads the flag.)"""
+    """Is the agent mid-TASK (not merely mid-turn)? INFORMATIONAL ONLY — `ledger` uses
+    this to show a human what an agent is doing; compaction no longer gates on it (see
+    compact_decision). The flag file is what BASH believes; mailbox.task_state() folds the
+    same answer out of the mail itself and cannot go stale."""
     p = p or paths()
     return mailbox.state_flag(agent, p) == "busy"
 
@@ -479,17 +479,19 @@ def spec_thresholds(agent: str, p: Paths | None = None) -> tuple[int | None, int
         return None, None
 
 
-def compact_decision(ctx_tokens: int, soft: int, hard: int, is_mid_task: bool) -> str:
-    """"hard" | "soft" | "hold" | "none" — the whole compaction policy, as one pure function.
+def compact_decision(ctx_tokens: int, soft: int, hard: int) -> str:
+    """"hard" | "soft" | "none" — the whole compaction policy, as one pure function.
 
-    Compaction fires on a TASK boundary, not a turn boundary. A task spans many turns, and
-    compacting in the middle of one is what throws away the working state the agent still
-    needs; the mail protocol already says which is which (a task goes out, a done/result
-    comes back), so that is what gates it.
+    Compacts on MEASURED CONTEXT alone — no task-boundary prediction. This used to also
+    gate SOFT on a mail-derived busy/idle flag (HOLD mid-task, compact otherwise), which
+    was a GUESS: the flag went stale the instant its agent crashed or a done/result was
+    misrouted, which is why a whole reaper (sweep._reap) had to exist just to undo that
+    staleness. A measured token count is read fresh off the transcript every time —
+    nothing to go stale, nothing left to gate or reap.
 
       HARD — compact at the next TURN boundary regardless. Losing some working state is
              bad; running out of context loses everything.
-      SOFT — compact only BETWEEN tasks. Mid-task, HOLD and just report.
+      SOFT — compact as soon as the threshold is crossed, mid-task or not.
       0 on either threshold disables it.
     """
     if ctx_tokens <= 0:
@@ -497,7 +499,7 @@ def compact_decision(ctx_tokens: int, soft: int, hard: int, is_mid_task: bool) -
     if hard != 0 and ctx_tokens > hard:
         return "hard"
     if soft != 0 and ctx_tokens > soft:
-        return "hold" if is_mid_task else "soft"
+        return "soft"
     return "none"
 
 
@@ -506,17 +508,14 @@ def maybe_autocompact(agent: str, soft: object = None, hard: object = None,
     p = p or paths()
     s, h = resolve_thresholds(soft, hard)
     c = ctx(agent, p)
-    d = compact_decision(c, s, h, mid_task(agent, p))
+    d = compact_decision(c, s, h)
     if d == "hard":
         print(f"[af] context ≈ {c} tok > hard {h} — compacting '{agent}' now (mid-task or "
               f"not; running out would lose everything)…")
         compact(agent, nowait=nowait, p=p)
     elif d == "soft":
-        print(f"[af] context ≈ {c} tok > soft {s} and '{agent}' is between tasks — compacting…")
+        print(f"[af] context ≈ {c} tok > soft {s} — compacting '{agent}'…")
         compact(agent, nowait=nowait, p=p)
-    elif d == "hold":
-        print(f"[af] context ≈ {c} tok > soft {s}, but '{agent}' is mid-task — holding off "
-              f"(compacting now would drop its working state).")
     return d
 
 
@@ -530,3 +529,86 @@ def inbox_hint(p: Paths | None = None) -> None:
     if n > 0:
         print(f"[af] ⚠ {n} unread message(s) from spawned agents — af mail",
               file=sys.stdout)
+
+
+# --- standalone target helpers (no agent name, just a tmux target) ----------------
+
+def ring_target(target: str) -> bool:
+    """Ring the doorbell on a standalone tmux target (no agent name / Paths needed)."""
+    if not tmux.has_session(target.split(':', 1)[0]):
+        return False
+    pane = tmux.capture_pane(target)
+    phase = probemod.phase_of(pane) if pane is not None else 'idle'
+    if phase == 'permission':
+        return False
+    tmux.send_keys(target, 'C-u')
+    time.sleep(CLEAR_SETTLE)
+    for _try in (1, 2):
+        if not tmux.send_keys(target, DOORBELL, literal=True):
+            return False
+        time.sleep(TYPE_SETTLE)
+        if not tmux.send_enter(target):
+            return False
+        time.sleep(SUBMIT_SETTLE)
+        back = tmux.capture_pane(target)
+        if back is None or patterns.input_box(back) != DOORBELL_BODY:
+            return True
+    return False
+
+
+def say_target(target: str, msg: str) -> bool:
+    """Say a message into a standalone tmux target (no agent name / Paths needed)."""
+    if not msg:
+        return False
+    pane = tmux.capture_pane(target)
+    if pane is None:
+        return False
+    if probemod.phase_of(pane) == 'permission':
+        return False
+    for _try in (1, 2):
+        tmux.send_keys(target, 'C-u')
+        time.sleep(CLEAR_SETTLE)
+        tmux.send_keys(target, msg, literal=True)
+        time.sleep(TYPE_SETTLE)
+        tmux.send_enter(target)
+        time.sleep(SUBMIT_SETTLE)
+        back = tmux.capture_pane(target)
+        pending = patterns.input_box(back) if back is not None else None
+        if pending != msg:
+            return True
+    return False
+
+
+def compact_target(target: str, sid: str | None, nowait: bool = False) -> bool:
+    """Same as `compact()`, but against a standalone tmux target instead of an agent name —
+    `compact()` resolves the pane via `p.session(agent)`, which does not exist for a target
+    with no squad/Paths behind it at all."""
+    pr = probemod.probe_target(target, sid)
+    if not pr.alive:
+        print(f"[af] no session '{target}'")
+        return False
+    if pr.phase == "generating":
+        print(f"[af] '{target}' is mid-turn — refusing to compact (would interrupt).")
+        return False
+    if pr.phase == "permission":
+        print(f"[af] '{target}' is on a permission prompt — answer it first.")
+        return False
+    before = pr.ctx or 0
+    print(f"[af] compacting '{target}' (ctx ≈ {before} tok)…")
+    if not say_target(target, "/compact"):
+        return False
+    if nowait:
+        print(f"[af] '{target}' compacting in the background (was ≈ {before} tok).")
+    return True
+
+
+def maybe_autocompact_target(target: str, sid: str | None, soft: object = None,
+                             hard: object = None, nowait: bool = False) -> str:
+    """Same policy as `maybe_autocompact()`, scoped to a standalone target+sid instead of an
+    agent name — see `compact_target` for why the agent-shaped primitives don't fit here."""
+    s, h = resolve_thresholds(soft, hard)
+    c = probemod.probe_target(target, sid).ctx or 0
+    d = compact_decision(c, s, h)
+    if d in ("hard", "soft"):
+        compact_target(target, sid, nowait=nowait)
+    return d

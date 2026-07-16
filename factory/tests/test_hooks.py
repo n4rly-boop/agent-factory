@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from support import TempFactory, FACTORY   # imported first: puts the af package on sys.path
@@ -51,16 +52,20 @@ def bash_ev(cmd):
 class HookRun(TempFactory):
     """Runs a hook in-process with a fake stdin and a controlled env."""
 
-    def run_hook(self, name, payload=None, **env):
+    def run_hook(self, name, payload=None, pane=None, **env):
         raw = payload if isinstance(payload, str) else json.dumps(payload or {})
         out, err = io.StringIO(), io.StringIO()
         clean = {k: "" for k in ("AF_ROLE", "AF_DELEGATE", "AF_WORK", "AF_PEERS",
                                  "AF_CAVEMAN", "AF_BULK_LINES", "AF_PARENT", "AF_AGENT")}
         clean.update({k: str(v) for k, v in env.items()})
+        # role-reminder's Context:% line reads a real tmux pane — pane=None (the default)
+        # keeps every OTHER test hermetic (no real tmux call); a test of the context% line
+        # itself passes pane="...fixture text..." to fake one in.
         with mock.patch.dict(os.environ, clean), \
                 mock.patch.object(sys, "stdin", io.StringIO(raw)), \
                 mock.patch.object(sys, "stdout", out), \
-                mock.patch.object(sys, "stderr", err):
+                mock.patch.object(sys, "stderr", err), \
+                mock.patch("af.tmux.capture_pane", return_value=pane):
             rc = hooks.main([name])
         return rc, out.getvalue(), err.getvalue()
 
@@ -374,6 +379,172 @@ class FailsClosed(HookRun):
 
 
 # ======================================================================================
+# spawn-gate: the ONE hard topology invariant — only the orchestrator spawns full agents
+# ======================================================================================
+class SpawnGate(HookRun):
+    def gate(self, cmd, role="worker", **env):
+        return self.run_hook("spawn-gate", bash_ev(cmd), AF_ROLE=role, AF_AGENT="w1", **env)
+
+    def test_the_orchestrator_may_spawn(self):
+        rc, out, err = self.gate("af up newstation", role="orchestrator")
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+    def test_a_worker_running_af_up_is_denied(self):
+        rc, out, err = self.gate("af up newstation", role="worker")
+        self.assertEqual(rc, 2, "exit 2 is the ONLY code Claude Code reads as a block")
+        self.assertIn("BLOCKED", err)
+        self.assertIn("spawn-gate", err)
+
+    def test_python_dash_m_af_up_is_also_gated(self):
+        for cmd in ("python3 -m af up x", "python -m af up x", "python3 -m af.__main__ up x"):
+            rc, *_ = self.gate(cmd, role="worker")
+            self.assertEqual(rc, 2, cmd)
+
+    def test_a_bare_af_path_invocation_is_gated(self):
+        rc, *_ = self.gate("/repo/bin/af up x", role="worker")
+        self.assertEqual(rc, 2)
+
+    def test_af_revive_is_the_same_capability_as_af_up_and_is_also_gated(self):
+        # lifecycle.revive() calls straight into the same up() af up does — a station that
+        # can't `af up` must not be able to route around the gate through `af revive`.
+        for cmd in ("af revive orc", "python3 -m af revive orc", "python -m af revive orc"):
+            rc, *_ = self.gate(cmd, role="worker")
+            self.assertEqual(rc, 2, cmd)
+        rc, *_ = self.gate("af revive orc", role="orchestrator")
+        self.assertEqual(rc, 0)
+
+    def test_a_subshell_or_command_substitution_does_not_dodge_the_gate(self):
+        # A subshell is ordinary shell syntax, not obfuscation — it must not be a bypass.
+        for cmd in ("(af up x)", "$(af up x)", "( af up x )"):
+            rc, *_ = self.gate(cmd, role="worker")
+            self.assertEqual(rc, 2, cmd)
+
+    def test_a_leading_env_assignment_does_not_dodge_the_gate(self):
+        # `AF_SLUG=child af up` is an everyday env override, not an evasion attempt.
+        for cmd in ("FOO=bar af up x", "AF_SLUG=child af up x", "A=1 B=2 af up x"):
+            rc, *_ = self.gate(cmd, role="worker")
+            self.assertEqual(rc, 2, cmd)
+
+    def test_a_command_that_does_not_invoke_af_up_is_always_allowed(self):
+        for cmd in ("af mail send --to x", "af ledger", "echo af up", "python3 -m af mail"):
+            rc, out, err = self.gate(cmd, role="worker")
+            self.assertEqual((rc, out, err), (0, "", ""), cmd)
+
+    def test_a_non_bash_tool_is_always_allowed(self):
+        rc, out, err = self.run_hook("spawn-gate", edit_ev(f"{REPO}/x.py"),
+                                     AF_ROLE="worker", AF_AGENT="w1")
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+    def test_an_agent_with_no_role_is_outside_the_scheme(self):
+        # A bare, unmanaged session running `af up` is a human at the CLI, not a sub-agent
+        # spawning a sub-team — nothing here to gate.
+        rc, out, err = self.gate("af up x", role="")
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+    def test_an_exception_for_a_non_orchestrator_does_not_become_an_allowed_spawn(self):
+        with mock.patch.object(hooks, "_spawns_full_agent", side_effect=RuntimeError("boom")):
+            rc, out, err = self.gate("af up x", role="worker")
+        self.assertEqual(rc, 2, "a gate that cannot decide must not allow a spawn")
+        self.assertIn("RuntimeError", err)
+
+    def test_an_exception_for_the_orchestrator_does_not_block_the_root(self):
+        with mock.patch.object(hooks, "_spawns_full_agent", side_effect=RuntimeError("boom")):
+            rc, out, err = self.gate("af up x", role="orchestrator")
+        self.assertEqual(rc, 0, "a broken gate must never stop the root from doing its job")
+
+    def test_an_exception_with_no_role_does_not_block_a_bare_session(self):
+        with mock.patch.object(hooks, "_spawns_full_agent", side_effect=RuntimeError("boom")):
+            rc, out, err = self.gate("af up x", role="")
+        self.assertEqual(rc, 0)
+
+
+# ======================================================================================
+# read-wall: deny a huge unbounded Read, with a one-shot `af read-force` escape
+# ======================================================================================
+def _read_ev(path, limit=None, offset=None):
+    tin = {"file_path": path}
+    if limit is not None:
+        tin["limit"] = limit
+    if offset is not None:
+        tin["offset"] = offset
+    return {"tool_name": "Read", "tool_input": tin}
+
+
+class ReadWall(HookRun):
+    def _write(self, name: str, lines: int) -> str:
+        p = self.root / name
+        p.write_text("\n".join(f"line {i}" for i in range(lines)) + "\n", encoding="utf-8")
+        return str(p)
+
+    def test_a_bounded_read_always_passes_however_big_the_file(self):
+        big = self._write("big.py", 5000)
+        rc, out, err = self.run_hook("read-wall", _read_ev(big, limit=100))
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+    def test_an_unbounded_read_of_a_small_file_passes(self):
+        small = self._write("small.py", 10)
+        rc, out, err = self.run_hook("read-wall", _read_ev(small))
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+    def test_an_unbounded_read_over_the_threshold_is_denied(self):
+        big = self._write("big.py", 5000)
+        rc, out, err = self.run_hook("read-wall", _read_ev(big), AF_READ_WALL_LINES="500")
+        self.assertEqual(rc, 2)
+        self.assertIn("BLOCKED", err)
+        self.assertIn("read-force", err)
+
+    def test_the_threshold_is_tunable(self):
+        med = self._write("med.py", 50)
+        rc, *_ = self.run_hook("read-wall", _read_ev(med), AF_READ_WALL_LINES="20")
+        self.assertEqual(rc, 2)
+        rc, *_ = self.run_hook("read-wall", _read_ev(med), AF_READ_WALL_LINES="200")
+        self.assertEqual(rc, 0)
+
+    def test_a_non_read_tool_is_always_allowed(self):
+        big = self._write("big.py", 5000)
+        rc, out, err = self.run_hook("read-wall", write_ev(big), AF_READ_WALL_LINES="500")
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+    def test_read_force_is_a_ONE_SHOT_not_a_standing_allowlist(self):
+        big = self._write("big.py", 5000)
+        with mock.patch.dict(os.environ, {"AF_READ_WALL_LINES": "500"}):
+            self.assertEqual(hooks.read_force(big), 0)
+        rc1, *_ = self.run_hook("read-wall", _read_ev(big), AF_READ_WALL_LINES="500")
+        self.assertEqual(rc1, 0, "the forced read must pass")
+        rc2, *_ = self.run_hook("read-wall", _read_ev(big), AF_READ_WALL_LINES="500")
+        self.assertEqual(rc2, 2, "a second read must be denied again — one-shot, not standing")
+
+    def test_a_missing_file_stat_does_not_crash(self):
+        rc, out, err = self.run_hook("read-wall", _read_ev(str(self.root / "nope.py")))
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+    def test_read_force_with_a_relative_path_still_matches_the_absolute_file_path(self):
+        # Read's own tool_input always carries an ABSOLUTE file_path. `af read-force` is run
+        # by the agent in the same cwd, so a relative argument must resolve to the SAME key.
+        big = self._write("big.py", 5000)
+        rel = os.path.basename(big)
+        with mock.patch.dict(os.environ, {"AF_READ_WALL_LINES": "500"}), \
+                mock.patch("os.getcwd", return_value=str(self.root)):
+            self.assertEqual(hooks.read_force(rel), 0)
+        rc, *_ = self.run_hook("read-wall", _read_ev(big), AF_READ_WALL_LINES="500")
+        self.assertEqual(rc, 0, "a relative read-force path must still forgive the real read")
+
+    def test_read_force_consumption_is_unlink_not_check_then_unlink(self):
+        # A check-then-unlink (is_file() then unlink()) is a TOCTOU race between two
+        # concurrent Read hooks; unlink() itself must be the only check.
+        big = self._write("big.py", 5000)
+        with mock.patch.dict(os.environ, {"AF_READ_WALL_LINES": "500"}):
+            self.assertEqual(hooks.read_force(big), 0)
+        tok = hooks._read_force_dir() / hooks._read_force_key(big)
+        self.assertTrue(tok.is_file())
+        with mock.patch.object(Path, "is_file") as spy:
+            rc, *_ = self.run_hook("read-wall", _read_ev(big), AF_READ_WALL_LINES="500")
+            spy.assert_not_called()
+        self.assertEqual(rc, 0)
+        self.assertFalse(tok.is_file(), "the token must be consumed")
+
+
+# ======================================================================================
 # role-reminder
 # ======================================================================================
 class RoleReminder(HookRun):
@@ -424,6 +595,28 @@ class RoleReminder(HookRun):
     def test_caveman(self):
         rc, out, _ = self.run_hook("role-reminder", {}, AF_ROLE="worker", AF_CAVEMAN="1")
         self.assertIn("Answer in caveman", out)
+
+    def test_context_pct_appears_when_the_pane_shows_it(self):
+        # Ground truth off the pane, not a re-derived estimate — same source probe() trusts.
+        rc, out, _ = self.run_hook("role-reminder", {}, AF_ROLE="worker",
+                                   pane="Context: 42% left")
+        self.assertIn("Context: 42%.", out)
+
+    def test_no_context_line_when_the_pane_cannot_be_read(self):
+        rc, out, _ = self.run_hook("role-reminder", {}, AF_ROLE="worker", pane=None)
+        self.assertNotIn("Context:", out)
+        self.assertTrue(out.endswith("\n"))
+
+    def test_a_broken_pane_read_is_silence_not_a_crash(self):
+        # A nudge must never be the reason a prompt fails.
+        with mock.patch("af.tmux.capture_pane", side_effect=RuntimeError("boom")):
+            rc, out, _ = self.run_hook("role-reminder", {}, AF_ROLE="worker")
+        self.assertEqual(rc, 0)
+        self.assertIn("ROLE: you are", out)
+
+    def test_an_agent_with_no_role_gets_no_context_line_either(self):
+        rc, out, _ = self.run_hook("role-reminder", {}, pane="Context: 10% left")
+        self.assertEqual((rc, out), (0, ""))
 
     def test_it_stays_short_because_it_is_paid_for_on_every_turn(self):
         rc, out, _ = self.run_hook("role-reminder", {}, AF_ROLE="worker", AF_AGENT="coder",
@@ -647,8 +840,8 @@ class HooksOk(TempFactory):
 class Dispatch(HookRun):
     def test_every_hook_the_settings_install_is_dispatchable(self):
         self.assertEqual(sorted(hooks.HOOKS),
-                         ["delegate-wall", "escalation-stop", "limit-hook", "role-reminder",
-                          "session-start"])
+                         ["delegate-wall", "escalation-stop", "limit-hook", "read-wall",
+                          "role-reminder", "session-start", "spawn-gate"])
 
     def test_an_unknown_hook_is_a_usage_error_not_a_silent_zero(self):
         rc, out, err = self.run_hook("nonesuch")

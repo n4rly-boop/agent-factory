@@ -190,3 +190,33 @@ def probe(agent: str, p: Paths | None = None) -> Probe:
 
     return Probe(alive=True, phase=phase, ctx=ctx, endturns=endturns, inputbox=box,
                  ctxpct=ctxpct)
+
+
+def probe_target(target: str, sid: str | None = None) -> Probe:
+    """Probe a tmux session by its target name (for standalone warden mode).
+
+    Unlike probe() which resolves via agent name + Paths, this works directly
+    against a tmux session name. Uses the provided sid to find the session log,
+    or skips the log read if no sid is available.
+    """
+    pane = tmux.capture_pane(target)
+    # For standalone targets, we can optionally read the log if we have a sid
+    ctx, endturns = None, 0
+    if sid:
+        from .paths import PROJECTS
+        # Find the log file for this sid
+        for root, _dirs, files in os.walk(PROJECTS):
+            if f'{sid}.jsonl' in files:
+                log_path = Path(root) / f'{sid}.jsonl'
+                ctx, endturns = _scan_log(log_path)
+                break
+
+    if pane is None:
+        return Probe(alive=False, phase='idle', ctx=ctx, endturns=endturns, inputbox=None)
+
+    phase = _phase(pane)
+    ctxpct = patterns.context_pct(pane)
+    box = patterns.input_box(pane) if phase in ('idle', 'generating') else None
+
+    return Probe(alive=True, phase=phase, ctx=ctx, endturns=endturns, inputbox=box,
+                 ctxpct=ctxpct)

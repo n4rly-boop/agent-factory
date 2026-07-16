@@ -23,7 +23,7 @@ import sys
 import time
 import uuid
 
-from . import drive, hooks, mailbox, manifest, patterns, spec as specmod, tmux
+from . import drive, hooks, live as livemod, mailbox, manifest, patterns, spec as specmod, squad, tmux
 from .paths import LINE_SH, MAIL_SH, POLL_SH, Paths, paths
 
 RESUME_WATCH_TICKS = 24     # 12s of watching for the resume chooser
@@ -194,6 +194,17 @@ def up(name: str = "claude", p: Paths | None = None, env: dict | None = None) ->
     print(f"[af] interactive claude launched (session={s} id={sid} cwd={p.cwd})")
     p.state.mkdir(parents=True, exist_ok=True)
     p.sid_file(name).write_text(sid, encoding="utf-8")
+    # Record the station in the durable roster (squad.json). Additive: the sid file above
+    # stays authoritative during the migration, so a squad-write failure must never fail a
+    # spawn — the roster is a convenience view that self-heals on the next reconcile.
+    try:
+        squad.mark_up(
+            name, p, live_sid=sid, settings_path=sp.settings, spawn_flags=basefl,
+            model=sp.model, role=e.get("AF_ROLE", ""), parent=e.get("AF_PARENT", ""),
+            delegate=e.get("AF_DELEGATE", ""),
+        )
+    except Exception as ex:
+        print(f"[af] ⚠ squad roster not updated for '{name}': {ex}", file=sys.stderr)
     print(f"[af] detached — watch it live:  tmux attach -r -t {s}   (-r = read-only)")
 
     if "--resume" in launchflags:
@@ -212,12 +223,25 @@ def up(name: str = "claude", p: Paths | None = None, env: dict | None = None) ->
 
 def down(name: str = "claude", p: Paths | None = None) -> int:
     p = p or paths()
-    # A `busy` state that outlives its agent silently disables soft compaction for the NEXT
-    # agent to take that name — it inherits the stale flag and never compacts again.
+    # Capture the session the agent is ACTUALLY running BEFORE killing it. Claude Code forks
+    # the session on --resume, so a resumed-then-downed agent's sid file may name the frozen
+    # parent; live_sid reads the real post-fork id from the process argv. Recording it now is
+    # what lets revive resume the transcript that was actually growing, not a dead one.
+    try:
+        captured = livemod.live_sid(name, p) or ""
+    except Exception:
+        captured = ""
+    # Clean up the busy/idle flag files so the next agent to take this name starts
+    # with a clean slate in the ledger display — a stale flag would show the wrong
+    # state for whoever inherits the name.
     p.task_flag(name).unlink(missing_ok=True)
     p.tasker(name).unlink(missing_ok=True)
     tmux.kill_session(p.session(name))
     _rm_dead_state(name, p)
+    try:
+        squad.mark_down(name, captured or None, p)
+    except Exception:
+        pass
     print(f"[af] '{name}' down — session killed.")
     return 0
 
@@ -311,6 +335,15 @@ def revive(name: str = "claude", sid: str = "", p: Paths | None = None) -> int:
     sf = p.spec_file(name)
     opflags = _flags(e)   # anything the operator passed on THIS command line
 
+    if not sid:
+        # The durable roster's live_sid is the authoritative session — captured on down after
+        # any fork, so it names the transcript that was actually growing. Preferred over the
+        # sid file (written once at spawn, rots on resume) and the spec's frozen spawn-time id.
+        try:
+            st = squad.get(name, p)
+            sid = st.live_sid if st else ""
+        except Exception:
+            sid = ""
     if not sid:
         try:
             sid = p.sid_file(name).read_text(encoding="utf-8").strip()

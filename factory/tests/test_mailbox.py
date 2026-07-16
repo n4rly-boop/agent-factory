@@ -8,6 +8,7 @@ that does not exist, and `ring` bails before it can type anything anywhere.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import shutil
 import subprocess
@@ -34,6 +35,9 @@ class FakeClock:
     def sleep(self, seconds):        # the lock's spin still sleeps for real
         time.sleep(seconds)
 
+    def monotonic(self):             # the lock's wait budget is measured against a real clock
+        return time.monotonic()
+
 
 class MailTest(TempFactory):
     """A TempFactory with a clock we control: message ts has one-second resolution, and the
@@ -43,10 +47,10 @@ class MailTest(TempFactory):
         super().setUp()
         self.now = 1_700_000_000
 
-    def send(self, to, body="body", kind="fyi", frm="orc", at=None):
+    def send(self, to, body="body", kind="fyi", frm="orc", at=None, dedup_key=None):
         clock = FakeClock(at if at is not None else self.now)
         with mock.patch.object(mailbox, "time", clock):
-            return mailbox.send(to, body, kind=kind, frm=frm, p=self.p)
+            return mailbox.send(to, body, kind=kind, frm=frm, p=self.p, dedup_key=dedup_key)
 
     def tick(self, n=1):
         self.now += n
@@ -330,65 +334,188 @@ class TestBlobs(MailTest):
         self.assertEqual(mailbox.unread("qa", self.p), 0)   # the junk line was still acked
 
 
+# --- dedup ---------------------------------------------------------------------------
+class TestDedup(MailTest):
+    """`send(..., dedup_key=...)` makes a retried send idempotent: a second send with the
+    same key for the same recipient must return the ALREADY-SENT message rather than
+    appending a duplicate line. Calls with no dedup_key (the overwhelming majority) must
+    keep behaving exactly like the old lock-free atomic-append path."""
+
+    def test_same_key_twice_returns_the_same_message_and_appends_once(self):
+        first = self.send("qa", "hello", dedup_key="k1")
+        second = self.send("qa", "hello", dedup_key="k1")
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(len(self.p.box("qa").read_text().splitlines()), 1)
+
+    def test_distinct_keys_append_distinct_lines(self):
+        first = self.send("qa", "hello", dedup_key="k1")
+        second = self.send("qa", "hello", dedup_key="k2")
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(len(self.p.box("qa").read_text().splitlines()), 2)
+
+    def test_no_dedup_key_is_the_unchanged_fast_path_and_never_dedupes(self):
+        # Same recipient, same body, no dedup_key at all — the default path must not
+        # accidentally collapse these into one line the way a dedup_key would.
+        first = self.send("qa", "identical body")
+        second = self.send("qa", "identical body")
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(len(self.p.box("qa").read_text().splitlines()), 2)
+        self.assertEqual(first.dedup, "")
+        self.assertEqual(second.dedup, "")
+
+    def test_the_envelope_on_disk_carries_the_dedup_field(self):
+        self.send("qa", "hello", dedup_key="k1")
+        line = json.loads(self.p.box("qa").read_text().splitlines()[0])
+        self.assertEqual(line["dedup"], "k1")
+
+    def test_message_parse_round_trips_the_dedup_field(self):
+        raw = json.dumps({"id": "m-1", "ts": 1700000000, "from": "orc", "to": "qa",
+                           "kind": "fyi", "body": "hi", "dedup": "k1"})
+        m = mailbox.Message.parse(raw)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.dedup, "k1")
+
+    def test_message_parse_defaults_dedup_to_empty_string_when_absent(self):
+        raw = json.dumps({"id": "m-1", "ts": 1700000000, "from": "orc", "to": "qa",
+                           "kind": "fyi", "body": "hi"})
+        m = mailbox.Message.parse(raw)
+        self.assertEqual(m.dedup, "")
+
+    def test_find_by_dedup_returns_none_when_no_message_carries_the_key(self):
+        self.send("qa", "hello", dedup_key="k1")
+        self.assertIsNone(mailbox.find_by_dedup("qa", "nope", self.p))
+
+    def test_find_by_dedup_finds_the_matching_message(self):
+        sent = self.send("qa", "hello", dedup_key="k1")
+        found = mailbox.find_by_dedup("qa", "k1", self.p)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.id, sent.id)
+
+    def test_concurrent_sends_with_the_same_key_produce_exactly_one_line(self):
+        """The concurrency-critical property: the check-then-append under dedup_key must be
+        serialized by the mailbox flock, so two callers racing to retry the same logical send
+        can never both win. Threads are aligned on a Barrier so both truly overlap the
+        check-and-append window rather than merely running "close together"."""
+        barrier = threading.Barrier(2)
+        results: list = []
+        errors: list = []
+
+        def worker(body):
+            try:
+                barrier.wait(timeout=5)
+                m = mailbox.send("qa", body, kind="fyi", frm="orc", p=self.p,
+                                  dedup_key="same")
+                results.append(m)
+            except Exception as e:      # a thread's exception cannot fail the test directly
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(f"body-{i}",)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+
+        self.assertEqual(errors, [], f"a racing send raised: {errors}")
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].id, results[1].id,
+                          "both racing sends must agree on the same winning message")
+
+        lines = self.p.box("qa").read_text().splitlines()
+        self.assertEqual(len(lines), 1, f"expected exactly one line, got: {lines}")
+        line = json.loads(lines[0])
+        self.assertEqual(line["dedup"], "same")
+
+
 # --- the lock ----------------------------------------------------------------------
 class TestLock(MailTest):
-    def test_a_held_lock_blocks_the_reader_until_it_is_released(self):
-        """The reader must WAIT for a live lock — not reap it, and not sail through it.
+    """flock, not a mkdir mutex (see af.mailbox module docstring): the lock FILE persists —
+    only its flock is taken/released — so these tests hold/release a real OS flock on the
+    same path `mailbox._locked` opens, from a background thread, rather than mkdir/rmtree."""
 
-        The budget below (100 spins × 0.02s = 2s) is deliberately far longer than the 0.15s
-        the lock is held, and the test asserts the read finished well inside it: that is
-        what tells a clean wait apart from a stale-reap, which would otherwise pass every
-        assertion here while proving the opposite.
-        """
-        self.send("qa", "one")
-        lock = self.p.mail_lock("qa")
-        lock.mkdir(parents=True)
+    def _hold_lock_for(self, agent: str, seconds: float, held: threading.Event,
+                        blew_up: list, acquired: threading.Event | None = None
+                        ) -> threading.Thread:
+        path = self.p.mail_lock(agent)
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-        held = threading.Event()
-        blew_up = []
-
-        def release():
+        def hold():
             try:
-                time.sleep(0.15)
-                shutil.rmtree(lock)          # must exist: nobody else may touch it
+                with path.open("w", encoding="utf-8") as fh:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                    if acquired is not None:
+                        acquired.set()
+                    time.sleep(seconds)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
                 held.set()
             except Exception as e:           # a thread's exception cannot fail a test — record it
                 blew_up.append(e)
                 held.set()
+                if acquired is not None:
+                    acquired.set()
 
-        t = threading.Thread(target=release)
-        started = time.monotonic()
-        with mock.patch.object(mailbox, "LOCK_SPINS", 100), \
-             mock.patch.object(mailbox, "LOCK_SLEEP", 0.02):
-            t.start()
+        t = threading.Thread(target=hold)
+        t.start()
+        return t
+
+    def test_a_held_lock_blocks_the_reader_until_it_is_released(self):
+        """The reader must WAIT for a live lock — not steal it, and not sail through it.
+
+        LOCK_WAIT (patched to 2s) is deliberately far longer than the 0.15s the lock is
+        held, and the test asserts the read finished well inside it: that is what tells a
+        clean wait apart from a would-be steal, which would otherwise pass every assertion
+        here while proving the opposite.
+        """
+        self.send("qa", "one")
+        held = threading.Event()
+        acquired = threading.Event()
+        blew_up: list = []
+
+        with mock.patch.object(mailbox, "LOCK_WAIT", 2.0):
+            t = self._hold_lock_for("qa", 0.15, held, blew_up, acquired)
+            self.assertTrue(acquired.wait(5), "lock-holding thread never acquired the lock")
+            started = time.monotonic()
             got = mailbox.read("qa", p=self.p)
             elapsed = time.monotonic() - started
-            budget = mailbox.LOCK_SPINS * mailbox.LOCK_SLEEP
         t.join(5)
 
-        self.assertEqual(blew_up, [], "the reader reaped a lock that was still held")
+        self.assertEqual(blew_up, [], "the lock-holding thread raised")
         self.assertTrue(held.is_set())
         self.assertEqual([m.body for m in got], ["one"])
         self.assertGreaterEqual(elapsed, 0.15, "the reader did not wait for the lock")
-        self.assertLess(elapsed, budget, "the reader stale-reaped instead of waiting")
-        self.assertFalse(lock.exists(), "read() left the lock behind")
+        self.assertLess(elapsed, 2.0, "the reader waited past the release instead of "
+                                       "proceeding as soon as the lock freed")
 
-    def test_a_stale_lock_is_reaped_rather_than_wedging_the_mailbox_forever(self):
+    def test_a_lock_held_past_the_wait_budget_raises_rather_than_stealing_it(self):
+        """flock cannot go stale (the OS releases it the instant the holder's fd closes or
+        the holder dies), so there is no steal case left to reap: a lock genuinely held by
+        a LIVE thread for longer than the wait budget must surface as MailboxLocked, never
+        be taken out from under it. That is the fix for the class of bug a mkdir mutex had
+        (a slow-but-live holder mistaken for a dead one and stolen from)."""
         self.send("qa", "one")
-        lock = self.p.mail_lock("qa")
-        lock.mkdir(parents=True)                       # nobody will ever release this
+        held = threading.Event()
+        acquired = threading.Event()
+        blew_up: list = []
+        t = self._hold_lock_for("qa", 0.3, held, blew_up, acquired)
+        self.assertTrue(acquired.wait(5), "lock-holding thread never acquired the lock")
 
-        with mock.patch.object(mailbox, "LOCK_SPINS", 3), \
-             mock.patch.object(mailbox, "LOCK_SLEEP", 0.01):
-            got = mailbox.read("qa", p=self.p)         # spins, gives up, takes the lock
+        with mock.patch.object(mailbox, "LOCK_WAIT", 0.05), \
+             mock.patch.object(mailbox, "LOCK_POLL", 0.01):
+            with self.assertRaises(mailbox.MailboxLocked):
+                mailbox.read("qa", p=self.p)
 
-        self.assertEqual([m.body for m in got], ["one"])
-        self.assertFalse(lock.exists())
-        self.assertEqual(mailbox.unread("qa", self.p), 0)
+        t.join(5)
+        self.assertEqual(blew_up, [])
+        # The mail is untouched — a refused read must not have advanced the cursor.
+        self.assertEqual(mailbox.unread("qa", self.p), 1)
 
     def test_the_lock_is_released_even_when_there_is_no_mail(self):
         self.assertEqual(mailbox.read("qa", p=self.p), [])
-        self.assertFalse(self.p.mail_lock("qa").exists())
+        # The lock file may legitimately persist (flock only ever locks/unlocks it) — what
+        # must be true is that it is no longer HELD, i.e. immediately re-lockable.
+        path = self.p.mail_lock("qa")
+        with path.open("w", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises if still held
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 # --- bash <-> python interop -------------------------------------------------------

@@ -83,3 +83,13 @@ def list_sessions_verbose() -> list[str]:
     if p.returncode != 0:
         return []
     return [s for s in p.stdout.splitlines() if s]
+
+
+def list_panes(target: str) -> list[str]:
+    """Return the pane_pid values for every pane in the named session/window.
+
+    Returns an empty list if the target doesn't exist or tmux fails."""
+    p = _run(["list-panes", "-t", target, "-F", "#{pane_pid}"])
+    if p.returncode != 0:
+        return []
+    return [s for s in p.stdout.splitlines() if s]

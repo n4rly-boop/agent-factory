@@ -316,6 +316,56 @@ class Compact(TempFactory):
         self.assertTrue(self.p.compacted("w").read_text().isdigit())
 
 
+class CompactTarget(unittest.TestCase):
+    """Standalone (non-agent) compaction against a bare tmux target — same refusal rules as
+    `compact()`, but resolved via `probemod.probe_target`, not an agent name + Paths."""
+
+    def _refuses(self, phase):
+        with mock.patch("af.drive.probemod.probe_target", return_value=_p(phase)), \
+             mock.patch("af.drive.say_target") as say:
+            self.assertFalse(drive.compact_target("t", "sid-1"))
+        say.assert_not_called()
+
+    def test_refuses_mid_generation(self):
+        self._refuses("generating")
+
+    def test_refuses_on_a_permission_prompt(self):
+        self._refuses("permission")
+
+    def test_refuses_a_dead_target(self):
+        with mock.patch("af.drive.probemod.probe_target", return_value=_p(alive=False)), \
+             mock.patch("af.drive.say_target") as say:
+            self.assertFalse(drive.compact_target("t", "sid-1"))
+        say.assert_not_called()
+
+    def test_compacts_an_idle_target(self):
+        with mock.patch("af.drive.probemod.probe_target", return_value=_p("idle", ctx=300000)), \
+             mock.patch("af.drive.say_target", return_value=True) as say:
+            self.assertTrue(drive.compact_target("t", "sid-1", nowait=True))
+        self.assertEqual(say.call_args.args[1], "/compact")
+
+
+class MaybeAutocompactTarget(unittest.TestCase):
+    """This is the bug that shipped first: the standalone warden loop called
+    `maybe_autocompact(target, ...)`, which resolves an AGENT name via `p.session(agent)` —
+    a tmux target has no such session, so it silently never compacted anything. This locks in
+    the fix: the target-scoped primitive reads context via `probe_target(target, sid)`."""
+
+    def test_over_soft_compacts(self):
+        with mock.patch("af.drive.probemod.probe_target", return_value=_p("idle", ctx=300000)), \
+             mock.patch("af.drive.say_target", return_value=True) as say:
+            d = drive.maybe_autocompact_target("t", "sid-1", soft=200000, hard=500000, nowait=True)
+        self.assertEqual(d, "soft")
+        say.assert_called_once()
+
+    def test_under_soft_does_nothing(self):
+        with mock.patch("af.drive.probemod.probe_target", return_value=_p("idle", ctx=1000)), \
+             mock.patch("af.drive.say_target") as say:
+            d = drive.maybe_autocompact_target("t", "sid-1", soft=200000, hard=500000, nowait=True)
+        self.assertEqual(d, "none")
+        say.assert_not_called()
+
+
 class MidTask(TempFactory):
     def test_mid_task_reads_the_flag_file_that_bash_writes(self):
         self.assertFalse(drive.mid_task("w", self.p))

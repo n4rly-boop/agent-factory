@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from . import drive, mailbox, tmux
+from . import drive
 from .paths import Paths, paths
 from .probe import Probe, probe
 from .nums import intish
@@ -193,7 +193,6 @@ def sweep(skip: str = "", p: Paths | None = None) -> int:
             # Blocking here would put a 300s wait inside every `af post` — per agent.
             drive.maybe_autocompact(name, soft, hard, nowait=True, p=p)
 
-        _reap(p)
     finally:
         lock.release()
         for sig, handler in prev.items():
@@ -202,35 +201,6 @@ def sweep(skip: str = "", p: Paths | None = None) -> int:
             except (ValueError, OSError):
                 pass
     return 0
-
-
-def _reap(p: Paths) -> None:
-    """The stale-busy-flag reaper.
-
-    A `busy` flag says "this agent owes a done/result", and SOFT compaction refuses to touch
-    a busy agent — so a flag whose agent no longer exists silently exempts that NAME from
-    compaction forever, and the next agent to take the name inherits the exemption.
-
-    UNLESS the dead agent still has UNREAD mail: then the flag is not garbage, it is a task
-    legitimately QUEUED for an agent that is down (mail.sh promises it will be rung on the
-    next up/revive). Reaping it would also destroy the tasker record its eventual `done`
-    needs in order to clear the busy state.
-    """
-    if not p.mailroot.is_dir():
-        return
-    for f in sorted(p.mailroot.glob("state-*")):
-        try:
-            if f.read_text(encoding="utf-8").strip() != "busy":
-                continue
-        except OSError:
-            continue
-        who = f.name[len("state-"):]
-        if tmux.has_session(p.session(who)):
-            continue
-        if mailbox.unread(who, p) > 0:
-            continue
-        f.unlink(missing_ok=True)
-        p.tasker(who).unlink(missing_ok=True)
 
 
 def autosweep(skip: str = "", p: Paths | None = None) -> None:

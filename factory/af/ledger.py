@@ -19,7 +19,7 @@ Two rules this view exists to keep:
 from __future__ import annotations
 
 from . import hooks, mailbox, spec as specmod
-from .drive import mid_task, resolve_thresholds
+from .drive import resolve_thresholds
 from .manifest import session_log_exists
 from .paths import Paths, paths
 from .probe import probe
@@ -77,7 +77,11 @@ def ledger(p: Paths | None = None) -> int:
         if pr.alive:
             alive = "● alive"
             ctx = str(pr.ctx or 0)
-            state = "busy" if pr.phase == "generating" else ("task" if mid_task(name, p) else "idle")
+            # task_state() folds the answer out of the mail log itself on every read, so a
+            # dead agent's stale busy flag (nothing reaps it anymore — see af.sweep) cannot
+            # pin this display on "task" forever the way reading the raw flag would.
+            state = ("busy" if pr.phase == "generating"
+                     else ("task" if mailbox.task_state(name, p) == "busy" else "idle"))
         else:
             alive = "○ down"
             ctx = ""

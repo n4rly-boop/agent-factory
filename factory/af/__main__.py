@@ -11,6 +11,9 @@ so nothing here may write a file the bash cannot read.
   mail                : post  mail/inbox  mailstat  register-self  unregister-self
   the context guard   : sweep  (post and mail run one automatically; ledger deliberately
                         does NOT — it is a look, and it reports what a sweep would do)
+  delegation levers   : read-force (one-shot escape hatch for the read-wall hook)
+                        (delegation itself: call the delegate-to-local-model skill or
+                        Task subagent directly — no wrapper here, see squad.md)
 """
 
 from __future__ import annotations
@@ -212,6 +215,11 @@ def cmd_warden(a: argparse.Namespace) -> int:
     return warden.main(a.rest)
 
 
+def cmd_postmaster(a: argparse.Namespace) -> int:
+    from . import postmaster
+    return postmaster.main(a.rest)
+
+
 def cmd_polling(a: argparse.Namespace) -> int:
     from . import polling
     return polling.main(a.rest)
@@ -219,6 +227,12 @@ def cmd_polling(a: argparse.Namespace) -> int:
 
 def cmd_sweep(a: argparse.Namespace) -> int:
     return sweepmod.sweep(a.skip or "")
+
+
+# --- delegation levers -------------------------------------------------------------
+def cmd_read_force(a: argparse.Namespace) -> int:
+    from . import hooks
+    return hooks.read_force(a.path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -324,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--agent", default=None)
     q.set_defaults(fn=cmd_unread)
 
-    q = sub.add_parser("sweep", help="compact idle agents past their threshold; reap stale flags")
+    q = sub.add_parser("sweep", help="compact agents past their threshold")
     q.add_argument("--skip", default="", help="an agent the caller is about to touch")
     q.set_defaults(fn=cmd_sweep)
 
@@ -340,9 +354,18 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("rest", nargs=argparse.REMAINDER)
     q.set_defaults(fn=cmd_warden)
 
+    q = sub.add_parser("postmaster", help="squad state + mail safety net (watch/status/stop)")
+    q.add_argument("rest", nargs=argparse.REMAINDER)
+    q.set_defaults(fn=cmd_postmaster)
+
     q = sub.add_parser("polling", help="re-poke an agent by mail on a clock (start/stop/list/status)")
     q.add_argument("rest", nargs=argparse.REMAINDER)
     q.set_defaults(fn=cmd_polling)
+
+    q = sub.add_parser("read-force",
+                       help="one-shot escape hatch for the read-wall PreToolUse hook")
+    q.add_argument("path")
+    q.set_defaults(fn=cmd_read_force)
 
     return ap
 
