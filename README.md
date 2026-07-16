@@ -188,15 +188,20 @@ the wall was there.
 One file per agent, so each file has exactly one writer and there is no
 read-modify-write race to lose — the same race that once cost us mail. The single
 view is a *derived* one, `af ledger`, which joins the specs against the live world
-(tmux for aliveness, the session log for context size, the mailbox for unread):
+(tmux for aliveness, the session log for context size and for the model that actually
+answered the last turn — not the spec's, which goes stale after a runtime `/model`
+switch — the mailbox for unread, squad.json for the compact count, and the warden's own
+on-disk timestamp for when it next sweeps):
 
 ```
 $ af ledger
-NAME       ROLE           MODEL    PARENT        CTX  MAIL STATE  SESSION
-orc        orchestrator   opus     -           142k     0 idle   ● alive
-eval       evaluation     sonnet   orc          38k     2 busy   ● alive  [wall]
-abl1       ablation       haiku    orc          91k     0 idle   ● alive  [wall]
-abl2       ablation       haiku    orc            -     1 -      ○ down (revivable)
+NAME       ROLE           MODEL                      PARENT        CTX  MAIL STATE  CMP SESSION
+orc        orchestrator   claude-opus-4-8            -           142k     0 idle      1 ● alive
+eval       evaluation     claude-sonnet-5            orc          38k     2 busy      0 ● alive  [wall]
+abl1       ablation       claude-haiku-4-5-20251001  orc          91k     0 idle      2 ● alive  [wall]
+abl2       ablation       claude-haiku-4-5-20251001  orc            -     1 -         0 ○ down (revivable)
+
+[af] next warden sweep: 214s
 ```
 
 `af line up` is also idempotent now: a station that is already running is left alone.
@@ -235,7 +240,7 @@ compact [name]       run /compact to shrink context (idle only; your call past ~
 remote [name]        (re)launch with Remote Control — drive it from the Claude web/app
 revive [name] [id]   relaunch a downed agent with its memory AND its role/hooks/model
 revivable            list downed agents (surviving log) you can revive by name
-ledger               one view of the line: role, model, ctx, unread mail, alive?
+ledger               one view of the line: role, model, ctx, unread mail, compacts, alive?
 screen [name]        dump the current TUI screen
 keys [name] <keys>   send raw tmux keys (Escape, C-c, …)
 attach [name]        print the tmux attach command for a human viewer

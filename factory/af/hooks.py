@@ -898,6 +898,8 @@ def session_start() -> int:
         from . import roster
         if roster.get(who, p) is not None:
             roster.set_live_sid(who, sid, p)
+            if str(payload.get("source") or "") == "compact":
+                roster.bump_compacts(who, p)
     except Exception:
         pass
     return 0
