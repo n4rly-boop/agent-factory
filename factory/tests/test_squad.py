@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from support import TempFactory   # imported first: it puts the af package on sys.path
@@ -272,6 +273,84 @@ class AddRemove(TempFactory):
         with mock.patch("af.squad.lifecycle.down") as down:
             self.assertEqual(squad.cmd_remove(str(f), "a"), 1)
             down.assert_not_called()
+
+    def test_down_stops_the_squads_daemons_not_only_its_stations(self):
+        # up starts warden+postmaster WITH the squad; down must stop them, or they outlive
+        # the team and loop over a roster of dead stations forever.
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"}}})
+        with mock.patch("af.squad.lifecycle.down"), \
+             mock.patch("af.warden.stop") as wstop, \
+             mock.patch("af.postmaster.stop") as pstop:
+            self.assertEqual(squad.cmd_down(f), 0)
+        wstop.assert_called_once()
+        pstop.assert_called_once()
+
+
+class AutoSlug(TempFactory):
+    """A fresh `up` must not sit on top of a DIFFERENT squad's slug — same slug means shared
+    mailboxes, specs and state, i.e. another team's unread mail under a brand-new orc. When
+    the base slug belongs to someone else, bump to base1/base2/…; when it is free or already
+    ours, keep it so re-runs and --resume are unaffected."""
+
+    def _bp_for(self, slug):
+        return _bp(self.root, {"slug": slug, "agents": {"a": {"role": "worker"}}})
+
+    def _occupy(self, slug, blueprint_path):
+        # Make `slug` look like a live OTHER squad: a squad.json whose recorded blueprint is
+        # some other path.
+        p = squad._p(slug)
+        roster.set_meta(blueprint_path, 1, p)
+
+    def test_free_base_slug_is_used_unchanged(self):
+        f = self._bp_for("proj")
+        self.assertEqual(squad._resolve_slug("proj", str(Path(f).resolve())),
+                         "proj")
+
+    def test_a_slug_owned_by_another_squad_is_bumped(self):
+        f = self._bp_for("proj")
+        self._occupy("proj", "/some/other/blueprint.json")
+        got = squad._resolve_slug("proj", str(Path(f).resolve()))
+        self.assertEqual(got, "proj1")
+
+    def test_our_own_slug_is_reused_not_bumped(self):
+        f = self._bp_for("proj")
+        resolved = str(Path(f).resolve())
+        self._occupy("proj", resolved)                 # recorded blueprint == ours
+        self.assertEqual(squad._resolve_slug("proj", resolved), "proj")
+
+    def test_walks_past_several_foreign_slugs(self):
+        f = self._bp_for("proj")
+        resolved = str(Path(f).resolve())
+        self._occupy("proj", "/other/a.json")
+        self._occupy("proj1", "/other/b.json")
+        self.assertEqual(squad._resolve_slug("proj", resolved), "proj2")
+
+    def test_status_down_heal_resolve_to_the_bumped_slug(self):
+        # The team lives under proj1; commands driven by the same blueprint must find proj1,
+        # not the foreign proj.
+        f = self._bp_for("proj")
+        resolved = str(Path(f).resolve())
+        self._occupy("proj", "/other/a.json")
+        self._occupy("proj1", resolved)                # ours, bumped
+        stations = squad.plan(f)
+        self.assertEqual(squad._effective_paths(f, stations).slug, "proj1")
+
+    def test_ours_wins_over_a_freed_base_slug(self):
+        # The orphaning bug: foreign squad forced us to proj1, then the foreign proj is torn
+        # down (its squad.json deleted) so proj falls free. down/status/heal must STILL find
+        # our team at proj1 — a "first free or ours" walk would grab the now-free proj and
+        # leave the live proj1 team unaddressable.
+        f = self._bp_for("proj")
+        resolved = str(Path(f).resolve())
+        self._occupy("proj1", resolved)                # ours, bumped; proj has NO squad.json
+        self.assertEqual(squad._resolve_slug("proj", resolved), "proj1")
+        stations = squad.plan(f)
+        self.assertEqual(squad._effective_paths(f, stations).slug, "proj1")
+
+    def test_a_fresh_up_still_takes_the_free_base_when_nothing_is_ours(self):
+        # No team of ours anywhere → the base is free and must be used, not bumped.
+        f = self._bp_for("proj")
+        self.assertEqual(squad._resolve_slug("proj", str(Path(f).resolve())), "proj")
 
 
 if __name__ == "__main__":

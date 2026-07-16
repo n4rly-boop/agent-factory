@@ -277,7 +277,13 @@ def loop(agent: str, p: Paths | None = None) -> int:
         # for out of the agent's context, forever.
         body = msg + (FIRST_TICK_HINT.format(mins=mins) if sent == 0 else "")
         try:
-            mailbox.send(agent, body, kind=kind, frm=frm, p=p)
+            # Keyed on the TICK NUMBER, which is the thing a retry repeats. The counter is
+            # persisted only after a successful send, so a timer killed in between (or one
+            # whose ring raised after the letter had already landed) re-enters this loop with
+            # the same `sent` and would append the same alarm twice. Same key, same tick, one
+            # letter.
+            mailbox.send(agent, body, kind=kind, frm=frm, p=p,
+                         dedup_key=f"poll:{agent}:{sid}:{sent}")
             drive.ring(agent, p)
         except (OSError, ValueError) as e:
             _log(agent, f"send failed ({e}) — retrying next tick", p)

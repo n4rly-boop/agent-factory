@@ -48,6 +48,7 @@ SUBMIT_SETTLE = 0.5
 POLL = 0.5             # the wait loops' tick — `to*2` iterations of it, as in bash
 IDLE_SETTLE_TICKS = 4  # wait: consecutive non-busy reads before we call it DONE
 BOOT_SETTLE = 3.0      # up: let the TUI finish booting before the doorbell types into it
+RING_DEBOUNCE = 120.0  # ring: how long a just-fired doorbell suppresses another (see ring)
 
 DEFAULT_SOFT = 200000
 DEFAULT_HARD = 500000
@@ -195,24 +196,40 @@ def ring(agent: str, p: Paths | None = None) -> bool:
     if phase == "permission":
         return False
 
-    # DEDUP. Typing the doorbell at a BUSY agent QUEUES it to fire at the turn boundary —
-    # and each queued `!…read` is its OWN model turn. N sends during one long turn queue N
-    # doorbells; the first reads ALL unread, the rest fire empty turns. So if a doorbell is
-    # already queued (marker set) and the agent is still busy, don't queue another: the one
-    # in flight will deliver this message too. An IDLE agent is always rung — it needs the
-    # nudge, and its read clears the marker. (Cheap best-effort marker; a lost race just
-    # costs one extra doorbell, never a lost message.)
-    busy = phase == "generating"
-    if busy and p.ring_pending(agent).is_file():
-        return True
+    # DEDUP. Each doorbell is its OWN model turn, and the FIRST one to land reads ALL unread
+    # mail — so every doorbell typed between one being queued and the recipient reading is a
+    # guaranteed-empty turn. The marker means "a doorbell is in flight, not yet consumed";
+    # while it stands, another buys nothing. `mailbox.read` clears it on every non-peek read
+    # (even one that found the box empty), so the common case retires it fast.
+    #
+    # It is checked for an IDLE agent TOO — that is the fix. The old code marked only a BUSY
+    # agent, reasoning an idle one needs the nudge. But a just-rung agent reads as idle (the
+    # pane has not painted its timer yet — see the comment below), so ring #1 left no marker
+    # and the sender, plus the postmaster's 5-second ring-catch (unread still >0, the read
+    # not yet landed), rang again and again. Observed: four `!…read` in one orc's pane, three
+    # answering "no new mail".
+    #
+    # But the marker is AGE-BOUNDED, because "clear on read" is not enough on its own: an
+    # agent killed in the window between the doorbell firing and its read leaves a marker no
+    # read will ever retire, and an unbounded one would then silence that mailbox FOREVER —
+    # trading the spam for stranded mail, the worse failure. A real doorbell is consumed at
+    # the next turn boundary (seconds when idle, up to a long turn when busy); RING_DEBOUNCE
+    # is the ceiling on that. Past it, ring anyway — at most one extra doorbell per two
+    # minutes on a genuinely long turn, versus mail lost for good.
+    marker = p.ring_pending(agent)
+    try:
+        if marker.is_file() and (time.time() - marker.stat().st_mtime) < RING_DEBOUNCE:
+            return True
+    except OSError:
+        pass
 
     def _queued() -> bool:
-        """Record that a doorbell is now queued into a busy agent, so the next send skips."""
-        if busy:
-            try:
-                p.ring_pending(agent).write_text("1", encoding="utf-8")
-            except OSError:
-                pass
+        """Record that a doorbell is now in flight, so the next send skips until it is read
+        (or until RING_DEBOUNCE lapses, whichever comes first)."""
+        try:
+            p.ring_pending(agent).write_text("1", encoding="utf-8")
+        except OSError:
+            pass
         return True
 
     tmux.send_keys(tgt, "C-u")

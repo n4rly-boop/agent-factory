@@ -11,6 +11,8 @@ tmux is mocked throughout: nothing here touches a live pane.
 
 from __future__ import annotations
 
+import os
+import time
 import unittest
 from unittest import mock
 
@@ -149,9 +151,11 @@ class Doorbell(TempFactory):
 
 
 class DoorbellDedup(TempFactory):
-    """One doorbell per busy period. Each `!…read` queued at a busy agent is its own model
-    turn; the first reads ALL unread, so a second is a wasted empty turn. This is what made
-    a chatty line look like it was spamming its agents with mail-reads."""
+    """One doorbell per in-flight period, busy OR idle. Each `!…read` is its own model turn
+    and the first reads ALL unread, so any second before the recipient reads is a wasted
+    empty turn — the spam a chatty squad showed (four `!…read` in one pane, three empty). The
+    marker suppressing it is age-bounded so a pane that dies before reading cannot silence
+    its mailbox forever."""
 
     def _literal(self, sk):
         return [c.args[1] for c in sk.call_args_list if c.kwargs.get("literal")]
@@ -170,10 +174,29 @@ class DoorbellDedup(TempFactory):
             self.assertTrue(drive.ring("worker", self.p))          # second: skipped
             self.assertEqual(self._literal(sk), [])                # nothing typed
 
-    def test_an_idle_agent_is_always_rung_even_with_a_stale_marker(self):
-        # An idle agent needs the nudge regardless — and its read will clear the marker.
+    def test_a_just_rung_idle_agent_is_not_rung_again(self):
+        # The spam case: a just-rung agent reads as idle (timer not yet painted). The fresh
+        # marker must suppress the second ring, or the postmaster's 5s ring-catch re-rings it.
         self.p.cap("worker").write_text("")
-        self.p.ring_pending("worker").write_text("1")
+        with mock.patch("af.tmux.has_session", return_value=True), \
+             mock.patch("af.tmux.capture_pane", return_value=IDLE), \
+             mock.patch("af.tmux.send_keys", return_value=True) as sk, \
+             mock.patch("af.tmux.send_enter", return_value=True), \
+             mock.patch("time.sleep"):
+            self.assertTrue(drive.ring("worker", self.p))          # first: rings + marks
+            self.assertTrue(self.p.ring_pending("worker").is_file())
+            sk.reset_mock()
+            self.assertTrue(drive.ring("worker", self.p))          # second: skipped
+            self.assertEqual(self._literal(sk), [])
+
+    def test_a_stale_marker_does_not_silence_the_mailbox(self):
+        # A pane killed between the doorbell and its read leaves a marker no read will clear.
+        # Past RING_DEBOUNCE it must be ignored, or that mailbox is stranded forever.
+        self.p.cap("worker").write_text("")
+        marker = self.p.ring_pending("worker")
+        marker.write_text("1")
+        old = time.time() - drive.RING_DEBOUNCE - 1
+        os.utime(marker, (old, old))
         with mock.patch("af.tmux.has_session", return_value=True), \
              mock.patch("af.tmux.capture_pane", return_value=IDLE), \
              mock.patch("af.tmux.send_keys", return_value=True) as sk, \
@@ -181,16 +204,6 @@ class DoorbellDedup(TempFactory):
              mock.patch("time.sleep"):
             self.assertTrue(drive.ring("worker", self.p))
         self.assertIn("!bash $AF_MAIL read", self._literal(sk))
-
-    def test_an_idle_ring_does_not_set_the_marker(self):
-        self.p.cap("worker").write_text("")
-        with mock.patch("af.tmux.has_session", return_value=True), \
-             mock.patch("af.tmux.capture_pane", return_value=IDLE), \
-             mock.patch("af.tmux.send_keys", return_value=True), \
-             mock.patch("af.tmux.send_enter", return_value=True), \
-             mock.patch("time.sleep"):
-            drive.ring("worker", self.p)
-        self.assertFalse(self.p.ring_pending("worker").is_file())
 
     def test_reading_clears_the_pending_marker_even_with_no_new_mail(self):
         # The doorbell that triggered the read has fired; a stuck marker would silence the

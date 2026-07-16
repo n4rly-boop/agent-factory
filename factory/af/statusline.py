@@ -40,11 +40,12 @@ def save_limits(rate_limits: dict, state: Path) -> None:
     os.replace(tmp, state / "limits.json")
 
 
-def render(d: dict, now: int | None = None) -> str:
+def render(d: dict, now: int | None = None, ident: dict[str, str] | None = None) -> str:
     now = int(time.time()) if now is None else now
     rl = d.get("rate_limits") or {}
-    agent = os.environ.get("AF_AGENT") or "agent"
-    role = os.environ.get("AF_ROLE") or ""
+    src = ident if ident is not None else os.environ
+    agent = src.get("AF_AGENT") or "agent"
+    role = src.get("AF_ROLE") or ""
     model = ((d.get("model") or {}).get("display_name")) or ""
     ctx = d.get("context_window") or {}
     used = ctx.get("used_tokens") or ctx.get("used") or 0
@@ -66,15 +67,37 @@ def render(d: dict, now: int | None = None) -> str:
     return " | ".join(bits)
 
 
-def _state() -> Path:
+def _state(slug: str = "") -> Path:
     # AF_SLUG defaults to the literal "proj" here, exactly as statusline.sh does — never
     # derived from the cwd, or the limits file lands in a state dir the warden does not read.
+    # An argv slug wins over the env's: after a fork onto a pooled process $AF_SLUG can name
+    # another squad, and limits.json is what the warden reads to time the 5-hour rescue.
     # TODO(merge): same fallback as hooks._state_paths; belongs on Paths.from_env.
     from .paths import paths
-    return paths(os.environ.get("AF_SLUG") or "proj").state
+    return paths(slug or os.environ.get("AF_SLUG") or "proj").state
+
+
+def _ident(argv: list[str]) -> tuple[str, dict[str, str] | None]:
+    """`<slug> <agent>` from the settings file, resolved against that agent's spec — the same
+    fork-proof identity the hooks use, and for the same reason (af.hooks._bind_identity).
+    Returns (slug, vars-or-None); None means "no args, fall back to the environment"."""
+    if len(argv) < 2:
+        return "", None
+    slug, agent = argv[0], argv[1]
+    try:
+        from . import spec as specmod
+        from .paths import paths
+        sp = specmod.read(agent, paths(slug))
+    except Exception:
+        return slug, None
+    d = {k: v for k, v in (sp.env or {}).items() if v}
+    d["AF_AGENT"] = agent
+    return slug, d
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    slug, ident = _ident(argv)
     try:
         raw = sys.stdin.read()
     except Exception:
@@ -87,10 +110,10 @@ def main(argv: list[str] | None = None) -> int:
         rl = d.get("rate_limits") or {}
         if rl:
             try:
-                save_limits(rl, _state())
+                save_limits(rl, _state(slug))
             except Exception:
                 pass          # the drop is best-effort; the LINE is not optional
-        line = render(d)
+        line = render(d, ident=ident)
     except Exception:
         line = ""
     sys.stdout.write(line or "agent")

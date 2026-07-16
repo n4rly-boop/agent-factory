@@ -127,7 +127,55 @@ def _drain() -> None:
         pass
 
 
+# The agent's OWN AF_* vars, read from its spec — or None, meaning "nothing better than the
+# inherited environment". Bound once per hook run by `main`, from the `<slug> <name>` argv the
+# agent's settings file carries.
+#
+# WHY NOT JUST THE ENVIRONMENT. A hook's env is whatever process ran it, and that process is
+# not always the one `squad up` spawned. Claude Code forks a session (compaction, resume) by
+# claiming a process from a MACHINE-GLOBAL spare pool, and that pool inherits the env of
+# whichever session first started the daemon — which may be a DIFFERENT squad's agent, or a
+# squad that died hours ago. Observed live: the `inna` orc forked at 16:14 onto a spare
+# descended from a daemon started at 02:23 inside the `aae1` orc's pane, and every hook after
+# that fork read AF_SLUG=aae1, AF_PEERS=eval,annotator, AF_WORK=<aae1's dir>. The agent kept
+# its correct brief and mailbox (those come from the pane's own shell) while its hooks judged
+# it as a station of a dead squad — a delegate-wall measuring writes against the wrong work
+# dir, a spawn-gate reading the wrong role.
+#
+# So identity may not be inherited: it must be looked up. `<slug> <name>` is baked into the
+# per-agent settings file at spawn (Claude Code passes it through as argv), and the spec at
+# $AF_SPECROOT/<slug>/agent-<name>.json is the file `up` wrote for THIS agent. Neither can be
+# swapped by a fork.
+_IDENT: dict[str, str] | None = None
+_IDENT_SLUG: str = ""
+
+
+def _bind_identity(slug: str, agent: str) -> None:
+    """Resolve this hook run's AF_* from the named agent's spec, not from the inherited env.
+
+    A spec we cannot read leaves `_IDENT` None — the env fallback, i.e. the old behaviour.
+    That is deliberate: the args are still trusted for slug/agent (they came from the
+    settings file), but inventing a role/wall for an agent whose constitution is missing
+    would be worse than the leak this function exists to close. `up` already refuses to
+    spawn, loudly, when a spec cannot be written.
+    """
+    global _IDENT, _IDENT_SLUG
+    _IDENT_SLUG = slug
+    try:
+        from . import spec as specmod
+        from .paths import paths as _paths
+        sp = specmod.read(agent, _paths(slug))
+    except Exception:
+        return
+    d = {k: v for k, v in (sp.env or {}).items() if v}
+    d["AF_AGENT"] = agent
+    d["AF_SLUG"] = slug
+    _IDENT = d
+
+
 def _env(k: str, default: str = "") -> str:
+    if _IDENT is not None:
+        return _IDENT.get(k) or default
     return os.environ.get(k) or default
 
 
@@ -151,7 +199,7 @@ def role_reminder() -> int:
     parent = _env("AF_PARENT", "orchestrator")
     # An orchestrator's parent is the human, not another orchestrator. Without this,
     # AF_PARENT's default makes the top station report to a station that does not exist.
-    if role == "orchestrator" and not os.environ.get("AF_PARENT"):
+    if role == "orchestrator" and not _env("AF_PARENT"):
         parent = ("the human, directly in chat (do NOT mail an 'orchestrator' — "
                   "no such station)")
     peers = _env("AF_PEERS")
@@ -265,7 +313,7 @@ def _bulk_lines() -> int:
     it here would have made the same blueprint behave differently under the two runtimes.
     Only non-numeric and negative values fall back to the default.
     """
-    v = (os.environ.get("AF_BULK_LINES") or "").strip()
+    v = _env("AF_BULK_LINES").strip()
     return intish(v, DEFAULT_BULK)
 
 
@@ -861,10 +909,16 @@ def _state_paths():
     limit-hook.sh and statusline.sh both default AF_SLUG to the literal "proj"; they never
     derive it from the cwd. Deriving it here would put the marker in a state dir the warden
     does not read.
+
+    The slug from argv wins over the env's, for the reason in _bind_identity: after a fork
+    onto a pooled process, $AF_SLUG can name a different squad entirely — and this function
+    picks the state dir the sid file, the limit marker and the roster live in. Writing those
+    under another squad's slug is not a cosmetic slip: session-start would stamp THIS agent's
+    live_sid onto the OTHER squad's roster row of the same name.
     # TODO(merge): belongs next to Paths.from_env as e.g. Paths.from_env(slug_default="proj").
     """
     from .paths import paths
-    return paths(os.environ.get("AF_SLUG") or "proj")
+    return paths(_IDENT_SLUG or os.environ.get("AF_SLUG") or "proj")
 
 
 # ======================================================================================
@@ -892,7 +946,11 @@ def escalation_stop() -> int:
     from . import mailbox
     from .paths import paths
 
-    p = paths()                                    # AF_SLUG, else slugify(basename(AF_CWD))
+    # If launched with `<slug> <agent>` args (identity bound), read that agent's mailbox under
+    # the argv slug — fork-proof, like every other hook. With no args this is the human
+    # orchestrator's own Stop: keep the env/cwd-derived slug, which is correct for it.
+    # (Not installed by settings_json today; this keeps it safe if a Stop hook is ever added.)
+    p = _state_paths() if _IDENT is not None else paths()
     who = _env("AF_AGENT", "orchestrator")         # unset in an orchestrator session
 
     if mailbox.unread(who, p) <= 0:
@@ -948,12 +1006,21 @@ HOOKS = {
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _IDENT, _IDENT_SLUG
+    _IDENT, _IDENT_SLUG = None, ""   # each call starts from the env; args (if any) rebind below
     argv = list(sys.argv[1:] if argv is None else argv)
     name = argv[0] if argv else ""
     fn = HOOKS.get(name)
     if fn is None:
-        print(f"usage: python3 -m af.hooks {{{'|'.join(HOOKS)}}}", file=sys.stderr)
+        print(f"usage: python3 -m af.hooks {{{'|'.join(HOOKS)}}} [<slug> <agent>]",
+              file=sys.stderr)
         return 64
+
+    # `<slug> <agent>`, as written into the agent's own settings file by squad.settings_json.
+    # Optional: a settings file generated before this existed passes nothing and gets the old
+    # env-derived behaviour. See _bind_identity for why the env alone cannot be trusted.
+    if len(argv) >= 3:
+        _bind_identity(argv[1], argv[2])
 
     try:
         return fn()
