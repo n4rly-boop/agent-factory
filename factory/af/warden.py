@@ -112,17 +112,22 @@ def logfile(p: Paths) -> Path:
 
 
 def last_sweep_file(p: Paths) -> Path:
-    # Just the epoch the last sweep CHECK ran (whether or not it found anything to compact) —
-    # so `af ledger` can read "seconds until the next one" off disk without signaling this
-    # process at all. `loop()`'s own `last_sweep` lives only in memory and resets to 0 on
-    # every warden restart; this file is the one externally-visible copy of it.
+    # "<epoch>:<interval>" for the last sweep CHECK (whether or not it found anything to
+    # compact) — so `af ledger` can read "seconds until the next one" off disk without
+    # signaling this process at all. The interval rides along because AI_SWEEP_EVERY is
+    # this WARDEN process's own env, fixed at its `watch` time — a reader in some other
+    # shell (ledger, a human) has no reason to share that value, and reading its own
+    # env instead silently reports the wrong number the moment the two differ (e.g. right
+    # after `AI_SWEEP_EVERY=60 af warden watch` from a shell that never exported it).
+    # `loop()`'s own `last_sweep` lives only in memory and resets to 0 on every warden
+    # restart; this file is the one externally-visible copy of it.
     return p.durable_state / "last-sweep"
 
 
-def _write_last_sweep(p: Paths, at: float) -> None:
+def _write_last_sweep(p: Paths, at: float, every: int) -> None:
     try:
         p.durable_state.mkdir(parents=True, exist_ok=True)
-        last_sweep_file(p).write_text(str(int(at)), encoding="utf-8")
+        last_sweep_file(p).write_text(f"{int(at)}:{every}", encoding="utf-8")
     except OSError:
         pass   # best-effort: a failed write only degrades ledger's ETA, never the sweep itself
 
@@ -135,10 +140,15 @@ def next_sweep_in(p: Paths) -> int | None:
     if not _live(_pid(p)):
         return None
     try:
-        last = int(last_sweep_file(p).read_text(encoding="utf-8").strip())
+        raw = last_sweep_file(p).read_text(encoding="utf-8").strip()
+        last_s, _, every_s = raw.partition(":")
+        last = int(last_s)
+        # every_s is "" for a file written before this field existed — fall back to OUR
+        # OWN env's default in that one case only; every write from here on carries it.
+        every = int(every_s) if every_s else sweep_every()
     except (OSError, ValueError):
         return None
-    return sweep_every() - (int(time.time()) - last)
+    return every - (int(time.time()) - last)
 
 
 def _standalone_pidfile(target: str) -> Path:
@@ -373,7 +383,7 @@ def loop(p: Paths) -> int:
         # busy or idle — no distinction is made.
         if not sweep_off() and time.time() - last_sweep >= every:
             last_sweep = time.time()
-            _write_last_sweep(p, last_sweep)
+            _write_last_sweep(p, last_sweep, every)
             healed = _heal_sids(p)          # correct the sid files BEFORE sweep reads them
             if healed:
                 log(healed, p)
