@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
 
 from support import TempFactory   # imported first: it puts the af package on sys.path
 
-from af import squad
+from af import roster, squad
 
 
 def _bp(tmp, doc: dict):
@@ -178,6 +179,99 @@ class Rendering(TempFactory):
         self.assertEqual(set(d["hooks"]),
                          {"SessionStart", "UserPromptSubmit", "PreToolUse", "StopFailure"})
         self.assertIn("statusLine", d)
+
+
+class DropFromBlueprint(TempFactory):
+    def test_removes_the_named_agent_and_rewrites_the_file(self):
+        f = _bp(self.root, {"slug": "s", "agents": {"a": {"role": "worker"},
+                                                     "b": {"role": "worker"}}})
+        self.assertTrue(squad._drop_from_blueprint(f, "a"))
+        doc = json.loads(open(f, encoding="utf-8").read())
+        self.assertEqual(set(doc["agents"]), {"b"})
+
+    def test_a_count_expanded_replica_is_not_a_literal_key(self):
+        # "w1" is what `count:` expands "w" into at plan() time — it never exists as a key
+        # in the blueprint itself, so there is nothing here to pop.
+        f = _bp(self.root, {"slug": "s", "agents": {"w": {"role": "worker", "count": 3}}})
+        self.assertFalse(squad._drop_from_blueprint(f, "w1"))
+        doc = json.loads(open(f, encoding="utf-8").read())
+        self.assertIn("w", doc["agents"])
+
+
+class AddRemove(TempFactory):
+    def test_add_unknown_name_is_fatal_and_spawns_nothing(self):
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"}}})
+        with mock.patch("af.squad.lifecycle.up") as up:
+            self.assertEqual(squad.cmd_add(f, "ghost"), 1)
+            up.assert_not_called()
+
+    def test_add_spawns_only_the_named_station_leaving_others_alone(self):
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"},
+                                                           "b": {"role": "worker"}}})
+        with mock.patch("af.squad.preflight", return_value=True), \
+             mock.patch("af.squad.hooks.hooks_ok", return_value=True), \
+             mock.patch("af.squad.lifecycle.up") as up, \
+             mock.patch("af.tmux.has_session", side_effect=[False, True]):
+            self.assertEqual(squad.cmd_add(f, "a"), 0)
+        up.assert_called_once()
+        self.assertEqual(up.call_args[0][0], "a")
+        self.assertEqual(roster.load(self.p).blueprint, str((self.root / "bp.json").resolve()))
+
+    def test_remove_unknown_name_errors_without_touching_anything(self):
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"}}})
+        with mock.patch("af.squad.lifecycle.down") as down:
+            self.assertEqual(squad.cmd_remove(f, "ghost"), 1)
+            down.assert_not_called()
+
+    def test_remove_kills_the_session_drops_roster_row_and_blueprint_entry(self):
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"},
+                                                           "b": {"role": "worker"}}})
+        roster.mark_up("a", self.p, role="worker")
+        with mock.patch("af.squad.lifecycle.down") as down:
+            self.assertEqual(squad.cmd_remove(f, "a"), 0)
+        down.assert_called_once_with("a", self.p)
+        self.assertIsNone(roster.get("a", self.p))
+        doc = json.loads(open(f, encoding="utf-8").read())
+        self.assertEqual(set(doc["agents"]), {"b"})
+
+    def test_remove_deletes_spec_settings_and_sid_so_ledger_and_revive_forget_it(self):
+        # `af down` deliberately keeps these — a station stays revivable. `remove` means
+        # gone: without the spec, `af ledger` (globs agent-*.json) stops listing it, and
+        # `af revive` refuses by default instead of resurrecting it from the manifest.
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"}}})
+        self.p.specdir.mkdir(parents=True, exist_ok=True)
+        self.p.spec_file("a").write_text("{}", encoding="utf-8")
+        self.p.settings_file("a").write_text("{}", encoding="utf-8")
+        self.p.sid_file("a").write_text("some-sid", encoding="utf-8")
+        with mock.patch("af.squad.lifecycle.down"):
+            self.assertEqual(squad.cmd_remove(f, "a"), 0)
+        self.assertFalse(self.p.spec_file("a").exists())
+        self.assertFalse(self.p.settings_file("a").exists())
+        self.assertFalse(self.p.sid_file("a").exists())
+
+    def test_add_on_an_already_running_station_is_not_an_error(self):
+        # "skipped" (already up) is the requested end-state already holding, not a
+        # failure — cmd_up doesn't count it as one, cmd_add shouldn't either.
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"}}})
+        with mock.patch("af.squad.preflight", return_value=True), \
+             mock.patch("af.squad.lifecycle.up") as up, \
+             mock.patch("af.tmux.has_session", return_value=True):
+            self.assertEqual(squad.cmd_add(f, "a"), 0)
+        up.assert_not_called()
+
+    def test_add_on_a_malformed_blueprint_is_fatal(self):
+        f = self.root / "bad.json"
+        f.write_text("{ not json", encoding="utf-8")
+        with mock.patch("af.squad.lifecycle.up") as up:
+            self.assertEqual(squad.cmd_add(str(f), "a"), 1)
+            up.assert_not_called()
+
+    def test_remove_on_a_malformed_blueprint_is_fatal(self):
+        f = self.root / "bad.json"
+        f.write_text("{ not json", encoding="utf-8")
+        with mock.patch("af.squad.lifecycle.down") as down:
+            self.assertEqual(squad.cmd_remove(str(f), "a"), 1)
+            down.assert_not_called()
 
 
 if __name__ == "__main__":

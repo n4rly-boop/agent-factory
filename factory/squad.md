@@ -24,11 +24,19 @@ af squad plan   blueprint.json   # resolved roles/hierarchy/models — no spawn.
 af squad up     blueprint.json   # generate briefs + settings, spawn every station (+ start the daemons)
 af squad status blueprint.json   # alive? context size? unread mail?
 af squad down   blueprint.json   # stop the team
+af squad add    blueprint.json <name>   # spawn ONE new station already in the blueprint — rest left alone
+af squad remove blueprint.json <name>   # kill it, drop it from the roster AND the blueprint
 af sweep                         # the context guard, on demand — the daemons also run it on a clock
 ```
 
 (`af squad up --resume blueprint.json` brings each station back **on its old session**,
 so a team keeps its memory across a respawn.)
+
+To grow or shrink a live team: edit `agents:` in the blueprint (add a station, or delete
+one by hand) then `af squad add blueprint.json <name>` / `af squad remove blueprint.json
+<name>`. `squad up` would also pick up a newly-added station on a re-run — it skips
+anyone already alive — but `add`/`remove` do it without touching, or printing a line
+about, every other station on the team.
 
 The blueprint is plain JSON — no third-party parser, so `af` stays stdlib-only:
 

@@ -11,6 +11,8 @@ enforced by hooks rather than hoped for.
     python3 -m af.squad up     [--resume] <bp>    briefs + settings + specs, then spawn
     python3 -m af.squad status <bp.json>          who's alive, context size, unread mail
     python3 -m af.squad down   <bp.json>          stop every station
+    python3 -m af.squad add    <bp.json> <name>   spawn ONE new station, rest untouched
+    python3 -m af.squad remove <bp.json> <name>   kill it, drop it from roster + blueprint
     python3 -m af.squad settings <slug> <name> <out>   regenerate one settings file
 
 The blueprint is plain JSON — `af` is stdlib-only on purpose (it runs inside agents' panes
@@ -441,6 +443,70 @@ def _resume_flag(st: Station, p: Paths) -> tuple[str, str]:
     return "", ""
 
 
+def _spawn_station(st: Station, p: Paths, bp: str, bulk: int, resume: bool) -> str:
+    """Bring up ONE station. Shared by `up` (every station in the blueprint) and `add` (one
+    named station added to an already-running squad) so the two never drift apart on what
+    "spawn" means. Returns "spawned" | "skipped" (already running) | "failed"."""
+    dlabel = {"required": "  [wall]", "advised": "  [advise]"}.get(st.delegate, "")
+    # `up` kills any existing session for the name before relaunching. Run `squad up` twice
+    # — a habit, after an edit to one station's brief — and it would tear down the whole
+    # live squad, every agent's TUI, mid-task. Alive stays alive.
+    if tmux.has_session(p.session(st.name)):
+        # Left alone means NOTHING was applied: not the brief, not the settings, not the
+        # spec. Say that. Reporting "already running" next to a blueprint you just edited
+        # reads as "your edit is live", and it is not.
+        print(f"[squad] {st.name:<10} {st.role:<14} {st.model or 'default':<8} already "
+              f"running — LEFT ALONE (blueprint edits NOT applied)")
+        print(f"[squad]            to apply them:  af down {st.name} && af squad up {bp}")
+        if not p.spec_file(st.name).is_file():
+            print(f"[squad]            ⚠ it has no spec (spawned by an older version) — it "
+                  f"would revive with NO role and NO hooks")
+        return "skipped"
+
+    ep = write_entrypoint(st, bulk)
+    stf = p.settings_file(st.name)
+    write_settings(st.slug, st.name, stf)
+    if not hooks.hooks_ok(stf):
+        # preflight already passed, so this is the belt: a settings file that installs no
+        # runnable hook is an agent with no wall and nothing saying so.
+        print(f"[squad] FATAL: settings for {st.name} install hooks that would FAIL OPEN "
+              f"({stf}) — not spawning it.", file=sys.stderr)
+        return "failed"
+
+    rflag, sid = _resume_flag(st, p) if resume else ("", "")
+    flags = (f"{rflag}--settings {stf} "
+             f"{f'--model {st.model} ' if st.model else ''}"
+             f"--append-system-prompt {shlex.quote(sysprompt(st, ep))} "
+             f"{os.environ.get('AI_CLAUDE_FLAGS', '')}").strip()
+
+    env = dict(os.environ)
+    env.update({
+        "AF_SLUG": st.slug, "AF_ROLE": st.role, "AF_PARENT": st.parent, "AF_PEERS": st.peers,
+        "AF_DELEGATE": st.delegate, "AF_BULK_LINES": str(bulk), "AF_CAVEMAN": st.caveman,
+        "AF_WORK": st.work,
+        "AI_COMPACT_SOFT": st.soft or os.environ.get("AI_COMPACT_SOFT", "") or "200000",
+        "AI_COMPACT_HARD": st.hard or os.environ.get("AI_COMPACT_HARD", "") or "500000",
+        "AI_CLAUDE_FLAGS": flags,
+        "AI_NOTIFY_OFF": "1",
+    })
+    # lifecycle.up narrates a spawn (`ai up` did too, and squad.sh threw it away with
+    # >/dev/null 2>&1). Its stdout is noise here — but its stderr is NOT: those are the
+    # "spec could not be written / it will revive with no wall" warnings, and bash was
+    # silently eating them. They go to the operator.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        lifecycle.up(st.name, p, env)
+
+    if tmux.has_session(p.session(st.name)):
+        tail = f"{'← ' + st.parent if st.parent else ''}{dlabel}" \
+               f"{f'  [resumed {sid}]' if rflag else ''}"
+        print(f"[squad] {st.name:<10} {st.role:<14} {st.model or 'default':<8} {tail}")
+        return "spawned"
+    print(f"[squad] {st.name:<10} FAILED TO LAUNCH — check: python3 -m af up {st.name}")
+    sys.stderr.write(buf.getvalue())
+    return "failed"
+
+
 def cmd_up(bp: str, resume: bool = False) -> int:
     if not preflight():
         return 1
@@ -460,65 +526,11 @@ def cmd_up(bp: str, resume: bool = False) -> int:
     n = skipped = 0
 
     for st in stations:
-        dlabel = {"required": "  [wall]", "advised": "  [advise]"}.get(st.delegate, "")
-        # `up` kills any existing session for the name before relaunching. Run `squad up` twice
-        # — a habit, after an edit to one station's brief — and it would tear down the whole
-        # live squad, every agent's TUI, mid-task. Alive stays alive.
-        if tmux.has_session(p.session(st.name)):
-            # Left alone means NOTHING was applied: not the brief, not the settings, not the
-            # spec. Say that. Reporting "already running" next to a blueprint you just edited
-            # reads as "your edit is live", and it is not.
-            print(f"[squad] {st.name:<10} {st.role:<14} {st.model or 'default':<8} already "
-                  f"running — LEFT ALONE (blueprint edits NOT applied)")
-            print(f"[squad]            to apply them:  af down {st.name} && af squad up {bp}")
-            if not p.spec_file(st.name).is_file():
-                print(f"[squad]            ⚠ it has no spec (spawned by an older version) — it "
-                      f"would revive with NO role and NO hooks")
-            skipped += 1
-            continue
-
-        ep = write_entrypoint(st, bulk)
-        stf = p.settings_file(st.name)
-        write_settings(slug, st.name, stf)
-        if not hooks.hooks_ok(stf):
-            # preflight already passed, so this is the belt: a settings file that installs no
-            # runnable hook is an agent with no wall and nothing saying so.
-            print(f"[squad] FATAL: settings for {st.name} install hooks that would FAIL OPEN "
-                  f"({stf}) — not spawning it.", file=sys.stderr)
-            continue
-
-        rflag, sid = _resume_flag(st, p) if resume else ("", "")
-        flags = (f"{rflag}--settings {stf} "
-                 f"{f'--model {st.model} ' if st.model else ''}"
-                 f"--append-system-prompt {shlex.quote(sysprompt(st, ep))} "
-                 f"{os.environ.get('AI_CLAUDE_FLAGS', '')}").strip()
-
-        env = dict(os.environ)
-        env.update({
-            "AF_SLUG": slug, "AF_ROLE": st.role, "AF_PARENT": st.parent, "AF_PEERS": st.peers,
-            "AF_DELEGATE": st.delegate, "AF_BULK_LINES": str(bulk), "AF_CAVEMAN": st.caveman,
-            "AF_WORK": st.work,
-            "AI_COMPACT_SOFT": st.soft or os.environ.get("AI_COMPACT_SOFT", "") or "200000",
-            "AI_COMPACT_HARD": st.hard or os.environ.get("AI_COMPACT_HARD", "") or "500000",
-            "AI_CLAUDE_FLAGS": flags,
-            "AI_NOTIFY_OFF": "1",
-        })
-        # lifecycle.up narrates a spawn (`ai up` did too, and squad.sh threw it away with
-        # >/dev/null 2>&1). Its stdout is noise here — but its stderr is NOT: those are the
-        # "spec could not be written / it will revive with no wall" warnings, and bash was
-        # silently eating them. They go to the operator.
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            lifecycle.up(st.name, p, env)
-
-        if tmux.has_session(p.session(st.name)):
-            tail = f"{'← ' + st.parent if st.parent else ''}{dlabel}" \
-                   f"{f'  [resumed {sid}]' if rflag else ''}"
-            print(f"[squad] {st.name:<10} {st.role:<14} {st.model or 'default':<8} {tail}")
+        outcome = _spawn_station(st, p, bp, bulk, resume)
+        if outcome == "spawned":
             n += 1
-        else:
-            print(f"[squad] {st.name:<10} FAILED TO LAUNCH — check: python3 -m af up {st.name}")
-            sys.stderr.write(buf.getvalue())
+        elif outcome == "skipped":
+            skipped += 1
 
     # squad.json is the one file that also answers "where did this team come from, and
     # when": no separate line.json, no second writer to keep in sync.
@@ -550,6 +562,99 @@ def cmd_up(bp: str, resume: bool = False) -> int:
         postmaster.watch(p=p)
     for ln in out2.getvalue().splitlines():
         print(f"[squad] {ln}")
+    return 0
+
+
+def cmd_add(bp: str, name: str, resume: bool = False) -> int:
+    """Bring up ONE new station that already has an entry in the blueprint (someone edited
+    it in — a wizard, or by hand) but has never been spawned. Everyone else on the squad is
+    untouched: this is `squad up` narrowed to a single name, for when you don't want the
+    "already running — LEFT ALONE" line printed for the whole team just to add one agent."""
+    if not preflight():
+        return 1
+    try:
+        stations = plan(bp)
+    except SquadSpecError as e:
+        print(f"[squad] FATAL: {e}", file=sys.stderr)
+        return 1
+    st = next((s for s in stations if s.name == name), None)
+    if st is None:
+        print(f"[squad] FATAL: {name!r} is not a station in {bp} — add it under `agents:` "
+              f"first, then run `squad add` again.", file=sys.stderr)
+        return 1
+
+    p = _p(st.slug)
+    bulk = bulk_lines(bp)
+    outcome = _spawn_station(st, p, bp, bulk, resume)
+    if outcome == "failed":
+        return 1
+    if outcome == "spawned":
+        roster.set_meta(str(Path(bp).resolve()), int(time.time()), p)
+        print(f"[squad] talk to it:  af post {name} \"…\"")
+    return 0
+
+
+def _drop_from_blueprint(bp: str | Path, name: str) -> bool:
+    """Remove `name` from `agents:` so the blueprint stays the truth after `squad remove`.
+    Returns False (and leaves the file untouched) if `name` is not a literal key — which
+    happens when it is one replica of a `count:`-expanded entry, a group the schema has no
+    way to remove one member of.
+
+    Written via temp-file + os.replace, same as roster._write — a `squad remove` that dies
+    mid-write must not leave a half-written blueprint behind."""
+    path = Path(bp)
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise SquadSpecError(f"cannot read blueprint {bp} to remove {name!r}: {e}") from e
+    agents = doc.get("agents") or {}
+    if name not in agents:
+        return False
+    agents.pop(name)
+    doc["agents"] = agents
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return True
+
+
+def cmd_remove(bp: str, name: str) -> int:
+    """Take one station off the squad for good: kill its session, delete its spec/settings/sid
+    (not just mark it down — `af down` keeps those so the station stays revivable; `remove`
+    means gone, so `af ledger` — which lists agents by spec file — stops showing it, and `af
+    revive` refuses by default instead of resurrecting it from the manifest), drop its roster
+    row, and delete it from the blueprint so a later `squad up` never treats it as "left alone"
+    or `heal` as "crashed"."""
+    try:
+        stations = plan(bp)
+    except SquadSpecError as e:
+        print(f"[squad] FATAL: {e}", file=sys.stderr)
+        return 1
+    if not any(s.name == name for s in stations):
+        print(f"[squad] FATAL: {name!r} is not a station in {bp} — nothing to remove.",
+              file=sys.stderr)
+        return 1
+
+    slug = stations[0].slug
+    p = _p(slug)
+    with contextlib.redirect_stdout(io.StringIO()):
+        lifecycle.down(name, p)
+    p.spec_file(name).unlink(missing_ok=True)
+    p.settings_file(name).unlink(missing_ok=True)
+    p.sid_file(name).unlink(missing_ok=True)
+    roster.remove(name, p)
+    try:
+        dropped = _drop_from_blueprint(bp, name)
+    except SquadSpecError as e:
+        print(f"[squad] {name} removed — session killed, spec gone, dropped from roster. "
+              f"FATAL: could not update {bp}: {e}", file=sys.stderr)
+        return 1
+    if dropped:
+        print(f"[squad] {name} removed — session killed, dropped from roster and {bp}.")
+    else:
+        print(f"[squad] {name} removed — session killed, dropped from roster. NOT found as "
+              f"a literal key in {bp} (likely one replica of a `count:` group) — edit the "
+              f"blueprint by hand if you meant to drop it from there too.")
     return 0
 
 
@@ -609,6 +714,16 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("blueprint")
     q = sub.add_parser("down", help="stop every station on the squad")
     q.add_argument("blueprint")
+    q = sub.add_parser("add", help="spawn ONE new station already in the blueprint, "
+                                   "leaving the rest of the squad untouched")
+    q.add_argument("--resume", "--adopt", dest="resume", action="store_true",
+                   help="bring it back ON ITS OLD SESSION (memory kept)")
+    q.add_argument("blueprint")
+    q.add_argument("name")
+    q = sub.add_parser("remove", help="kill ONE station, drop it from the roster AND the "
+                                      "blueprint")
+    q.add_argument("blueprint")
+    q.add_argument("name")
     q = sub.add_parser("heal", help="diagnose every station and repair breakage without "
                                     "losing context (sid drift, stale settings, crashed agents)")
     q.add_argument("--dry-run", dest="dry_run", action="store_true",
@@ -635,6 +750,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(a.blueprint)
         if a.cmd == "down":
             return cmd_down(a.blueprint)
+        if a.cmd == "add":
+            return cmd_add(a.blueprint, a.name, a.resume)
+        if a.cmd == "remove":
+            return cmd_remove(a.blueprint, a.name)
         if a.cmd == "heal":
             return cmd_heal(a.blueprint, a.dry_run, a.restart_idle)
         if a.cmd == "settings":
