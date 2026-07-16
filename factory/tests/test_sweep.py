@@ -1,7 +1,7 @@
 """sweep: who must NOT be compacted, and when.
 
 Every skip rule here is a bug that shipped once. The tests are on the pure decision
-functions (skip_reason, compact_decision, resolve_thresholds) plus the reaper, with tmux
+functions (skip_reason, compact_decision, resolve_thresholds), with tmux
 mocked out — NO agent is spawned and no live pane is ever touched.
 """
 
@@ -80,8 +80,7 @@ class SkipRules(unittest.TestCase):
             sweepmod.skip_reason("w", _p(), last_compacted=now - 601, now=now, cooldown=600))
 
     def test_liveness_is_judged_before_the_cooldown(self):
-        # A down agent must report "down", not be excused as merely cooling: the reaper's
-        # decision depends on aliveness, and the two must not disagree.
+        # A down agent must report "down", not be excused as merely cooling.
         now = 1_000_000
         self.assertEqual(
             sweepmod.skip_reason("w", _p(alive=False), last_compacted=now, now=now), "down")
@@ -113,27 +112,22 @@ class Thresholds(unittest.TestCase):
     def test_zero_disables(self):
         soft, hard = drive.resolve_thresholds(0, 0, env={})
         self.assertEqual((soft, hard), (0, 0))
-        self.assertEqual(drive.compact_decision(9_000_000, 0, 0, False), "none")
+        self.assertEqual(drive.compact_decision(9_000_000, 0, 0), "none")
 
 
 class Decision(unittest.TestCase):
-    def test_soft_compacts_only_BETWEEN_tasks(self):
-        self.assertEqual(drive.compact_decision(250_000, 200_000, 500_000, False), "soft")
+    def test_soft_compacts_when_above_soft_threshold(self):
+        self.assertEqual(drive.compact_decision(250_000, 200_000, 500_000), "soft")
 
-    def test_soft_HOLDS_mid_task(self):
-        # A task spans many turns; compacting in the middle of one throws away the working
-        # state the agent still needs.
-        self.assertEqual(drive.compact_decision(250_000, 200_000, 500_000, True), "hold")
-
-    def test_hard_fires_mid_task_anyway(self):
+    def test_hard_fires_when_above_hard_threshold(self):
         # Losing some working state is bad; running out of context loses everything.
-        self.assertEqual(drive.compact_decision(600_000, 200_000, 500_000, True), "hard")
+        self.assertEqual(drive.compact_decision(600_000, 200_000, 500_000), "hard")
 
     def test_under_the_soft_threshold_nothing_happens(self):
-        self.assertEqual(drive.compact_decision(100, 200_000, 500_000, False), "none")
+        self.assertEqual(drive.compact_decision(100, 200_000, 500_000), "none")
 
     def test_an_agent_with_no_usage_yet_is_left_alone(self):
-        self.assertEqual(drive.compact_decision(0, 200_000, 500_000, False), "none")
+        self.assertEqual(drive.compact_decision(0, 200_000, 500_000), "none")
 
 
 class SpecThresholds(TempFactory):
@@ -148,38 +142,6 @@ class SpecThresholds(TempFactory):
     def test_a_missing_spec_answers_None_None_not_zero(self):
         # (None, None) means "unknown — use the env"; (0, 0) would mean "disabled".
         self.assertEqual(drive.spec_thresholds("nobody", self.p), (None, None))
-
-
-class Reaper(TempFactory):
-    """A `busy` flag whose agent no longer exists silently exempts that NAME from soft
-    compaction forever — and the next agent to take the name inherits the exemption."""
-
-    def test_a_stale_busy_flag_of_a_dead_agent_is_reaped(self):
-        self.p.task_flag("ghost").write_text("busy")
-        self.p.tasker("ghost").write_text("orchestrator")
-        with mock.patch("af.sweep.tmux.has_session", return_value=False):
-            sweepmod._reap(self.p)
-        self.assertFalse(self.p.task_flag("ghost").exists())
-        self.assertFalse(self.p.tasker("ghost").exists())
-
-    def test_a_LIVE_agents_busy_flag_is_left_alone(self):
-        self.p.task_flag("worker").write_text("busy")
-        self.p.tasker("worker").write_text("orchestrator")
-        with mock.patch("af.sweep.tmux.has_session", return_value=True):
-            sweepmod._reap(self.p)
-        self.assertTrue(self.p.task_flag("worker").exists())
-
-    def test_a_dead_agent_with_UNREAD_mail_keeps_its_flag(self):
-        # That flag is not garbage: it is a task legitimately QUEUED for an agent that is
-        # down (mail.sh promises it will be rung on the next up/revive). Reaping it would
-        # also destroy the tasker record its eventual `done` needs to clear the busy state.
-        from af import mailbox
-        mailbox.send("queued", "do the thing", kind="task", frm="orchestrator", p=self.p)
-        self.assertEqual(mailbox.unread("queued", self.p), 1)
-        with mock.patch("af.sweep.tmux.has_session", return_value=False):
-            sweepmod._reap(self.p)
-        self.assertEqual(self.p.task_flag("queued").read_text(), "busy")
-        self.assertTrue(self.p.tasker("queued").exists())
 
 
 class Lock(TempFactory):

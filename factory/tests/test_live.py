@@ -15,6 +15,7 @@ and must never be returned.
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -23,7 +24,7 @@ from unittest import mock
 
 from support import FACTORY   # noqa: F401 — imported first: puts the af package on sys.path
 
-from af import live
+from af import live, tmux as tmux_mod
 from af.paths import Paths
 
 FORK = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -112,6 +113,57 @@ class LiveSid(unittest.TestCase):
         self.assertEqual(self.sid("orc", "s", equals), SID)
 
 
+class Ps(unittest.TestCase):
+    """_ps — regression: a non-UTF-8 byte in ONE unrelated process' argv used to blow up
+    strict `text=True` decoding, and the bare `except Exception: return ""` around it then
+    blinded live_sid/reconcile/heal for every agent on the host, not just the odd one. `_ps`
+    must decode permissively (errors="replace") so the damage stays confined to that one
+    line."""
+
+    def test_a_non_utf8_byte_in_one_line_does_not_blank_the_whole_read(self):
+        # A stray process with an invalid UTF-8 continuation byte (\xe2 alone, no continuation)
+        # sitting next to an otherwise normal line. Old code: subprocess.run(text=True) raises
+        # UnicodeDecodeError here, the except swallows it, _ps() returns "".
+        bad = b"some-other-proc --flag \xe2 garbage-arg\n"
+        good = f"claude --session-id {SID} --settings {_settings('s', 'orc')}\n".encode()
+        raw = bad + good
+        with mock.patch(
+            "af.live.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=["ps"], returncode=0, stdout=raw),
+        ):
+            out = live._ps()
+        # Must not raise (already implied by reaching here) and must not come back empty.
+        self.assertNotEqual(out, "")
+        self.assertIn("�", out)  # the replacement character, not a swallowed exception
+
+    def test_the_bad_byte_does_not_corrupt_or_drop_an_unrelated_good_line(self):
+        bad = b"some-other-proc --flag \xe2 garbage-arg\n"
+        good = f"claude --session-id {SID} --settings {_settings('s', 'orc')}\n".encode()
+        raw = bad + good
+        with mock.patch(
+            "af.live.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=["ps"], returncode=0, stdout=raw),
+        ):
+            ps_out = live._ps()
+        # The unrelated bad line must not stop the real agent's line from parsing correctly
+        # once fed through the same helpers live_sid uses.
+        lines = live._agent_lines(ps_out, "s", "orc")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("settings-orc.json", lines[0])
+        d = tempfile.TemporaryDirectory(prefix="af-ps-proj-")
+        self.addCleanup(d.cleanup)
+        p = Paths(slug="s", root=Path(d.name), cwd=Path(d.name), mailroot=Path(d.name),
+                   specroot=Path(d.name))
+        with mock.patch("af.paths.PROJECTS", Path(d.name)):
+            self.assertEqual(live.live_sid("orc", p, ps_out=ps_out), SID)
+
+    def test_ps_raising_is_still_caught_and_returns_empty(self):
+        # A genuine failure to run ps at all (binary missing, timeout, etc.) is still handled
+        # by the outer except — only the UnicodeDecodeError path was ever the bug.
+        with mock.patch("af.live.subprocess.run", side_effect=OSError("no such file")):
+            self.assertEqual(live._ps(), "")
+
+
 class AgentLines(unittest.TestCase):
     """_agent_lines — the filter that decides which process lines belong to one agent."""
 
@@ -158,6 +210,146 @@ class Newest(unittest.TestCase):
 
     def test_an_empty_set_is_None(self):
         self.assertIsNone(live._newest(set(), self.proj))
+
+
+class PsTree(unittest.TestCase):
+    """_ps_tree — returns (pid, ppid, command) triples."""
+
+    def test_parses_pid_ppid_command(self):
+        raw = b"  12345     1 /usr/bin/claude --session-id abc\n  12346 12345 /usr/bin/python\n"
+        with mock.patch(
+            "af.live.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=["ps"], returncode=0, stdout=raw),
+        ):
+            result = live._ps_tree()
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], ("12345", "1", "/usr/bin/claude --session-id abc"))
+        self.assertEqual(result[1], ("12346", "12345", "/usr/bin/python"))
+
+    def test_empty_output_returns_empty_list(self):
+        raw = b""
+        with mock.patch(
+            "af.live.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=["ps"], returncode=0, stdout=raw),
+        ):
+            result = live._ps_tree()
+        self.assertEqual(result, [])
+
+    def test_non_utf8_byte_does_not_crash(self):
+        raw = b"  12345     1 /usr/bin/proc --arg \xe2\n"
+        with mock.patch(
+            "af.live.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=["ps"], returncode=0, stdout=raw),
+        ):
+            result = live._ps_tree()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "12345")
+
+    def test_ps_failure_returns_empty_list(self):
+        with mock.patch("af.live.subprocess.run", side_effect=OSError("no ps")):
+            self.assertEqual(live._ps_tree(), [])
+
+
+class ResolveSid(unittest.TestCase):
+    """_resolve_sid — the shared session-id resolution logic."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-resolve-")
+        self.addCleanup(self._tmp.cleanup)
+        self.proj = Path(self._tmp.name)
+
+    def test_fork_returns_fork_not_parent(self):
+        # fork is a session-id that is NOT anyone's resume target
+        self.assertEqual(
+            live._resolve_sid({FORK, PARENT}, {PARENT}, self.proj),
+            FORK,
+        )
+
+    def test_launcher_returns_resume_target(self):
+        # No session-id that is not a resume target -> the resume target IS live
+        self.assertEqual(
+            live._resolve_sid(set(), {SID}, self.proj),
+            SID,
+        )
+
+    def test_nothing_to_resolve_returns_none(self):
+        self.assertIsNone(
+            live._resolve_sid(set(), set(), self.proj),
+        )
+
+    def test_fresh_spawn_returns_its_session_id(self):
+        # session-id exists, no resume targets -> it is the live session
+        self.assertEqual(
+            live._resolve_sid({SID}, set(), self.proj),
+            SID,
+        )
+
+
+class PaneRootPid(unittest.TestCase):
+    """pane_root_pid — resolves the OS pid of a tmux pane's root process."""
+
+    def test_returns_first_pid(self):
+        with mock.patch.object(tmux_mod, "list_panes", return_value=["12345", "67890"]):
+            self.assertEqual(live.pane_root_pid("my-session"), "12345")
+
+    def test_returns_none_when_no_panes(self):
+        with mock.patch.object(tmux_mod, "list_panes", return_value=[]):
+            self.assertIsNone(live.pane_root_pid("my-session"))
+
+
+class SidInPane(unittest.TestCase):
+    """sid_in_pane — resolves the live session id from a pane's process tree."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-sid-pane-")
+        self.addCleanup(self._tmp.cleanup)
+        patcher = mock.patch("af.paths.PROJECTS", Path(self._tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_returns_session_id_from_descendant(self):
+        # Pane root pid 100, child 101 has --session-id
+        ps_text = f"100     1 /usr/bin/bash\n101   100 claude --session-id {SID}"
+        with mock.patch.object(live, "pane_root_pid", return_value="100"):
+            result = live.sid_in_pane("my-session", ps_out=ps_text)
+        self.assertEqual(result, SID)
+
+    def test_returns_resume_target_when_no_fork(self):
+        ps_text = f"100     1 /usr/bin/bash\n101   100 claude --resume {SID}"
+        with mock.patch.object(live, "pane_root_pid", return_value="100"):
+            result = live.sid_in_pane("my-session", ps_out=ps_text)
+        self.assertEqual(result, SID)
+
+    def test_returns_fork_not_parent(self):
+        ps_text = (
+            f"100     1 /usr/bin/bash\n"
+            f"101   100 claude --session-id {FORK} --fork-session --resume {PARENT}"
+        )
+        with mock.patch.object(live, "pane_root_pid", return_value="100"):
+            result = live.sid_in_pane("my-session", ps_out=ps_text)
+        self.assertEqual(result, FORK)
+
+    def test_returns_none_when_no_session_id(self):
+        ps_text = "100     1 /usr/bin/bash\n101   100 vim file.txt"
+        with mock.patch.object(live, "pane_root_pid", return_value="100"):
+            result = live.sid_in_pane("my-session", ps_out=ps_text)
+        self.assertIsNone(result)
+
+    def test_returns_none_when_pane_root_pid_is_none(self):
+        with mock.patch.object(live, "pane_root_pid", return_value=None):
+            result = live.sid_in_pane("my-session", ps_out="anything")
+        self.assertIsNone(result)
+
+    def test_walks_descendants_not_siblings(self):
+        # pid 200 is NOT a descendant of 100 (its ppid is 1, not 100)
+        ps_text = (
+            f"100     1 /usr/bin/bash\n"
+            f"101   100 claude --session-id {SID}\n"
+            f"200     1 other --session-id {OTHER}"
+        )
+        with mock.patch.object(live, "pane_root_pid", return_value="100"):
+            result = live.sid_in_pane("my-session", ps_out=ps_text)
+        self.assertEqual(result, SID)  # NOT OTHER
 
 
 if __name__ == "__main__":

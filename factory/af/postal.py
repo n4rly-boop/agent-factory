@@ -19,9 +19,9 @@ KINDS = ("task", "question", "blocked", "result", "done", "fyi")
 def post(to: str, body: str, kind: str = "", p: Paths | None = None) -> int:
     """Send mail to an agent and ring its doorbell.
 
-    The default kind is `task`, because that is what posting to an agent MEANS. It is also
-    the signal that marks the agent busy — without it `mid_task` is never true and
-    compaction happily runs in the middle of a multi-turn task.
+    The default kind is `task`, because that is what posting to an agent MEANS. It also
+    marks the agent busy in the ledger display — the busy/idle signal is purely
+    informational (used by `af ledger`); it no longer affects compaction at all.
     """
     p = p or paths()
     if not to:

@@ -1,8 +1,9 @@
 """The mailbox: the reliable channel between agents.
 
-On-disk format is fixed by mail.sh, which is still running against the same files:
+On-disk format (every `.sh` is a 6-line Python shim now; nothing but this module and
+`af.mailcli` ever opens these files):
 
-    <agent>.jsonl    one message per physical line: {id,ts,from,to,kind,body|body_file}
+    <agent>.jsonl    one message per physical line: {id,ts,from,to,kind,body|body_file,dedup?}
     <agent>.cursor   how many messages the agent has consumed. THE CURSOR IS THE ACK.
     blob/<id>.txt    the body of a message too big to append atomically
     state-<agent>    literal "busy" | "idle" — is it mid-TASK (not merely mid-turn)
@@ -17,12 +18,13 @@ measured on the ENCODED line and anything longer spills to a blob.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
 import sys
 import random
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,8 +32,8 @@ from pathlib import Path
 from .paths import Paths, paths
 
 BLOB_AT = 2000  # bytes of encoded line we consider safely atomic
-LOCK_SPINS = 50
-LOCK_SLEEP = 0.1
+LOCK_WAIT = 5.0    # seconds to wait for the flock before giving up
+LOCK_POLL = 0.05
 
 
 class MailboxLocked(Exception):
@@ -46,6 +48,7 @@ class Message:
     to: str
     kind: str
     body: str
+    dedup: str = ""
 
     @classmethod
     def parse(cls, line: str) -> "Message | None":
@@ -71,37 +74,44 @@ class Message:
             to=str(m.get("to", "")),
             kind=str(m.get("kind", "")),
             body=str(body),
+            dedup=str(m.get("dedup") or ""),
         )
 
 
 # --- the lock ---------------------------------------------------------------------
-# A mkdir-directory mutex, NOT fcntl.flock. This is not conservatism: bash and Python must
-# exclude EACH OTHER while both are live, and an flock does not exclude a mkdir-lock — the
-# two would sail straight through one another and the cursor (a read-modify-write) would be
-# rewound, re-delivering mail that was already acked. flock replaces this the day mail.sh
-# is gone, and not before. (fcntl.flock is fine for any NEW lock only Python ever holds.)
-def _lock(agent: str, p: Paths) -> bool:
-    d = p.mail_lock(agent)
-    d.parent.mkdir(parents=True, exist_ok=True)
-    for _ in range(LOCK_SPINS):
-        try:
-            d.mkdir()
-            return True
-        except FileExistsError:
-            time.sleep(LOCK_SLEEP)
-        except OSError:
-            return False
-    # A stale lock must not wedge the mailbox forever — take it after 5s.
-    shutil.rmtree(d, ignore_errors=True)
+# fcntl.flock, not a mkdir mutex. The mkdir mutex existed only to exclude a BASH writer —
+# an flock taken by Python is invisible to a bash process touching the same file, so the
+# two could sail past each other and rewind the cursor. Every `.sh` is now a 6-line Python
+# shim; nothing but this module opens these files, so a kernel-held flock is correct and
+# strictly better: it cannot go stale. The mkdir version needed a "steal it after 5s"
+# escape hatch for a holder that crashed mid-lock, and that escape hatch could ALSO steal
+# the lock out from under a holder that was merely slow, not dead — the exact class of bug
+# a squad.json review caught in the same pattern (see af.squad). flock is held by the OS
+# per file descriptor: it releases the instant the holding process exits or closes the fd,
+# crash or not, so there is no stale case to steal past — a bounded wait either succeeds or
+# reports a genuinely different live holder.
+@contextlib.contextmanager
+def _locked(agent: str, p: Paths):
+    path = p.mail_lock(agent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = path.open("w", encoding="utf-8")
     try:
-        d.mkdir()
-        return True
-    except OSError:
-        return False
-
-
-def _unlock(agent: str, p: Paths) -> None:
-    shutil.rmtree(p.mail_lock(agent), ignore_errors=True)
+        deadline = time.monotonic() + LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise MailboxLocked(
+                        f"mailbox of '{agent}' is locked by another reader — try again")
+                time.sleep(LOCK_POLL)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 # --- counting ---------------------------------------------------------------------
@@ -178,14 +188,31 @@ def stat(p: Paths | None = None) -> dict[str, int]:
 
 
 # --- send -------------------------------------------------------------------------
+def find_by_dedup(to: str, dedup_key: str, p: Paths) -> Message | None:
+    """The last message to `to` carrying this dedup key, if any — the primitive `send`'s
+    idempotent path checks before appending a duplicate."""
+    for m in dump(to, p):
+        if m.dedup == dedup_key:
+            return m
+    return None
+
+
 def send(to: str, body: str, kind: str = "fyi", frm: str | None = None,
-         p: Paths | None = None) -> Message:
+         p: Paths | None = None, dedup_key: str | None = None) -> Message:
     """Append a message to the recipient's mailbox and update the task bookkeeping.
 
     This is the file half of delivery only. The DOORBELL — the one fixed, path-free command
     typed into the recipient's pane — is a pane write, and lands with the rest of the tmux
     writers; until then, a message sent from Python is read on the recipient's next
-    `mail read` (which is exactly what mail.sh calls a QUEUED message).
+    `mail read` (which mail.sh, before it was a shim, called a QUEUED message).
+
+    `dedup_key`, when given, makes the send idempotent: a caller that might retry (a ring
+    re-attempted next tick, a wake re-sent after an ambiguous failure) passes a stable key,
+    and a second send with the same key for the same recipient returns the ALREADY-SENT
+    message instead of appending a duplicate. Checked and appended under the mailbox lock so
+    two concurrent deduped sends cannot both pass the check. Callers that never retry (the
+    overwhelming majority — a human `af post`, a model composing a fresh message) pass
+    nothing and pay no lock, no scan: the current lock-free atomic-append path is unchanged.
     """
     p = p or paths()
     if not to:
@@ -195,34 +222,47 @@ def send(to: str, body: str, kind: str = "fyi", frm: str | None = None,
     frm = frm or os.environ.get("AF_AGENT") or "orchestrator"
     kind = kind or "fyi"
 
-    p.blobdir.mkdir(parents=True, exist_ok=True)
-    ts = int(time.time())
-    msg_id = f"m-{ts}-{os.getpid()}-{random.randint(0, 32767)}"
+    def _append() -> Message:
+        p.blobdir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        msg_id = f"m-{ts}-{os.getpid()}-{random.randint(0, 32767)}"
 
-    def encode(key: str, val: str) -> str:
-        return json.dumps(
-            {"id": msg_id, "ts": ts, "from": frm, "to": to, "kind": kind, key: val},
-            ensure_ascii=False,
-            separators=(",", ":"),  # jq -c parity: same body, same blob-spill threshold
-        )
+        def encode(key: str, val: str) -> str:
+            d = {"id": msg_id, "ts": ts, "from": frm, "to": to, "kind": kind, key: val}
+            if dedup_key:
+                d["dedup"] = dedup_key
+            return json.dumps(
+                d, ensure_ascii=False,
+                separators=(",", ":"),  # jq -c parity: same body, same blob-spill threshold
+            )
 
-    line = encode("body", body)
-    if len(line.encode("utf-8")) > BLOB_AT:
-        blob = p.blob(msg_id)
-        blob.write_text(body, encoding="utf-8")
-        line = encode("body_file", str(blob))
+        line = encode("body", body)
+        if len(line.encode("utf-8")) > BLOB_AT:
+            blob = p.blob(msg_id)
+            blob.write_text(body, encoding="utf-8")
+            line = encode("body_file", str(blob))
 
-    with p.box(to).open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+        with p.box(to).open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
-    _mark_task(to, frm, kind, p)
-    return Message(id=msg_id, ts=ts, frm=frm, to=to, kind=kind, body=body)
+        _mark_task(to, frm, kind, p)
+        return Message(id=msg_id, ts=ts, frm=frm, to=to, kind=kind, body=body,
+                       dedup=dedup_key or "")
+
+    if not dedup_key:
+        return _append()
+
+    with _locked(to, p):
+        existing = find_by_dedup(to, dedup_key, p)
+        if existing is not None:
+            return existing
+        return _append()
 
 
 def _mark_task(to: str, frm: str, kind: str, p: Paths) -> None:
-    """The busy/idle flag files. A task goes out, a done/result comes back — that is what
-    tells a turn boundary from a TASK boundary, and compacting at the wrong one throws away
-    the working state the agent still needs.
+    """The busy/idle flag files. A task goes out, a done/result comes back — this
+    bookkeeping is used by `af ledger` to show whether an agent is busy or idle.
+    Compaction no longer consults these flags.
 
     done/result clears the SENDER's state only when it is answering the party that tasked
     it; clearing on any done/result would let a side-reply to a peer mark an agent idle
@@ -258,9 +298,7 @@ def read(agent: str | None = None, peek: bool = False,
     agent = agent or os.environ.get("AF_AGENT") or "orchestrator"
     p.mailroot.mkdir(parents=True, exist_ok=True)
 
-    if not _lock(agent, p):
-        raise MailboxLocked(f"mailbox of '{agent}' is locked by another reader — try again")
-    try:
+    with _locked(agent, p):
         box = p.box(agent)
         cur = _read_cursor(agent, p)
         tot = _lines(box)
@@ -274,8 +312,6 @@ def read(agent: str | None = None, peek: bool = False,
             return []
         if not peek:
             p.cursor(agent).write_text(str(tot), encoding="utf-8")
-    finally:
-        _unlock(agent, p)
 
     out, dropped = [], 0
     for line in _split(box)[cur:tot]:
@@ -330,9 +366,8 @@ def task_state(agent: str, p: Paths | None = None) -> str:
     """Is the agent mid-TASK, folded out of the mail itself: the last `task` addressed TO it,
     versus the `done`/`result` it sent BACK to whoever tasked it.
 
-    The flag file is a cache of this, and a cache an interrupted `send` or a purged /tmp can
-    strand: a stale `busy` silently exempts a name from soft compaction forever, which is why
-    sweep grew a reaper for it. The fold cannot go stale — it IS the messages.
+    Used by `af ledger` for display. The fold cannot go stale — it IS the messages,
+    re-folded from the mail log on every read. No reaper is needed for this.
 
     An agent's replies live in the TASKER's box, not its own, so this reads two boxes rather
     than folding one. There is no global order across boxes to fold over: `ts` has one-second
