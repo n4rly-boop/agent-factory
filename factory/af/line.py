@@ -47,6 +47,8 @@ HOOKS_DIR = FACTORY_DIR / "hooks"
 STATUSLINE_SH = FACTORY_DIR / "statusline.sh"
 ROLE_REMINDER = HOOKS_DIR / "role-reminder.sh"
 DELEGATE_WALL = HOOKS_DIR / "delegate-wall.sh"
+SPAWN_GATE = HOOKS_DIR / "spawn-gate.sh"
+READ_WALL = HOOKS_DIR / "read-wall.sh"
 LIMIT_HOOK = HOOKS_DIR / "limit-hook.sh"
 SESSION_START = HOOKS_DIR / "session-start.sh"
 
@@ -55,7 +57,8 @@ SESSION_START = HOOKS_DIR / "session-start.sh"
 # delegate-wall without its +x bit is not a wall — it is a wall-shaped hole, and nothing in
 # the agent's output says so. (Observed: an agent sailed straight through a chmod-less wall
 # and wrote the file it was supposed to be denied.)
-PREFLIGHT = (ROLE_REMINDER, DELEGATE_WALL, LIMIT_HOOK, SESSION_START, STATUSLINE_SH)
+PREFLIGHT = (ROLE_REMINDER, DELEGATE_WALL, SPAWN_GATE, READ_WALL, LIMIT_HOOK, SESSION_START,
+             STATUSLINE_SH)
 
 DEFAULT_BULK_LINES = 40
 
@@ -515,7 +518,12 @@ def settings_json(slug: str, name: str) -> str:
     ],
     "PreToolUse": [
       {{ "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
-        "hooks": [ {{ "type": "command", "command": "{DELEGATE_WALL}", "timeout": 5 }} ] }}
+        "hooks": [
+          {{ "type": "command", "command": "{DELEGATE_WALL}", "timeout": 5 }},
+          {{ "type": "command", "command": "{SPAWN_GATE}", "timeout": 5 }}
+        ] }},
+      {{ "matcher": "Read",
+        "hooks": [ {{ "type": "command", "command": "{READ_WALL}", "timeout": 5 }} ] }}
     ],
     "StopFailure": [
       {{ "matcher": "rate_limit",
@@ -800,6 +808,17 @@ def cmd_up(bp: str, resume: bool = False) -> int:
     with contextlib.redirect_stdout(out):
         warden.watch(p=p)
     for ln in out.getvalue().splitlines():
+        print(f"[line] {ln}")
+
+    # The postmaster is the line's OTHER daemon — squad.json reconciliation and the mail
+    # ring-catch, on a much shorter clock than the warden's five-minute one. Started
+    # alongside it for the same reason: a team working unattended never calls a
+    # command, so nothing else will ever start it. Idempotent, like warden.watch.
+    from . import postmaster
+    out2 = io.StringIO()
+    with contextlib.redirect_stdout(out2):
+        postmaster.watch(p=p)
+    for ln in out2.getvalue().splitlines():
         print(f"[line] {ln}")
     return 0
 
