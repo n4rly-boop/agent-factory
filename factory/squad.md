@@ -93,12 +93,17 @@ commands to run; they read specs and live probes directly, the same as always.
 ## Making delegation actually happen
 
 Telling a mini-orchestrator to delegate decays like every other instruction stated
-once in a prompt. Three levers move the incentive to the tool boundary instead:
+once in a prompt. No `af delegate` wrapper here on purpose — it would couple this
+project to one skill's exact CLI shape instead of just naming the routing rule:
 
-- **`af delegate "<spec>" [out] [--root DIR] [--think]`** — one command instead of
-  the multi-step dance (recall the skill exists, build the `agent.py` invocation,
-  stage a prompt, collect output) that made writing the code inline the *one-step*
-  option. `--root` defaults to the station's own `AF_WORK`, never the whole repo.
+- **simple or bulk/mechanical work** (many items, boilerplate, spec-code, first
+  drafts, big logs) → the `delegate-to-local-model` skill, called directly.
+- **tests and review** → a Haiku subagent.
+- **anything needing real judgment, architecture, or a big change** → Sonnet/Opus
+  (yourself, or a Task subagent on that tier).
+
+Two levers move the incentive to the tool boundary instead of relying on the
+instruction alone:
 - **`Context: NN%`** is appended to the `role-reminder` line on every prompt — the
   same number Claude Code's own UI shows, read straight off the pane. The cost of
   *not* delegating stops being invisible turn-to-turn.

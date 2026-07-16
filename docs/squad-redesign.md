@@ -193,18 +193,22 @@ enforced by hooks. So they move to the tool boundary. **Writes stay free** (a wr
 that farms out two-line fixes is overhead); the levers are cheaper-delegation, visible cost,
 and a read-wall.
 
-- **B — one-command delegate.** `af delegate "<spec>" <out>` wraps the whole local-model
-  call. The model avoids delegation today because it is multi-step (read the skill, run
-  `agent.py`, stage a prompt, collect output) while writing it yourself is one step. Make
-  the sanctioned path one tool call and the incentive flips.
+- **B — one-command delegate. REVERTED.** Built `af delegate "<spec>" <out>` as a wrapper
+  around the local-model skill's `agent.py`, then dropped it: it couples this project to
+  one skill's exact CLI shape for no real gain over calling the skill directly, and the
+  skill itself was already simplified to a single entry point. Kept as a plain routing
+  instruction instead — simple/bulk work → `delegate-to-local-model` directly, tests/review
+  → Haiku, judgment/architecture → Sonnet/Opus. See squad.md's "Making delegation actually
+  happen".
 - **C — context cost made visible.** A `UserPromptSubmit` hook injects the current
   `Context: NN%` (~5 tokens) every turn, so the model feels the cost instead of being told
   about it once.
 - **D — read-wall with an escape hatch.** Reading a huge file straight into the window is
   the top context sink. A `PreToolUse` hook on `Read`:
   1. File over `K` lines **and** the read is unbounded (no `limit`) → **deny**, offering
-     three routes: read in bounded pages (`offset`/`limit`), `af delegate` to return a
-     distilled slice, or `af read-force <path>` to drop a **one-shot** override and re-read.
+     three routes: read in bounded pages (`offset`/`limit`), the `delegate-to-local-model`
+     skill to return a distilled slice, or `af read-force <path>` to drop a **one-shot**
+     override and re-read.
   2. If a force token for that path is present → allow and consume it (deliberate each
      time).
 

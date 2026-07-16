@@ -739,7 +739,7 @@ would read it in whole, unbounded.
 
 Do it one of these ways instead:
   1. bounded pages — pass offset/limit and read it in pieces.
-  2. delegate-to-local-model (or `af delegate "<spec>" <out>`) — get back a distilled slice
+  2. delegate-to-local-model skill (or a Task subagent) — get back a distilled slice
      instead of the raw file.
   3. af read-force {path} — a ONE-SHOT override if you genuinely need the whole file this
      time; it consumes itself on the next read and the wall re-arms.

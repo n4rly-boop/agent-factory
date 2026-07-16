@@ -11,8 +11,9 @@ so nothing here may write a file the bash cannot read.
   mail                : post  mail/inbox  mailstat  register-self  unregister-self
   the context guard   : sweep  (post and mail run one automatically; ledger deliberately
                         does NOT — it is a look, and it reports what a sweep would do)
-  delegation levers   : delegate (one-command delegate-to-local-model call)
-                        read-force (one-shot escape hatch for the read-wall hook)
+  delegation levers   : read-force (one-shot escape hatch for the read-wall hook)
+                        (delegation itself: call the delegate-to-local-model skill or
+                        Task subagent directly — no wrapper here, see squad.md)
 """
 
 from __future__ import annotations
@@ -229,42 +230,6 @@ def cmd_sweep(a: argparse.Namespace) -> int:
 
 
 # --- delegation levers -------------------------------------------------------------
-DELEGATE_SKILL = os.path.expanduser(
-    "~/.claude/skills/delegate-to-local-model/scripts/agent.py")
-
-
-def cmd_delegate(a: argparse.Namespace) -> int:
-    """`af delegate "<spec>" [out]` — one tool call in place of the multi-step dance (recall
-    the skill exists, build the agent.py invocation, stage a prompt, collect output) that
-    made writing the code inline the ONE-step option, and delegating the several-step one.
-
-    --root scopes the local model's sandbox: never the whole repo (the over-broad-root
-    mistake this project's own author already made and documented once) — default to
-    AF_WORK (a station's own scratch zone), not cwd."""
-    import subprocess
-    import tempfile
-
-    if not os.path.isfile(DELEGATE_SKILL):
-        print(f"[af] delegate-to-local-model skill not found at {DELEGATE_SKILL}",
-              file=sys.stderr)
-        return 1
-
-    root = a.root or os.environ.get("AF_WORK") or os.getcwd()
-    out = a.out
-    if not out:
-        fd, out = tempfile.mkstemp(prefix="af-delegate-", suffix=".txt")
-        os.close(fd)
-
-    argv = [sys.executable, DELEGATE_SKILL, "--root", root, "--out", out]
-    if a.think:
-        argv.append("--think")
-    argv.append(a.spec)
-
-    r = subprocess.run(argv)
-    print(f"[af] delegated (root={root}) — full answer: {out}")
-    return r.returncode
-
-
 def cmd_read_force(a: argparse.Namespace) -> int:
     from . import hooks
     return hooks.read_force(a.path)
@@ -396,14 +361,6 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("polling", help="re-poke an agent by mail on a clock (start/stop/list/status)")
     q.add_argument("rest", nargs=argparse.REMAINDER)
     q.set_defaults(fn=cmd_polling)
-
-    q = sub.add_parser("delegate", help="one-command delegate-to-local-model call")
-    q.add_argument("spec", help="the task/spec text for the local model")
-    q.add_argument("out", nargs="?", default=None,
-                   help="where to write the full answer (default: a temp file)")
-    q.add_argument("--root", default=None, help="sandbox root (default: $AF_WORK, then cwd)")
-    q.add_argument("--think", action="store_true", help="enable reasoning in the local model")
-    q.set_defaults(fn=cmd_delegate)
 
     q = sub.add_parser("read-force",
                        help="one-shot escape hatch for the read-wall PreToolUse hook")
