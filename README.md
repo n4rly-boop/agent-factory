@@ -190,15 +190,18 @@ read-modify-write race to lose — the same race that once cost us mail. The sin
 view is a *derived* one, `af ledger`, which joins the specs against the live world
 (tmux for aliveness, the session log for context size and for the model that actually
 answered the last turn — not the spec's, which goes stale after a runtime `/model`
-switch — the mailbox for unread, squad.json for the compact count):
+switch — the mailbox for unread, squad.json for the compact count, and the warden's own
+on-disk timestamp for when it next sweeps):
 
 ```
 $ af ledger
-NAME       ROLE           MODEL    PARENT        CTX  MAIL STATE  CMP SESSION
-orc        orchestrator   opus     -           142k     0 idle      1 ● alive
-eval       evaluation     sonnet   orc          38k     2 busy      0 ● alive  [wall]
-abl1       ablation       haiku    orc          91k     0 idle      2 ● alive  [wall]
-abl2       ablation       haiku    orc            -     1 -         0 ○ down (revivable)
+NAME       ROLE           MODEL                      PARENT        CTX  MAIL STATE  CMP SESSION
+orc        orchestrator   claude-opus-4-8            -           142k     0 idle      1 ● alive
+eval       evaluation     claude-sonnet-5            orc          38k     2 busy      0 ● alive  [wall]
+abl1       ablation       claude-haiku-4-5-20251001  orc          91k     0 idle      2 ● alive  [wall]
+abl2       ablation       claude-haiku-4-5-20251001  orc            -     1 -         0 ○ down (revivable)
+
+[af] next warden sweep: 214s
 ```
 
 `af line up` is also idempotent now: a station that is already running is left alone.

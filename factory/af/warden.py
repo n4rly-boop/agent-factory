@@ -111,6 +111,36 @@ def logfile(p: Paths) -> Path:
     return p.durable_state / "warden.log"
 
 
+def last_sweep_file(p: Paths) -> Path:
+    # Just the epoch the last sweep CHECK ran (whether or not it found anything to compact) —
+    # so `af ledger` can read "seconds until the next one" off disk without signaling this
+    # process at all. `loop()`'s own `last_sweep` lives only in memory and resets to 0 on
+    # every warden restart; this file is the one externally-visible copy of it.
+    return p.durable_state / "last-sweep"
+
+
+def _write_last_sweep(p: Paths, at: float) -> None:
+    try:
+        p.durable_state.mkdir(parents=True, exist_ok=True)
+        last_sweep_file(p).write_text(str(int(at)), encoding="utf-8")
+    except OSError:
+        pass   # best-effort: a failed write only degrades ledger's ETA, never the sweep itself
+
+
+def next_sweep_in(p: Paths) -> int | None:
+    """Seconds until the next sweep check, for a read-only display. None when there is
+    nothing to report: no warden running, or it has not swept even once yet."""
+    if sweep_off():
+        return None
+    if not _live(_pid(p)):
+        return None
+    try:
+        last = int(last_sweep_file(p).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    return sweep_every() - (int(time.time()) - last)
+
+
 def _standalone_pidfile(target: str) -> Path:
     d = _standalone_dir(target)
     d.mkdir(parents=True, exist_ok=True)
@@ -343,6 +373,7 @@ def loop(p: Paths) -> int:
         # busy or idle — no distinction is made.
         if not sweep_off() and time.time() - last_sweep >= every:
             last_sweep = time.time()
+            _write_last_sweep(p, last_sweep)
             healed = _heal_sids(p)          # correct the sid files BEFORE sweep reads them
             if healed:
                 log(healed, p)

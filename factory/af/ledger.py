@@ -16,18 +16,19 @@ Two rules this view exists to keep:
     non-executable hook blocks nothing, Claude Code just prints an error and runs the tool.
   * The MODEL column is likewise a LIVE READ off the transcript, not an echo of the spec —
     the spec is what was PASSED at spawn; a runtime `/model` switch leaves it stale forever.
-  * `ledger` does NOT sweep. It is a LOOK. It reports what a sweep WOULD compact.
+  * `ledger` does NOT sweep. It is a LOOK. It reports what a sweep WOULD compact, and — read
+    off the warden's own on-disk timestamp, never by signaling the daemon — when it next will.
 """
 
 from __future__ import annotations
 
-from . import hooks, mailbox, roster, spec as specmod
+from . import hooks, mailbox, roster, spec as specmod, warden
 from .drive import resolve_thresholds
 from .manifest import session_log_exists
 from .paths import Paths, paths
 from .probe import probe
 
-HEADER = (f"{'NAME':<10} {'ROLE':<14} {'MODEL':<8} {'PARENT':<8} {'CTX':>8} {'MAIL':>5} "
+HEADER = (f"{'NAME':<10} {'ROLE':<14} {'MODEL':<26} {'PARENT':<8} {'CTX':>8} {'MAIL':>5} "
           f"{'STATE':<6} {'CMP':>3} SESSION")
 
 
@@ -103,7 +104,7 @@ def ledger(p: Paths | None = None) -> int:
         model = pr.model or sp.model or "default"
         compacts = (squad.agents.get(name).compacts if squad.agents.get(name) else 0)
 
-        print(f"{name:<10} {sp.role or '-':<14} {model:<8} "
+        print(f"{name:<10} {sp.role or '-':<14} {model:<26} "
               f"{sp.parent or '-':<8} {ctx or '-':>8} {unread:>5} {state or '-':<6} "
               f"{compacts:>3} {alive}{_wall(sp.delegate, sp.settings)}")
 
@@ -111,4 +112,11 @@ def ledger(p: Paths | None = None) -> int:
     if fat:
         print(f"[af] ⚠ past their soft threshold: {' '.join(fat)} — 'af sweep' will compact "
               f"the idle ones.")
+    eta = warden.next_sweep_in(p)
+    if eta is None:
+        print("[af] warden not watching this squad — no scheduled sweep")
+    elif eta <= 0:
+        print("[af] next warden sweep: due now")
+    else:
+        print(f"[af] next warden sweep: {eta}s")
     return 0
