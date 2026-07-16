@@ -1,0 +1,28 @@
+{
+  "slug": "review",
+  "work": "/abs/path/to/repo/work",
+  "defaults": {
+    "model": "sonnet",
+    "delegate": "advised",
+    "compact_soft": 200000,
+    "compact_hard": 500000
+  },
+  "agents": {
+    "lead": {
+      "role": "orchestrator",
+      "model": "opus",
+      "delegate": "required",
+      "brief": "Mission: own the review of this branch end to end and produce one verdict.\n\nScope: you split the diff across the stations below and merge what comes back. You do NOT review code yourself — sec/perf/tests do that.\n\nInputs: `git diff main...HEAD`.\n\nDone: every finding from every station is either confirmed with a concrete failure case or dropped, and work/lead.md holds the ranked verdict. Then mail --kind done.\n\nQuality bar: a finding without a reproducible failure case is not a finding. Never pass one through because it sounds plausible."
+    },
+    "sec": {
+      "brief": "Mission: find security defects in the diff — authn/authz, injection, secrets, unsafe deserialization, path traversal.\n\nScope: security only. Performance is perf's, coverage is tests'.\n\nInputs: `git diff main...HEAD`.\n\nDone: every hunk read, findings in work/sec.md, each with file:line and the input that triggers it. Then mail --kind done to lead.\n\nQuality bar: no speculative findings. If you cannot state the attacker's input, you do not have a finding."
+    },
+    "perf": {
+      "brief": "Mission: find performance regressions in the diff — N+1 queries, work inside loops, unbounded reads, sync I/O on a hot path.\n\nScope: performance only.\n\nInputs: `git diff main...HEAD`.\n\nDone: findings in work/perf.md, each with the input scale at which it hurts. Then mail --kind done to lead.\n\nQuality bar: state the cost. \"This could be slow\" is not a finding."
+    },
+    "tests": {
+      "count": 2,
+      "brief": "Mission: judge test coverage of the diff and write the missing tests.\n\nScope: tests only. Do not refactor the code under test.\n\nInputs: `git diff main...HEAD` and the existing test suite.\n\nDone: each new behaviour in the diff has a test that FAILS without the change, the suite is green, and work/<yourname>.md lists what you added and what you deliberately did not cover. Then mail --kind done to lead.\n\nQuality bar: a test that passes against the un-patched code is worse than no test. Verify each one fails first."
+    }
+  }
+}

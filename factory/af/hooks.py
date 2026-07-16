@@ -847,9 +847,9 @@ def session_start() -> int:
     # (never create one: `who` defaults to "orchestrator", who is not a squad member), and
     # never let it fail the hook.
     try:
-        from . import squad
-        if squad.get(who, p) is not None:
-            squad.set_live_sid(who, sid, p)
+        from . import roster
+        if roster.get(who, p) is not None:
+            roster.set_live_sid(who, sid, p)
     except Exception:
         pass
     return 0

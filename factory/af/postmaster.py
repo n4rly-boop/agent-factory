@@ -12,7 +12,7 @@ does too. Nothing here may become a prerequisite for that.
 
 What was actually missing, per the redesign doc:
 
-  1. STATE. `squad.json` (af.squad) is the durable roster, but nothing keeps it honest
+  1. STATE. `squad.json` (af.roster) is the durable roster, but nothing keeps it honest
      while no `af` command is running — `up`/`down` write it, `reconcile()` corrects it
      against tmux+ps, but a team working unattended never calls a command, so nobody
      ever calls reconcile either. This daemon is the thing that does, on a clock.
@@ -36,7 +36,7 @@ What was actually missing, per the redesign doc:
      wake, a polling tick — reaches for instead of inventing its own guard.
 
 One process per slug, like the warden — but this is the HOT path (short tick, cheap
-per-tick work: one `ps -A` call via squad.reconcile, one unread count per mailbox) where
+per-tick work: one `ps -A` call via roster.reconcile, one unread count per mailbox) where
 the warden is the COLD path (a five-minute clock, full transcript scans). Different
 cadences, different blast radius: if this dies, mail still flows (synchronous send+ring
 still works); if the warden dies, mail still flows too — only the unattended-context-
@@ -54,7 +54,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import drive, mailbox, squad
+from . import drive, mailbox, roster
 from .nums import intish
 from .paths import FACTORY_DIR, Paths, paths
 
@@ -126,7 +126,7 @@ def _ring_catch(p: Paths, last_total: dict[str, int]) -> list[str]:
     simply ignoring) is deliberately left alone tick after tick — re-ringing a pane that
     cannot answer is noise, not help."""
     rung = []
-    for agent in squad.load(p).agents:
+    for agent in roster.load(p).agents:
         try:
             tot = mailbox.total(agent, p)
         except Exception:
@@ -166,7 +166,7 @@ def loop(p: Paths) -> int:
             log("stopped", p)
             return 0
         try:
-            squad.reconcile(p)
+            roster.reconcile(p)
         except Exception as e:
             log(f"reconcile failed: {e}", p)
         try:

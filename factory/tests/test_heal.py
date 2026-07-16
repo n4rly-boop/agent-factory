@@ -1,4 +1,4 @@
-"""heal: diagnosing what broke on a line, and the SAFE repairs.
+"""heal: diagnosing what broke on a squad, and the SAFE repairs.
 
 The invariant these tests protect: a live claude is never killed, and a crashed one comes
 back on its recorded session. `diagnose` is read-only and takes an injected `ps_out` and
@@ -15,11 +15,11 @@ from unittest import mock
 
 from support import TempFactory
 
-from af import heal, line
+from af import heal, squad
 
 
 def _ps_line(slug: str, agent: str, *, session_id: str = "", resume: str = "") -> str:
-    """One process line as `ps -A -o command=` would print it for an agent of a line."""
+    """One process line as `ps -A -o command=` would print it for an agent of a squad."""
     parts = ["claude"]
     if session_id:
         parts.append(f"--session-id {session_id}")
@@ -42,7 +42,7 @@ class Diagnose(TempFactory):
     def _good_settings(self, name: str) -> None:
         """A real settings file, hooks pointing at the repo's +x shims — including
         SessionStart. hooks_ok is True for it."""
-        line.write_settings(self.slug, name, self.p.settings_file(name))
+        squad.write_settings(self.slug, name, self.p.settings_file(name))
 
     FORK = "7a612149-900e-4619-a020-c2d6d0636a04"
     PARENT = "11d8b710-ef92-456a-96db-59c316b9041b"
@@ -96,7 +96,7 @@ class Diagnose(TempFactory):
         # Hand-write a settings file that installs a hook but NOT session-start.sh.
         stf = self.p.settings_file(str("w"))
         stf.parent.mkdir(parents=True, exist_ok=True)
-        role = line.ROLE_REMINDER
+        role = squad.ROLE_REMINDER
         stf.write_text(
             '{ "hooks": { "UserPromptSubmit": [ { "hooks": [ '
             f'{{ "type": "command", "command": "{role}" }} ] }} ] }} }}',

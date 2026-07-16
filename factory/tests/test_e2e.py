@@ -97,7 +97,7 @@ class E2E(unittest.TestCase):
         # the fake ignores the value. af writes no settings file at `up`, so this is just a token.
         return f"--settings {self.specdir() / 'settings-neo.json'}"
 
-    def squad(self) -> dict:
+    def roster(self) -> dict:
         return json.loads((self.specdir() / "squad.json").read_text(encoding="utf-8"))
 
     def sid_file(self) -> Path:
@@ -162,11 +162,11 @@ class E2E(unittest.TestCase):
         return r.stdout.strip()
 
     def reconcile(self) -> subprocess.CompletedProcess:
-        """Drive af.squad.reconcile hermetically (real ps + real tmux). There is no first-class
+        """Drive af.roster.reconcile hermetically (real ps + real tmux). There is no first-class
         `af reconcile` CLI, but reconcile is the documented owner of live_sid healing, so this
         exercises the real af code path against the real forked process."""
         return subprocess.run(
-            [sys.executable, "-c", "import af.squad as s; s.reconcile()"],
+            [sys.executable, "-c", "import af.roster as s; s.reconcile()"],
             env=self.env(), cwd=str(self.tmp / "cwd"), capture_output=True, text=True,
         )
 
@@ -186,7 +186,7 @@ class E2E(unittest.TestCase):
                             f"fake transcript {transcript} never written")
 
             self.assertTrue((self.specdir() / "agent-neo.json").is_file(), "spec not written")
-            sq = self.squad()["agents"]["neo"]
+            sq = self.roster()["agents"]["neo"]
             self.assertEqual(sq["status"], "alive")
             self.assertEqual(sq["live_sid"], sid1)
             self.assertTrue(sq["settings_path"].endswith("settings-neo.json"), sq["settings_path"])
@@ -236,7 +236,7 @@ class E2E(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue(self.wait_for(lambda: not self.has_session("neo")),
                             "session still alive after af down")
-            sq = self.squad()["agents"]["neo"]
+            sq = self.roster()["agents"]["neo"]
             self.assertEqual(sq["status"], "down")
             self.assertTrue(sq["live_sid"], "live_sid was cleared on down (should be captured)")
             # No fork happened for a fresh spawn, so the recorded sid is the S1 sid. NOTE: down
@@ -279,7 +279,7 @@ class E2E(unittest.TestCase):
             self.assertEqual(self.resolve_live_sid(self.full_ps()), fork_sid,
                              "live_sid did not resolve the fork from ps")
 
-            # End-to-end reconcile (real squad.reconcile via real af._ps): BEST-EFFORT, weakened.
+            # End-to-end reconcile (real roster.reconcile via real af._ps): BEST-EFFORT, weakened.
             #
             # BUG FOUND: af.live._ps() runs `ps -A -o command=` with text=True and, on a host
             # whose process table contains ANY non-UTF-8 argv byte (common on a shared dev box),
@@ -290,7 +290,7 @@ class E2E(unittest.TestCase):
             # deterministic resolver check above proves the tracking logic itself is correct.
             rc = self.reconcile()
             self.assertEqual(rc.returncode, 0, f"reconcile failed: {rc.stderr}")
-            sq = self.squad()["agents"]["neo"]
+            sq = self.roster()["agents"]["neo"]
             self.assertEqual(sq["status"], "alive")
             # Never a garbage value: it is the fork (when _ps saw the process) or the preserved
             # S4 sid (when _ps was blinded by the UTF-8 bug). Both are honest outcomes.

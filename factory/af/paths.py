@@ -22,11 +22,10 @@ PROJECTS = Path.home() / ".claude" / "projects"
 # every spawned agent gets AF_MAIL=<mail.sh> in its env, and the doorbell it is told to
 # type is `!bash $AF_MAIL read`. That must keep pointing at the SHELL script — an agent
 # spawned by Python is a plain `claude` with no PYTHONPATH, so a python -m af doorbell
-# would die in its pane. line.sh is here for revive's settings regeneration.
+# would die in its pane.
 FACTORY_DIR = Path(__file__).resolve().parents[1]
 MAIL_SH = FACTORY_DIR / "mail.sh"
 POLL_SH = FACTORY_DIR / "polling.sh"
-LINE_SH = FACTORY_DIR / "line.sh"
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]")
 
@@ -146,23 +145,20 @@ class Paths:
         return self.specroot / self.slug
 
     def spec_file(self, agent: str) -> Path:
-        # agent-<name>.json, never <name>.json: an agent named `line` would otherwise
-        # collide with the line-level line.json.
+        # agent-<name>.json, never <name>.json: an agent named `squad` would otherwise
+        # collide with the team-level squad.json.
         return self.specdir / f"agent-{agent}.json"
 
     def settings_file(self, agent: str) -> Path:
         return self.specdir / f"settings-{agent}.json"
 
     @property
-    def line_file(self) -> Path:
-        return self.specdir / "line.json"
-
-    @property
     def squad_file(self) -> Path:
         """The one mutable source of truth for a team — durable (under the spec home, NOT
-        /tmp, so a purge cannot erase the roster) and flock-guarded. Replaces line.json plus
-        the scattered sid-/state- files as the answer to 'who is on the team, is it alive,
-        what session is it on'. See af.squad."""
+        /tmp, so a purge cannot erase the roster) and flock-guarded. It is the sole record of
+        which blueprint a team came from, when it was created, and who is on it (replacing the
+        scattered sid-/state- files and a separate line.json that used to duplicate the same
+        two facts). See af.roster."""
         return self.specdir / "squad.json"
 
     @property

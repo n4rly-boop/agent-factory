@@ -18,7 +18,7 @@ Two rules this view exists to keep:
 
 from __future__ import annotations
 
-from . import hooks, mailbox, spec as specmod
+from . import hooks, mailbox, roster, spec as specmod
 from .drive import resolve_thresholds
 from .manifest import session_log_exists
 from .paths import Paths, paths
@@ -42,20 +42,15 @@ def _wall(delegate: str, settings: str) -> str:
 def ledger(p: Paths | None = None) -> int:
     p = p or paths()
     if not p.specdir.is_dir():
-        print(f"[af] no line on '{p.slug}' yet (no specs in {p.specdir})")
+        print(f"[af] no squad on '{p.slug}' yet (no specs in {p.specdir})")
         return 0
     names = specmod.all_specs(p)
     if not names:
         print(f"[af] no agents recorded for '{p.slug}'")
         return 0
 
-    blueprint = ""
-    try:
-        import json
-        blueprint = str(json.loads(p.line_file.read_text(encoding="utf-8")).get("blueprint", ""))
-    except Exception:
-        pass
-    print(f"[af] line '{p.slug}'" + (f"   blueprint: {blueprint}" if blueprint else "")
+    blueprint = roster.load(p).blueprint
+    print(f"[af] squad '{p.slug}'" + (f"   blueprint: {blueprint}" if blueprint else "")
           + f"   specs: {p.specdir}")
     print()
     print(HEADER)

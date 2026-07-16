@@ -1,369 +1,277 @@
-"""squad.json — the one mutable source of truth for a team.
+"""squad: blueprint loading, count expansion, parent defaulting, threshold + delegate
+resolution. The fatal-typo case is the one that, when it was NOT fatal, produced a
+silently unwalled agent.
 
-Everything here runs against a temp AF_ROOT / AF_SPECROOT (via TempFactory), so the durable
-squad file lands under the temp spec home and nothing touches the real ~/.claude. The
-reconcile tests fake tmux/live/mailbox rather than reaching for a live session: reconcile
-imports them locally (`from . import tmux, live, mailbox`), so patching the module attributes
-is what the running code actually calls.
+No agent is spawned. The resolver is pure; the only I/O is reading a blueprint written
+into a temp dir.
 """
 
 from __future__ import annotations
 
+import json
 import unittest
-from dataclasses import replace
 from unittest import mock
 
 from support import TempFactory   # imported first: it puts the af package on sys.path
 
-from af import squad
+from af import roster, squad
 
 
-# --- the dataclass model, no disk ---------------------------------------------------
-class TestStationFromDict(unittest.TestCase):
-    def test_missing_keys_default_and_non_int_falls_back_to_zero(self):
-        st = squad.Station.from_dict({"name": "qa"})
-        self.assertEqual(st.name, "qa")
-        self.assertEqual(st.role, "")
-        self.assertEqual(st.status, squad.PLANNED)
-        self.assertEqual(st.spawned, 0)
-        self.assertEqual(st.ctx_tokens, 0)
-        self.assertEqual(st.unread, 0)
-
-        junk = squad.Station.from_dict(
-            {"name": "qa", "spawned": "soon", "ctx_tokens": None, "unread": "lots"})
-        self.assertEqual(junk.spawned, 0)
-        self.assertEqual(junk.ctx_tokens, 0)
-        self.assertEqual(junk.unread, 0)
-
-    def test_int_like_strings_are_accepted(self):
-        st = squad.Station.from_dict({"name": "qa", "spawned": "42", "ctx_tokens": "1000"})
-        self.assertEqual(st.spawned, 42)
-        self.assertEqual(st.ctx_tokens, 1000)
+def _bp(tmp, doc: dict):
+    f = tmp / "bp.json"
+    f.write_text(json.dumps(doc), encoding="utf-8")
+    return str(f)
 
 
-class TestSquadFromDict(unittest.TestCase):
-    def test_name_is_backfilled_from_the_dict_key(self):
-        sq = squad.Squad.from_dict({"agents": {"orc": {"role": "orchestrator"}}}, "aftest")
-        self.assertIn("orc", sq.agents)
-        self.assertEqual(sq.agents["orc"].name, "orc")     # inner "name" was absent
-        self.assertEqual(sq.agents["orc"].role, "orchestrator")
+class LoadJSON(unittest.TestCase):
+    def test_valid_json_round_trips(self):
+        self.assertEqual(squad.load_from_string('{"k": "v"}'), {"k": "v"})
 
-    def test_inner_name_wins_when_present(self):
-        sq = squad.Squad.from_dict({"agents": {"orc": {"name": "orc", "role": "r"}}}, "aftest")
-        self.assertEqual(sq.agents["orc"].name, "orc")
+    def test_invalid_json_is_fatal(self):
+        with self.assertRaises(squad.SquadSpecError):
+            squad.load_from_string("{ not json at all")
 
-    def test_a_non_dict_becomes_an_empty_squad_for_the_slug(self):
-        sq = squad.Squad.from_dict([1, 2, 3], "aftest")
-        self.assertEqual(sq.slug, "aftest")
-        self.assertEqual(sq.agents, {})
+    def test_unreadable_path_is_fatal(self):
+        with self.assertRaises(squad.SquadSpecError):
+            squad.load("/no/such/blueprint.json")
 
 
-# --- persistence: round-trip, partial update, blank-sid guard -----------------------
-class TestPersistence(TempFactory):
-    def test_upsert_round_trips_every_field_through_disk(self):
-        squad.upsert(
-            self.p, name="qa", role="qa", parent="orc", model="opus",
-            delegate="advised", spawn_flags="--x", settings_path="/s.json",
-            live_sid="sid-1", status=squad.ALIVE, spawned=123,
-            ctx_tokens=4000, unread=2)
+class DelegateLevels(unittest.TestCase):
+    def test_the_three_levels_and_their_aliases(self):
+        self.assertEqual(squad.dlevel("required"), "required")
+        self.assertEqual(squad.dlevel("hard"), "required")
+        self.assertEqual(squad.dlevel("full"), "required")     # meant required before, still does
+        self.assertEqual(squad.dlevel("advised"), "advised")
+        self.assertEqual(squad.dlevel("advise"), "advised")
+        self.assertEqual(squad.dlevel(True), "advised")        # bare `delegate: true` = advised
+        self.assertEqual(squad.dlevel("no"), "")
+        self.assertEqual(squad.dlevel(False), "")
+        self.assertEqual(squad.dlevel(None, "advised"), "advised")   # default falls through
 
-        st = squad.load(self.p).agents["qa"]
-        self.assertEqual(st, squad.Station(
-            name="qa", role="qa", parent="orc", model="opus", delegate="advised",
-            spawn_flags="--x", settings_path="/s.json", live_sid="sid-1",
-            status=squad.ALIVE, spawned=123, ctx_tokens=4000, unread=2))
-
-    def test_partial_update_does_not_clobber_other_fields(self):
-        squad.upsert(self.p, name="qa", role="qa", live_sid="sid-1", status=squad.ALIVE)
-        squad.upsert(self.p, name="qa", ctx_tokens=9999)      # a reconcile-shaped touch
-
-        st = squad.load(self.p).agents["qa"]
-        self.assertEqual(st.ctx_tokens, 9999)
-        self.assertEqual(st.role, "qa")                       # survived
-        self.assertEqual(st.live_sid, "sid-1")                # survived
-        self.assertEqual(st.status, squad.ALIVE)              # survived
-
-    def test_set_live_sid_ignores_a_blank_sid(self):
-        squad.set_live_sid("qa", "sid-1", self.p)
-        squad.set_live_sid("qa", "", self.p)                  # a transient read miss
-        self.assertEqual(squad.get("qa", self.p).live_sid, "sid-1")
-
-    def test_set_live_sid_advances_on_a_real_sid(self):
-        squad.set_live_sid("qa", "sid-1", self.p)
-        squad.set_live_sid("qa", "sid-2", self.p)
-        self.assertEqual(squad.get("qa", self.p).live_sid, "sid-2")
+    def test_a_typo_is_FATAL(self):
+        # The whole point. `delegate: requird` used to fall through to '' — no wall, no
+        # advisory, no complaint — on a station meant to be walled. It must refuse.
+        with self.assertRaises(squad.SquadSpecError):
+            squad.dlevel("requird")
+        with self.assertRaises(squad.SquadSpecError):
+            squad.dlevel("blockk")
 
 
-# --- mark_down / remove -------------------------------------------------------------
-class TestMarkDown(TempFactory):
-    def test_mark_down_with_a_sid_records_down_and_writes_the_sid(self):
-        squad.upsert(self.p, name="qa", role="qa", live_sid="old", status=squad.ALIVE)
-        squad.mark_down("qa", "captured-at-kill", self.p)
+class Plan(TempFactory):
+    def plan(self, doc: dict):
+        return squad.plan(_bp(self.root, doc), cwd=str(self.root))
 
-        st = squad.get("qa", self.p)
-        self.assertEqual(st.status, squad.DOWN)
-        self.assertEqual(st.live_sid, "captured-at-kill")
-        self.assertEqual(st.role, "qa")                       # unrelated fields survive
+    def test_count_expands_sharing_one_brief(self):
+        st = self.plan({
+            "slug": "s",
+            "agents": {"abl": {"count": 3, "role": "ablation", "brief": "one hypothesis"}},
+        })
+        self.assertEqual([s.name for s in st], ["abl1", "abl2", "abl3"])
+        self.assertTrue(all(s.brief == "one hypothesis" for s in st))
 
-    def test_mark_down_with_none_keeps_the_stored_sid(self):
-        squad.upsert(self.p, name="qa", live_sid="the-resume-record", status=squad.ALIVE)
-        squad.mark_down("qa", None, self.p)
+    def test_no_count_keeps_the_bare_name(self):
+        st = self.plan({"slug": "s", "agents": {"solo": {"role": "worker"}}})
+        self.assertEqual([s.name for s in st], ["solo"])
 
-        st = squad.get("qa", self.p)
-        self.assertEqual(st.status, squad.DOWN)
-        self.assertEqual(st.live_sid, "the-resume-record")    # not erased
+    def test_parent_defaults_to_the_role_orchestrator_by_role_not_name(self):
+        # Top station named 'boss', role orchestrator. Everyone else must report to 'boss',
+        # not to the literal 'orc' that used to be hard-coded.
+        st = {s.name: s for s in self.plan({
+            "slug": "s",
+            "agents": {"boss": {"role": "orchestrator"}, "w": {"role": "worker"}},
+        })}
+        self.assertEqual(st["boss"].parent, "")       # the orchestrator reports to no station
+        self.assertEqual(st["w"].parent, "boss")
 
-    def test_mark_down_on_an_unknown_station_creates_a_down_record(self):
-        squad.mark_down("ghost", "s", self.p)
-        st = squad.get("ghost", self.p)
-        self.assertEqual(st.status, squad.DOWN)
-        self.assertEqual(st.live_sid, "s")
+    def test_explicit_parent_wins(self):
+        st = {s.name: s for s in self.plan({
+            "slug": "s",
+            "agents": {
+                "boss": {"role": "orchestrator"},
+                "a": {"parent": "boss"},
+                "b": {"parent": "a"},
+            },
+        })}
+        self.assertEqual(st["b"].parent, "a")
+
+    def test_orchestrator_is_a_reserved_station_name(self):
+        with self.assertRaises(squad.SquadSpecError):
+            self.plan({"slug": "s", "agents": {"orchestrator": {"role": "worker"}}})
+
+    def test_delegate_default_is_advised(self):
+        st = self.plan({"slug": "s", "agents": {"w": {"role": "worker"}}})
+        self.assertEqual(st[0].delegate, "advised")
+
+    def test_defaults_delegate_flows_to_stations(self):
+        st = {s.name: s for s in self.plan({
+            "slug": "s",
+            "defaults": {"delegate": "required"},
+            "agents": {
+                "a": {"role": "worker"},
+                "b": {"role": "worker", "delegate": "no"},
+            },
+        })}
+        self.assertEqual(st["a"].delegate, "required")   # inherited
+        self.assertEqual(st["b"].delegate, "")           # per-agent override wins
+
+    def test_a_typo_in_a_station_delegate_aborts_the_whole_plan(self):
+        with self.assertRaises(squad.SquadSpecError):
+            self.plan({"slug": "s", "agents": {"w": {"delegate": "requird"}}})
+
+    def test_work_is_resolved_absolute(self):
+        st = self.plan({"slug": "s", "work": "./out", "agents": {"w": {"role": "worker"}}})
+        self.assertEqual(st[0].work, str(self.root / "out"))
+
+    def test_thresholds_resolve_per_agent_over_defaults(self):
+        st = {s.name: s for s in self.plan({
+            "slug": "s",
+            "defaults": {"compact_soft": 120000, "compact_hard": 400000},
+            "agents": {
+                "a": {"role": "worker"},
+                "b": {"role": "worker", "compact_soft": 80000},
+            },
+        })}
+        self.assertEqual((st["a"].soft, st["a"].hard), ("120000", "400000"))
+        self.assertEqual(st["b"].soft, "80000")          # per-agent wins
+        self.assertEqual(st["b"].hard, "400000")         # falls back to default
+
+    def test_slug_defaults_to_the_cwd_basename(self):
+        st = self.plan({"agents": {"w": {"role": "worker"}}})
+        self.assertEqual(st[0].slug, self.root.name)
+
+    def test_a_non_mapping_agent_value_is_fatal(self):
+        with self.assertRaises(squad.SquadSpecError):
+            self.plan({"slug": "s", "agents": {"w": "not a mapping"}})
 
 
-class TestRemove(TempFactory):
-    def test_remove_drops_the_station_entirely(self):
-        squad.upsert(self.p, name="qa", role="qa")
-        squad.upsert(self.p, name="orc", role="orchestrator")
-        squad.remove("qa", self.p)
+class BulkLines(TempFactory):
+    def test_bulk_lines_read_from_defaults_only(self):
+        f = _bp(self.root, {"defaults": {"bulk_lines": 25}, "agents": {"w": {"role": "worker"}}})
+        self.assertEqual(squad.bulk_lines(f), 25)
 
-        agents = squad.load(self.p).agents
-        self.assertNotIn("qa", agents)
-        self.assertIn("orc", agents)                          # remove is targeted
-
-    def test_remove_is_distinct_from_mark_down(self):
-        squad.upsert(self.p, name="qa", live_sid="s", status=squad.ALIVE)
-        squad.mark_down("qa", None, self.p)
-        self.assertIsNotNone(squad.get("qa", self.p))         # mark_down keeps the record
-        squad.remove("qa", self.p)
-        self.assertIsNone(squad.get("qa", self.p))            # remove drops it
-
-    def test_removing_a_missing_station_is_a_no_op(self):
-        squad.remove("nobody", self.p)                        # must not raise
-        self.assertEqual(squad.load(self.p).agents, {})
+    def test_top_level_bulk_lines_is_ignored_as_in_bash(self):
+        # A top-level `bulk_lines:` was silently ignored by the bash (it read
+        # defaults.bulk_lines). Kept, not fixed — the hooks read AF_BULK_LINES from the env
+        # `up` fills, and both sides must agree on where the number lives.
+        f = _bp(self.root, {"bulk_lines": 999, "agents": {"w": {"role": "worker"}}})
+        self.assertEqual(squad.bulk_lines(f), squad.DEFAULT_BULK_LINES)
 
 
-# --- a missing or corrupt squad.json ------------------------------------------------
-class TestLoadTolerance(TempFactory):
-    def test_a_missing_file_loads_an_empty_squad(self):
-        self.assertFalse(self.p.squad_file.exists())
-        sq = squad.load(self.p)
-        self.assertEqual(sq.slug, "aftest")
-        self.assertEqual(sq.agents, {})
+class Rendering(TempFactory):
+    def test_required_station_gets_the_hard_wall_brief_and_sysprompt(self):
+        st = squad.plan(_bp(self.root, {
+            "slug": "s",
+            "agents": {"w": {"role": "worker", "delegate": "required", "brief": "do the thing"}},
+        }), cwd=str(self.root))[0]
+        md = squad.entrypoint_md(st, bulk=40)
+        self.assertIn("MINI-ORCHESTRATOR (hard wall)", md)
+        self.assertIn("do the thing", md)
+        sp = squad.sysprompt(st, self.root / "entrypoint-w.md")
+        self.assertIn("you do NOT do work directly", sp)
 
-    def test_garbage_json_loads_an_empty_squad(self):
+    def test_advised_station_names_the_bulk_threshold(self):
+        st = squad.plan(_bp(self.root, {"slug": "s", "agents": {"w": {"role": "worker"}}}),
+                        cwd=str(self.root))[0]
+        self.assertIn("(25+ lines)", squad.entrypoint_md(st, bulk=25))
+
+    def test_settings_json_is_valid_and_installs_four_hooks(self):
+        d = json.loads(squad.settings_json("s", "w"))
+        self.assertEqual(set(d["hooks"]),
+                         {"SessionStart", "UserPromptSubmit", "PreToolUse", "StopFailure"})
+        self.assertIn("statusLine", d)
+
+
+class DropFromBlueprint(TempFactory):
+    def test_removes_the_named_agent_and_rewrites_the_file(self):
+        f = _bp(self.root, {"slug": "s", "agents": {"a": {"role": "worker"},
+                                                     "b": {"role": "worker"}}})
+        self.assertTrue(squad._drop_from_blueprint(f, "a"))
+        doc = json.loads(open(f, encoding="utf-8").read())
+        self.assertEqual(set(doc["agents"]), {"b"})
+
+    def test_a_count_expanded_replica_is_not_a_literal_key(self):
+        # "w1" is what `count:` expands "w" into at plan() time — it never exists as a key
+        # in the blueprint itself, so there is nothing here to pop.
+        f = _bp(self.root, {"slug": "s", "agents": {"w": {"role": "worker", "count": 3}}})
+        self.assertFalse(squad._drop_from_blueprint(f, "w1"))
+        doc = json.loads(open(f, encoding="utf-8").read())
+        self.assertIn("w", doc["agents"])
+
+
+class AddRemove(TempFactory):
+    def test_add_unknown_name_is_fatal_and_spawns_nothing(self):
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"}}})
+        with mock.patch("af.squad.lifecycle.up") as up:
+            self.assertEqual(squad.cmd_add(f, "ghost"), 1)
+            up.assert_not_called()
+
+    def test_add_spawns_only_the_named_station_leaving_others_alone(self):
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"},
+                                                           "b": {"role": "worker"}}})
+        with mock.patch("af.squad.preflight", return_value=True), \
+             mock.patch("af.squad.hooks.hooks_ok", return_value=True), \
+             mock.patch("af.squad.lifecycle.up") as up, \
+             mock.patch("af.tmux.has_session", side_effect=[False, True]):
+            self.assertEqual(squad.cmd_add(f, "a"), 0)
+        up.assert_called_once()
+        self.assertEqual(up.call_args[0][0], "a")
+        self.assertEqual(roster.load(self.p).blueprint, str((self.root / "bp.json").resolve()))
+
+    def test_remove_unknown_name_errors_without_touching_anything(self):
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"}}})
+        with mock.patch("af.squad.lifecycle.down") as down:
+            self.assertEqual(squad.cmd_remove(f, "ghost"), 1)
+            down.assert_not_called()
+
+    def test_remove_kills_the_session_drops_roster_row_and_blueprint_entry(self):
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"},
+                                                           "b": {"role": "worker"}}})
+        roster.mark_up("a", self.p, role="worker")
+        with mock.patch("af.squad.lifecycle.down") as down:
+            self.assertEqual(squad.cmd_remove(f, "a"), 0)
+        down.assert_called_once_with("a", self.p)
+        self.assertIsNone(roster.get("a", self.p))
+        doc = json.loads(open(f, encoding="utf-8").read())
+        self.assertEqual(set(doc["agents"]), {"b"})
+
+    def test_remove_deletes_spec_settings_and_sid_so_ledger_and_revive_forget_it(self):
+        # `af down` deliberately keeps these — a station stays revivable. `remove` means
+        # gone: without the spec, `af ledger` (globs agent-*.json) stops listing it, and
+        # `af revive` refuses by default instead of resurrecting it from the manifest.
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"}}})
         self.p.specdir.mkdir(parents=True, exist_ok=True)
-        self.p.squad_file.write_text("{ not json at all")
-        sq = squad.load(self.p)
-        self.assertEqual(sq.slug, "aftest")
-        self.assertEqual(sq.agents, {})
+        self.p.spec_file("a").write_text("{}", encoding="utf-8")
+        self.p.settings_file("a").write_text("{}", encoding="utf-8")
+        self.p.sid_file("a").write_text("some-sid", encoding="utf-8")
+        with mock.patch("af.squad.lifecycle.down"):
+            self.assertEqual(squad.cmd_remove(f, "a"), 0)
+        self.assertFalse(self.p.spec_file("a").exists())
+        self.assertFalse(self.p.settings_file("a").exists())
+        self.assertFalse(self.p.sid_file("a").exists())
 
-    def test_a_half_written_object_loads_an_empty_squad(self):
-        self.p.specdir.mkdir(parents=True, exist_ok=True)
-        self.p.squad_file.write_text('{"slug": "aftest", "agents": {"qa": ')  # truncated
-        self.assertEqual(squad.load(self.p).agents, {})
+    def test_add_on_an_already_running_station_is_not_an_error(self):
+        # "skipped" (already up) is the requested end-state already holding, not a
+        # failure — cmd_up doesn't count it as one, cmd_add shouldn't either.
+        f = _bp(self.root, {"slug": self.slug, "agents": {"a": {"role": "worker"}}})
+        with mock.patch("af.squad.preflight", return_value=True), \
+             mock.patch("af.squad.lifecycle.up") as up, \
+             mock.patch("af.tmux.has_session", return_value=True):
+            self.assertEqual(squad.cmd_add(f, "a"), 0)
+        up.assert_not_called()
 
+    def test_add_on_a_malformed_blueprint_is_fatal(self):
+        f = self.root / "bad.json"
+        f.write_text("{ not json", encoding="utf-8")
+        with mock.patch("af.squad.lifecycle.up") as up:
+            self.assertEqual(squad.cmd_add(str(f), "a"), 1)
+            up.assert_not_called()
 
-# --- the edit context manager -------------------------------------------------------
-class TestEdit(TempFactory):
-    def test_two_sequential_edits_accumulate_and_leave_no_tmp_behind(self):
-        with squad.edit(self.p) as sq:
-            sq.agents["qa"] = squad.Station(name="qa", role="qa")
-        with squad.edit(self.p) as sq:
-            sq.agents["qa"] = replace(sq.agents["qa"], ctx_tokens=5)
-
-        st = squad.load(self.p).agents["qa"]
-        self.assertEqual(st.role, "qa")                       # first edit
-        self.assertEqual(st.ctx_tokens, 5)                    # second edit
-
-        tmp = self.p.squad_file.with_suffix(".json.tmp")
-        self.assertFalse(tmp.exists(), "an atomic write left its .json.tmp behind")
-        self.assertTrue(self.p.squad_file.exists())
-
-    def test_the_write_is_atomic_no_tmp_after_upsert(self):
-        squad.upsert(self.p, name="qa", role="qa")
-        self.assertFalse(self.p.squad_file.with_suffix(".json.tmp").exists())
-
-
-# --- reconcile ----------------------------------------------------------------------
-class TestReconcile(TempFactory):
-    """reconcile corrects the stored roster against ground truth. We fake the three sources
-    it reads — tmux liveness, the real (post-fork) sid, and unread mail — and check the four
-    status transitions plus the rule that live_sid only advances to a running session."""
-
-    ALIVE_NAMES = {"aliveOk", "aliveLimited"}
-
-    def _fake_has_session(self, target):
-        # target is p.session(name) == f"ai-{slug}-{name}"
-        return any(target.endswith(f"-{n}") for n in self.ALIVE_NAMES)
-
-    def _fake_live_sid(self, agent, p=None, ps_out=None):
-        # Only ever called for an alive agent; it returns the freshly-read running sid.
-        return "sid-running"
-
-    def _fake_unread(self, agent, p=None):
-        return 7
-
-    def _seed(self):
-        squad.upsert(self.p, name="aliveOk", role="qa", status=squad.DOWN,
-                     live_sid="stale", spawned=100)
-        squad.upsert(self.p, name="aliveLimited", status=squad.ALIVE, spawned=100)
-        squad.upsert(self.p, name="goneSpawned", status=squad.ALIVE,
-                     live_sid="resume-me", spawned=200)
-        squad.upsert(self.p, name="gonePlanned", status=squad.PLANNED, spawned=0)
-
-    def _reconcile(self):
-        self._seed()
-        # aliveLimited carries the usage-limit marker; the warden owns clearing it.
-        self.p.limited("aliveLimited").parent.mkdir(parents=True, exist_ok=True)
-        self.p.limited("aliveLimited").write_text("limited")
-        from af import tmux, live, mailbox
-        with mock.patch.object(tmux, "has_session", self._fake_has_session), \
-             mock.patch.object(live, "live_sid", self._fake_live_sid), \
-             mock.patch.object(mailbox, "unread", self._fake_unread):
-            return squad.reconcile(self.p)
-
-    def test_status_transitions(self):
-        sq = self._reconcile()
-        self.assertEqual(sq.agents["aliveOk"].status, squad.ALIVE)
-        self.assertEqual(sq.agents["aliveLimited"].status, squad.LIMITED)
-        self.assertEqual(sq.agents["goneSpawned"].status, squad.DOWN)
-        self.assertEqual(sq.agents["gonePlanned"].status, squad.PLANNED)
-
-    def test_live_sid_only_advances_to_a_running_session(self):
-        sq = self._reconcile()
-        # An alive agent's sid is corrected to the running one...
-        self.assertEqual(sq.agents["aliveOk"].live_sid, "sid-running")
-        # ...but a gone agent keeps its stored resume record.
-        self.assertEqual(sq.agents["goneSpawned"].live_sid, "resume-me")
-
-    def test_unread_is_reconciled_from_the_mailbox(self):
-        sq = self._reconcile()
-        self.assertEqual(sq.agents["aliveOk"].unread, 7)
-
-    def test_reconcile_returns_what_was_persisted(self):
-        sq = self._reconcile()
-        # The return value is a fresh load() — it must match disk.
-        self.assertEqual(sq.to_dict(), squad.load(self.p).to_dict())
-
-
-# --- quarantine: a mutation must not silently clobber an unparseable file ------------
-class TestQuarantine(TempFactory):
-    """`load` (read-only) tolerates a corrupt file by returning empty. But a mutation seeds from
-    `_load_for_edit`, which refuses to overwrite a corrupt file: it renames the bad bytes aside to
-    `squad.json.bad-<ts>` (data preserved) and starts a fresh roster, so a garbage file can never
-    persist an empty roster over real state."""
-
-    GARBAGE = "}{ not json at all — real state that must not be clobbered"
-
-    def _write_garbage(self):
-        self.p.specdir.mkdir(parents=True, exist_ok=True)
-        self.p.squad_file.write_text(self.GARBAGE, encoding="utf-8")
-
-    def test_a_mutation_quarantines_a_corrupt_file_and_starts_fresh(self):
-        self._write_garbage()
-        squad.upsert(self.p, name="x")
-
-        bad = list(self.p.specdir.glob("squad.json.bad-*"))
-        self.assertEqual(len(bad), 1, "the unparseable file was not quarantined")
-        self.assertEqual(bad[0].read_text(encoding="utf-8"), self.GARBAGE)  # original preserved
-
-        sq = squad.load(self.p)                       # the fresh roster parses...
-        self.assertIn("x", sq.agents)                 # ...and holds the new station
-        self.assertEqual(sq.agents["x"].name, "x")
-
-    def test_a_plain_load_never_quarantines(self):
-        self._write_garbage()
-        sq = squad.load(self.p)                        # read-only: tolerant, empty
-        self.assertEqual(sq.agents, {})
-        # A read must not rename anything — the bad file stays exactly where it is.
-        self.assertFalse(list(self.p.specdir.glob("squad.json.bad-*")))
-        self.assertEqual(self.p.squad_file.read_text(encoding="utf-8"), self.GARBAGE)
-
-
-# --- mark_up: idempotent spawn stamp, owns status/spawned ---------------------------
-class TestMarkUp(TempFactory):
-    def test_first_call_stamps_spawned_and_sets_alive(self):
-        st = squad.mark_up("qa", self.p)
-        self.assertEqual(st.status, squad.ALIVE)
-        self.assertGreater(st.spawned, 0)             # time.time() is real; just nonzero
-
-    def test_second_call_does_not_restamp_spawned(self):
-        first = squad.mark_up("qa", self.p).spawned
-        self.assertGreater(first, 0)
-        again = squad.mark_up("qa", self.p).spawned   # idempotent stamp
-        self.assertEqual(again, first)
-
-    def test_status_and_spawned_in_fields_are_ignored(self):
-        # mark_up owns these two; a caller passing them must not override.
-        squad.mark_up("qa", self.p)
-        first = squad.get("qa", self.p).spawned
-        st = squad.mark_up("qa", self.p, status=squad.DOWN, spawned=1)
-        self.assertEqual(st.status, squad.ALIVE)      # not DOWN
-        self.assertEqual(st.spawned, first)           # not 1
-
-    def test_extra_fields_are_applied(self):
-        st = squad.mark_up("qa", self.p, settings_path="/s.json",
-                           live_sid="sid-1", role="qa")
-        self.assertEqual(st.settings_path, "/s.json")
-        self.assertEqual(st.live_sid, "sid-1")
-        self.assertEqual(st.role, "qa")
-
-
-# --- reconcile: DOWN vs PLANNED for a gone station, decided by the resume record -----
-class TestReconcileDownVsPlanned(TempFactory):
-    """When a station is not alive, reconcile must tell 'was spawned' (DOWN) from 'never spawned'
-    (PLANNED). spawned==0 alone is not enough: a non-empty live_sid IS a resume record, so it
-    reconciles to DOWN even when the spawn stamp was lost."""
-
-    def _reconcile_all_gone(self):
-        from af import tmux, live, mailbox
-        with mock.patch.object(tmux, "has_session", lambda target: False), \
-             mock.patch.object(live, "live_sid", lambda *a, **k: ""), \
-             mock.patch.object(mailbox, "unread", lambda *a, **k: 0):
-            return squad.reconcile(self.p)
-
-    def test_a_gone_station_holding_a_live_sid_is_down_not_planned(self):
-        # spawned==0 but a resume record survives → it WAS spawned → DOWN.
-        squad.upsert(self.p, name="orphan", status=squad.ALIVE,
-                     live_sid="resume-me", spawned=0)
-        sq = self._reconcile_all_gone()
-        self.assertEqual(sq.agents["orphan"].status, squad.DOWN)
-        self.assertEqual(sq.agents["orphan"].live_sid, "resume-me")   # not blanked
-
-    def test_a_gone_station_with_no_sid_and_no_stamp_is_planned(self):
-        squad.upsert(self.p, name="planned", status=squad.PLANNED,
-                     live_sid="", spawned=0)
-        sq = self._reconcile_all_gone()
-        self.assertEqual(sq.agents["planned"].status, squad.PLANNED)
-
-
-# --- reconcile: a failing liveness probe on one station must not abort the rest ------
-class TestReconcilePartialProgress(TempFactory):
-    """The compute loop wraps each station's probe in try/except, so a probe that raises for one
-    session degrades only that station — the others still reconcile."""
-
-    def test_one_raising_probe_does_not_stop_the_others(self):
-        squad.upsert(self.p, name="boom", status=squad.ALIVE,
-                     live_sid="resume-boom", spawned=100)
-        squad.upsert(self.p, name="ok", status=squad.ALIVE,
-                     live_sid="stale", spawned=200)
-
-        def flaky_has_session(target):
-            if target.endswith("-boom"):
-                raise RuntimeError("tmux probe blew up")
-            return False                              # "ok" is gone
-
-        from af import tmux, live, mailbox
-        with mock.patch.object(tmux, "has_session", flaky_has_session), \
-             mock.patch.object(live, "live_sid", lambda *a, **k: ""), \
-             mock.patch.object(mailbox, "unread", lambda *a, **k: 0):
-            sq = squad.reconcile(self.p)
-
-        # "ok" still reconciled despite "boom"'s probe raising: gone + spawned → DOWN.
-        self.assertEqual(sq.agents["ok"].status, squad.DOWN)
-        self.assertEqual(sq.agents["ok"].live_sid, "stale")
-        # "boom" survived the raise (its status fell back to its ALIVE/LIMITED prior).
-        self.assertIn("boom", sq.agents)
+    def test_remove_on_a_malformed_blueprint_is_fatal(self):
+        f = self.root / "bad.json"
+        f.write_text("{ not json", encoding="utf-8")
+        with mock.patch("af.squad.lifecycle.down") as down:
+            self.assertEqual(squad.cmd_remove(str(f), "a"), 1)
+            down.assert_not_called()
 
 
 if __name__ == "__main__":
