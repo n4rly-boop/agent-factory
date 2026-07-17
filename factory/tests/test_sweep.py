@@ -173,6 +173,43 @@ class Lock(TempFactory):
         self.assertFalse(self.p.sweep_lock.exists())
 
 
+class MailPing(TempFactory):
+    """sweep() rings any alive, non-generating agent sitting on unread mail — closing the gap
+    where postmaster's own ring-catch deliberately never re-rings a STAGNANT unread count
+    (only a growing one). ring_pending_fresh() is the latency guard: when a doorbell is
+    already known in flight, sweep must not pay for (or trigger) a second one."""
+
+    def _sweep(self, phase="idle", unread=1, ring_pending_fresh=False):
+        self.p.box("worker").write_text("")   # so "worker" shows up in p.boxes()
+        pr = Probe(alive=True, phase=phase, ctx=1000, endturns=1, inputbox="")
+        with mock.patch("af.sweep.probe", side_effect=lambda n, pp: pr), \
+             mock.patch("af.mailbox.unread", return_value=unread), \
+             mock.patch("af.drive.ring_pending_fresh", return_value=ring_pending_fresh), \
+             mock.patch("af.drive.ring") as ring, \
+             mock.patch("af.drive.spec_thresholds", return_value=(None, None)), \
+             mock.patch("af.drive.maybe_autocompact", return_value="none"):
+            sweepmod.sweep(p=self.p)
+        return ring
+
+    def test_an_idle_agent_with_unread_mail_gets_rung(self):
+        ring = self._sweep(phase="idle", unread=1, ring_pending_fresh=False)
+        ring.assert_called_once_with("worker", self.p)
+
+    def test_a_doorbell_already_in_flight_is_not_piled_on(self):
+        ring = self._sweep(phase="idle", unread=1, ring_pending_fresh=True)
+        ring.assert_not_called()
+
+    def test_no_unread_mail_means_nothing_to_ring_for(self):
+        ring = self._sweep(phase="idle", unread=0, ring_pending_fresh=False)
+        ring.assert_not_called()
+
+    def test_a_generating_agent_is_not_rung_by_the_mail_ping_either(self):
+        # ring() itself doesn't check the timer, but sweep's mail-ping guard does — a
+        # generating agent already gets `maybe_autocompact`'s own generating-branch handling.
+        ring = self._sweep(phase="generating", unread=1, ring_pending_fresh=False)
+        ring.assert_not_called()
+
+
 class Autosweep(TempFactory):
     """Only an ORCHESTRATOR sweeps: a worker running `af mail` in its own session must not
     start compacting its peers."""

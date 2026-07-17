@@ -29,8 +29,9 @@ def _spec(name: str, p) -> None:
         slug=p.slug, name=name, cwd=str(p.cwd), sid="", spawned=0, flags=""), p)
 
 
-def _probe(alive=True, phase="idle", ctx=1000, endturns=1) -> Probe:
-    return Probe(alive=alive, phase=phase, ctx=ctx, endturns=endturns, inputbox="")
+def _probe(alive=True, phase="idle", ctx=1000, endturns=1, has_background=False) -> Probe:
+    return Probe(alive=alive, phase=phase, ctx=ctx, endturns=endturns, inputbox="",
+                 has_background=has_background)
 
 
 def _run_ledger(p) -> str:
@@ -75,11 +76,11 @@ class LedgerStateColumn(TempFactory):
         self.assertEqual(_state_column(out, "alice"), "idle")
 
     def test_a_genuinely_busy_agent_shows_task(self):
-        # A task went out and nothing has answered it yet.
-        mailbox.send(to="bob", body="do the other thing", kind="task", frm="boss", p=self.p)
-        self.assertEqual(mailbox.task_state("bob", self.p), "busy")
-
-        probes = {"alice": _probe(), "bob": _probe(), "carol": _probe(), "dave": _probe()}
+        # "task" now means the agent's OWN transcript tail ends on an unresolved Task/Agent
+        # dispatch (Probe.has_background) — not a fold of the mail log (mailbox.task_state
+        # is unrelated now; see test_mailbox.py/test_mailcli.py for its own coverage).
+        probes = {"alice": _probe(), "bob": _probe(has_background=True), "carol": _probe(),
+                  "dave": _probe()}
         with mock.patch("af.ledger.probe", side_effect=lambda n, pp: probes[n]):
             out = _run_ledger(self.p)
         self.assertEqual(_state_column(out, "bob"), "task")

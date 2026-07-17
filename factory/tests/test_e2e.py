@@ -98,7 +98,17 @@ class E2E(unittest.TestCase):
         return f"--settings {self.specdir() / 'settings-neo.json'}"
 
     def roster(self) -> dict:
-        return json.loads((self.specdir() / "squad.json").read_text(encoding="utf-8"))
+        """squad.json (STABLE) merged with state.json (VOLATILE), keyed by station name —
+        mirrors af.roster._merge()/load(). Read raw rather than through af.roster because this
+        test process never sets AF_ROOT/AF_SLUG for the squad under test (those only go into
+        the `af` subprocesses' env via self.env())."""
+        stable = json.loads((self.specdir() / "squad.json").read_text(encoding="utf-8"))
+        state_file = self.specdir() / "state.json"
+        volatile = (json.loads(state_file.read_text(encoding="utf-8"))
+                    if state_file.is_file() else {})
+        agents = {name: {**sd, **(volatile.get(name) or {})}
+                  for name, sd in (stable.get("agents") or {}).items()}
+        return {**stable, "agents": agents}
 
     def sid_file(self) -> Path:
         return self.tmp / "root" / ".ai" / self.slug / "sid-neo"

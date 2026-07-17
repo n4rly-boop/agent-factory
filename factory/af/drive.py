@@ -167,6 +167,19 @@ DOORBELL = "!bash $AF_MAIL read"      # typed into the pane, verbatim, always
 DOORBELL_BODY = "bash $AF_MAIL read"  # how the TUI renders it back in the box
 
 
+def ring_pending_fresh(agent: str, p: Paths | None = None) -> bool:
+    """True if a doorbell was sent recently enough (`RING_DEBOUNCE`) that another buys nothing.
+    The same check `ring()` makes internally — exposed so a caller (e.g. `sweep`, deciding
+    whether to nudge many idle-with-unread agents in one pass) can skip the tmux round-trip
+    entirely instead of paying it just to find out ring() would have no-op'd anyway."""
+    p = p or paths()
+    marker = p.ring_pending(agent)
+    try:
+        return marker.is_file() and (time.time() - marker.stat().st_mtime) < RING_DEBOUNCE
+    except OSError:
+        return False
+
+
 def ring(agent: str, p: Paths | None = None) -> bool:
     """The doorbell: type ONE fixed, path-free command into the recipient's pane.
 
@@ -196,6 +209,14 @@ def ring(agent: str, p: Paths | None = None) -> bool:
     if phase == "permission":
         return False
 
+    # REAL-STATE DEDUP, checked before the timer: if the doorbell is still sitting unsubmitted
+    # in the input box (a long turn hasn't reached its boundary yet), there is nothing a second
+    # send would do except pile a duplicate behind the first. This is the ground truth for the
+    # one window the age-bounded marker below cannot see into — a turn that outlives
+    # RING_DEBOUNCE with the first doorbell still visibly queued.
+    if pane is not None and patterns.input_box(pane) == DOORBELL_BODY:
+        return True
+
     # DEDUP. Each doorbell is its OWN model turn, and the FIRST one to land reads ALL unread
     # mail — so every doorbell typed between one being queued and the recipient reading is a
     # guaranteed-empty turn. The marker means "a doorbell is in flight, not yet consumed";
@@ -216,12 +237,8 @@ def ring(agent: str, p: Paths | None = None) -> bool:
     # the next turn boundary (seconds when idle, up to a long turn when busy); RING_DEBOUNCE
     # is the ceiling on that. Past it, ring anyway — at most one extra doorbell per two
     # minutes on a genuinely long turn, versus mail lost for good.
-    marker = p.ring_pending(agent)
-    try:
-        if marker.is_file() and (time.time() - marker.stat().st_mtime) < RING_DEBOUNCE:
-            return True
-    except OSError:
-        pass
+    if ring_pending_fresh(agent, p):
+        return True
 
     def _queued() -> bool:
         """Record that a doorbell is now in flight, so the next send skips until it is read
@@ -405,23 +422,33 @@ def approve(agent: str, choice: str = "2", p: Paths | None = None) -> int:
     return 1
 
 
-def compact(agent: str, nowait: bool = False, p: Paths | None = None) -> bool:
-    """Run /compact. SAFE ONLY between turns.
+def compact(agent: str, nowait: bool = False, p: Paths | None = None,
+            force_mid_turn: bool = False) -> bool:
+    """Run /compact. SAFE ONLY between turns — unless `force_mid_turn`.
 
-    Refuses mid-generation (would interrupt), on a permission prompt (the keystrokes would
-    ANSWER the prompt, not compact), and under the account-wide usage limit — /compact is a
-    model call, and the model is exactly what a limited agent has run out of. Sending it
-    there achieves nothing, and it achieves nothing FOREVER: the context never drops, so
-    every following sweep sees the same fat agent and sends /compact again, every tick,
-    until the quota returns. The warden deals with the limit; compaction stays out of its
-    way.
+    Refuses mid-generation (would interrupt — or so it was believed), on a permission prompt
+    (the keystrokes would ANSWER the prompt, not compact), and under the account-wide usage
+    limit — /compact is a model call, and the model is exactly what a limited agent has run
+    out of. Sending it there achieves nothing, and it achieves nothing FOREVER: the context
+    never drops, so every following sweep sees the same fat agent and sends /compact again,
+    every tick, until the quota returns. The warden deals with the limit; compaction stays out
+    of its way.
+
+    `force_mid_turn=True` skips ONLY the generating-refusal — permission and limited stay
+    absolute, because those are about real unsafety/uselessness, not about queueing. Claude
+    Code queues a slash command typed mid-generation exactly like plain text (docs: every
+    slash command except an explicit immediate-run whitelist — /status, /tasks, /usage, /btw
+    — queues and fires at the next turn boundary; /compact is not on that whitelist), so the
+    generating-refusal here was never a safety requirement, only an untested assumption — see
+    `maybe_autocompact`, which sets this only for a HARD breach: a turn burning past hard is
+    exactly the case that must not wait for the agent to go idle on its own.
     """
     p = p or paths()
     pr = probemod.probe(agent, p)
     if not pr.alive:
         print(f"[af] no agent '{agent}'")
         return False
-    if pr.phase == "generating":
+    if pr.phase == "generating" and not force_mid_turn:
         print(f"[af] '{agent}' is mid-turn — refusing to compact (would interrupt). "
               f"retry when idle.")
         return False
@@ -529,7 +556,9 @@ def maybe_autocompact(agent: str, soft: object = None, hard: object = None,
     if d == "hard":
         print(f"[af] context ≈ {c} tok > hard {h} — compacting '{agent}' now (mid-task or "
               f"not; running out would lose everything)…")
-        compact(agent, nowait=nowait, p=p)
+        # force_mid_turn: a hard breach must not wait for the agent to go idle on its own —
+        # see compact()'s docstring for why this is safe (the slash command queues).
+        compact(agent, nowait=nowait, p=p, force_mid_turn=True)
     elif d == "soft":
         print(f"[af] context ≈ {c} tok > soft {s} — compacting '{agent}'…")
         compact(agent, nowait=nowait, p=p)
