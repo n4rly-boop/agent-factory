@@ -105,5 +105,55 @@ class LedgerStateColumn(TempFactory):
         self.assertEqual(_state_column(out, "dave"), "-")
 
 
+def _self_column(output: str, name: str) -> str:
+    """The SELF token for `name`'s row — one further along than STATE, per HEADER's
+    NAME ROLE MODEL PARENT CTX MAIL STATE CMP SELF SESSION ordering: name(0) role(1)
+    model(2) parent(3) ctx(4) unread(5) state(6) cmp(7) self(8)."""
+    for line in output.splitlines():
+        tokens = line.split()
+        if tokens and tokens[0] == name:
+            return tokens[8]
+    raise AssertionError(f"no row for {name!r} in:\n{output}")
+
+
+class LedgerSelfColumn(TempFactory):
+    """delegate_wall()'s cumulative self-write counter, read straight off the file the hook
+    itself writes (p.self_lines(name)) — never through roster/Station, so a daemon that only
+    round-trips a stale in-memory Station copy can't silently drop it."""
+
+    def _spec(self, name: str, delegate: str) -> None:
+        env = {"AF_DELEGATE": delegate} if delegate else {}
+        specmod.write(specmod.Spec(
+            slug=self.p.slug, name=name, cwd=str(self.p.cwd), sid="", spawned=0, flags="",
+            env=env), self.p)
+
+    def test_an_advised_agent_shows_its_real_self_lines_count(self):
+        self._spec("alice", "advised")
+        self.p.state.mkdir(parents=True, exist_ok=True)
+        self.p.self_lines("alice").write_text("17", encoding="utf-8")
+
+        probes = {"alice": _probe()}
+        with mock.patch("af.ledger.probe", side_effect=lambda n, pp: probes[n]):
+            out = _run_ledger(self.p)
+        self.assertEqual(_self_column(out, "alice"), "17")
+
+    def test_a_required_agent_also_shows_its_count(self):
+        self._spec("bob", "required")
+        self.p.state.mkdir(parents=True, exist_ok=True)
+        self.p.self_lines("bob").write_text("3", encoding="utf-8")
+
+        probes = {"bob": _probe()}
+        with mock.patch("af.ledger.probe", side_effect=lambda n, pp: probes[n]):
+            out = _run_ledger(self.p)
+        self.assertEqual(_self_column(out, "bob"), "3")
+
+    def test_an_agent_with_no_delegate_level_shows_a_dash(self):
+        self._spec("carol", "")
+        probes = {"carol": _probe()}
+        with mock.patch("af.ledger.probe", side_effect=lambda n, pp: probes[n]):
+            out = _run_ledger(self.p)
+        self.assertEqual(_self_column(out, "carol"), "-")
+
+
 if __name__ == "__main__":
     unittest.main()

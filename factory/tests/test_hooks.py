@@ -180,7 +180,8 @@ class Advised(HookRun):
     def test_a_bulk_write_to_the_repo_earns_the_note(self):
         rc, out, err = self.wall(write_ev(f"{REPO}/src.py", BULK_BODY), level="advised")
         ctx = self.assertAdvised(rc, out)
-        self.assertIn("200 lines, threshold 40", ctx)
+        self.assertIn("self-written 200 lines outside your work dir without delegating "
+                      "(threshold 40)", ctx)
         self.assertIn(f"{REPO}/src.py", ctx)
 
     def test_a_bulk_write_INSIDE_work_is_the_agent_doing_its_job(self):
@@ -219,6 +220,43 @@ class Advised(HookRun):
         ctx = self.assertAdvised(*self.wall(bash_ev(heredoc), level="advised")[:2])
         self.assertNotIn("line 150", ctx)
         self.assertIn("…", ctx)
+
+    def test_two_calls_accumulate_and_the_second_crosses_the_threshold(self):
+        # The counter is CUMULATIVE across separate tool calls, not per-call: a station that
+        # self-writes 3 lines, then 5 more, has self-written 8 — and the note on the SECOND
+        # call must carry that total, not just the 5 this call landed.
+        rc1, out1, _ = self.wall(edit_ev(f"{REPO}/a.py", "a\nb\nc"), level="advised",
+                                 AF_BULK_LINES="8")
+        self.assertSilent(rc1, out1)
+        rc2, out2, _ = self.wall(edit_ev(f"{REPO}/b.py", "d\ne\nf\ng\nh"), level="advised",
+                                 AF_BULK_LINES="8")
+        ctx = self.assertAdvised(rc2, out2)
+        self.assertIn("self-written 8 lines outside your work dir without delegating "
+                      "(threshold 8)", ctx)
+
+    def test_a_bash_call_with_two_write_targets_counts_the_command_once_not_twice(self):
+        # One Bash tool_use, two out-of-zone heredoc targets. judge() runs once per target,
+        # but the fold into the cumulative counter happens ONCE after the loop — write_lines
+        # reads the whole tool call, so folding it inside the per-target loop would double
+        # (here: triple, since there are two targets plus the loop itself) count a single call.
+        cmd = (f"cat > {REPO}/a.py <<'EOF'\nfirst\nsecond\nEOF\n"
+               f"cat > {REPO}/b.py <<'EOF'\nthird\nfourth\nEOF")
+        expected = hooks.write_lines({"command": cmd})
+        rc, out, _ = self.wall(bash_ev(cmd), level="advised", AF_BULK_LINES="1000")
+        self.assertSilent(rc, out)
+        stored = int(self.p.self_lines("coder").read_text(encoding="utf-8").strip())
+        self.assertEqual(stored, expected)
+
+    def test_after_the_advice_fires_the_counter_resets_and_does_not_immediately_refire(self):
+        rc1, out1, _ = self.wall(edit_ev(f"{REPO}/a.py", BULK_BODY), level="advised",
+                                 AF_BULK_LINES="5")
+        self.assertAdvised(rc1, out1)
+        self.assertEqual(self.p.self_lines("coder").read_text(encoding="utf-8").strip(), "0")
+        # Next call starts fresh: a small write must not immediately re-fire off the total
+        # that was JUST cleared.
+        rc2, out2, _ = self.wall(edit_ev(f"{REPO}/b.py", "x\ny"), level="advised",
+                                 AF_BULK_LINES="5")
+        self.assertSilent(rc2, out2)
 
 
 class BulkThreshold(HookRun):
@@ -448,6 +486,47 @@ class FailsClosed(HookRun):
         for level in ("", "no", "off", "0", "none"):
             rc, out, err = self.wall(write_ev(f"{REPO}/src.py"), level=level)
             self.assertEqual((rc, out, err), (0, "", ""), f"AF_DELEGATE={level!r}")
+
+
+# ======================================================================================
+# delegate-progress: resets delegate_wall's cumulative counter on a real delegation
+# ======================================================================================
+class DelegateProgress(HookRun):
+    def _seed(self, n, agent="coder"):
+        self.p.state.mkdir(parents=True, exist_ok=True)
+        self.p.self_lines(agent).write_text(str(n), encoding="utf-8")
+
+    def _read(self, agent="coder"):
+        return self.p.self_lines(agent).read_text(encoding="utf-8").strip()
+
+    def progress(self, payload, **env):
+        return self.run_hook("delegate-progress", payload, AF_AGENT="coder", **env)
+
+    def test_the_matching_skill_resets_the_counter_to_zero(self):
+        self._seed(37)
+        rc, out, err = self.progress(
+            {"tool_name": "Skill", "tool_input": {"skill": "delegate-to-local-model"}})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._read(), "0")
+
+    def test_a_different_skill_does_not_reset(self):
+        self._seed(37)
+        rc, out, err = self.progress(
+            {"tool_name": "Skill", "tool_input": {"skill": "some-other-skill"}})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._read(), "37")
+
+    def test_a_non_skill_tool_does_not_reset(self):
+        self._seed(37)
+        rc, out, err = self.progress(
+            {"tool_name": "Bash", "tool_input": {"command": "echo hi"}})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._read(), "37")
+
+    def test_it_never_blocks(self):
+        rc, out, err = self.progress(
+            {"tool_name": "Skill", "tool_input": {"skill": "delegate-to-local-model"}})
+        self.assertEqual((rc, out, err), (0, "", ""))
 
 
 # ======================================================================================
@@ -912,8 +991,8 @@ class HooksOk(TempFactory):
 class Dispatch(HookRun):
     def test_every_hook_the_settings_install_is_dispatchable(self):
         self.assertEqual(sorted(hooks.HOOKS),
-                         ["delegate-wall", "escalation-stop", "limit-hook", "read-wall",
-                          "role-reminder", "session-start", "spawn-gate"])
+                         ["delegate-progress", "delegate-wall", "escalation-stop", "limit-hook",
+                          "read-wall", "role-reminder", "session-start", "spawn-gate"])
 
     def test_an_unknown_hook_is_a_usage_error_not_a_silent_zero(self):
         rc, out, err = self.run_hook("nonesuch")

@@ -194,6 +194,13 @@ def up(name: str = "claude", p: Paths | None = None, env: dict | None = None) ->
     print(f"[af] interactive claude launched (session={s} id={sid} cwd={p.cwd})")
     p.state.mkdir(parents=True, exist_ok=True)
     p.sid_file(name).write_text(sid, encoding="utf-8")
+    # A fresh spawn under this name starts delegate-wall's advisory counter at zero — a
+    # prior, never-fired count (the agent died before crossing the threshold) must not carry
+    # over and nudge the new agent on its very first small edit.
+    try:
+        p.self_lines(name).write_text("0", encoding="utf-8")
+    except OSError:
+        pass
     # Record the station in the durable roster (squad.json). Additive: the sid file above
     # stays authoritative during the migration, so a squad-write failure must never fail a
     # spawn — the roster is a convenience view that self-heals on the next reconcile.

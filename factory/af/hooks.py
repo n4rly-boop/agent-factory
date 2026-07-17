@@ -13,6 +13,7 @@ Two halves:
 
         python3 -m af.hooks role-reminder     # UserPromptSubmit
         python3 -m af.hooks delegate-wall     # PreToolUse: Write|Edit|MultiEdit|NotebookEdit|Bash
+        python3 -m af.hooks delegate-progress # PreToolUse: Skill — resets delegate-wall's counter
         python3 -m af.hooks spawn-gate        # PreToolUse: Bash — only the orchestrator spawns (`af up`/`af revive`)
         python3 -m af.hooks read-wall         # PreToolUse: Read — deny huge unbounded reads
         python3 -m af.hooks limit-hook        # StopFailure, matcher rate_limit
@@ -459,15 +460,43 @@ Then verify what came back. Do not retry this write."""
 
 def _advice_text(target: str, n: int, bulk: int) -> str:
     agent = _env("AF_AGENT", "this agent")
-    return f"""This write is bulk ({n} lines, threshold {bulk}) and lands outside your work dir:
+    return f"""You've self-written {n} lines outside your work dir without delegating (threshold {bulk}):
   {target}
 
-You are '{agent}', a mini-orchestrator. Bulk writing is exactly what the
-delegate-to-local-model skill is for: it is free, it runs in its own process, and it keeps
-the tokens off your context. Mailing the peer who owns this area is the other route.
+You are '{agent}', a mini-orchestrator. delegate-to-local-model is free, runs in its own
+process, and keeps the tokens off your context. Mailing the peer who owns this area is
+the other route.
 
-The write was ALLOWED — if you have already thought about it, carry on. If you were just
-doing it because it was quicker than delegating, delegate it and verify what comes back."""
+The write was ALLOWED — the counter resets the moment you actually delegate."""
+
+
+def _bump_self_lines(agent: str, n: int, p) -> int:
+    """Read-add-write the cumulative self-lines counter. No lock.
+
+    ponytail: a lost increment (concurrent tool calls racing the same file) only delays the
+    next nudge by one more write — the counter keeps growing regardless, and it self-corrects.
+    Add a roster.edit()-style flock if this ever needs to become an audited count rather than
+    an advisory one."""
+    f = p.self_lines(agent)
+    try:
+        cur = intish(f.read_text(encoding="utf-8").strip(), 0)
+    except OSError:
+        cur = 0
+    total = cur + n
+    try:
+        p.state.mkdir(parents=True, exist_ok=True)
+        f.write_text(str(total), encoding="utf-8")
+    except OSError:
+        pass   # best-effort: a failed write only delays the next nudge, never blocks the tool
+    return total
+
+
+def _reset_self_lines(agent: str, p) -> None:
+    try:
+        p.state.mkdir(parents=True, exist_ok=True)
+        p.self_lines(agent).write_text("0", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _advise(msg: str) -> int:
@@ -539,25 +568,28 @@ def delegate_wall() -> int:
     tin = payload.get("tool_input")
     tin = tin if isinstance(tin, dict) else {}
 
-    advise_target, advise_n = "", 0
+    advise_target = ""
 
     def judge(path: str, label: str = "") -> int | None:
         """The one decision, made once, per write target. RETURNS on an allowed target — it
         must never exit: one Bash command can carry several write targets and the caller loops
         over them. In the bash an early exit meant the FIRST allowed target ended the hook and
         every target after it went unjudged — `echo ok > /tmp/x; echo pwned > ai.sh` sailed
-        through a `required` wall."""
-        nonlocal advise_target, advise_n
+        through a `required` wall.
+
+        Only REMEMBERS the first out-of-zone target for `advised` — it does not touch the
+        self-lines counter here. `write_lines(tin)` is the same value on every iteration of
+        this loop (it reads the whole tool call, not the per-target slice), so folding it into
+        the cumulative counter inside this closure would double- or triple-count a single
+        multi-target Bash call. The fold happens exactly once, after the loop, below."""
+        nonlocal advise_target
         if _allowed(path, work, root):
             return None                            # inside work/ or scratch → not our business
         if level == "required":
             print(_deny_text(label or path, work), file=sys.stderr)
             return 2
-        n = write_lines(tin)                       # advised: only bulk is worth a word
-        if n < bulk:
-            return None
         if not advise_target:                      # advise ONCE, after every target is judged
-            advise_target, advise_n = (label or path), n
+            advise_target = label or path
         return None
 
     if tool == "Bash":
@@ -592,7 +624,43 @@ def delegate_wall() -> int:
             return rc
 
     if advise_target:
-        return _advise(_advice_text(advise_target, advise_n, bulk))
+        # Fold this call's size into the CUMULATIVE counter exactly once here — never inside
+        # judge()'s per-target loop (see its docstring) — so a multi-target Bash call still
+        # only counts once. `write_lines(tin)` is per-call size; `total` is what survives
+        # across calls until a real delegation (delegate_progress()) or the threshold fires.
+        n = write_lines(tin)
+        p = _state_paths()                         # fork-safe — never a bare paths()
+        who = _env("AF_AGENT", "orchestrator")
+        total = _bump_self_lines(who, n, p)
+        if total >= bulk:
+            _reset_self_lines(who, p)
+            return _advise(_advice_text(advise_target, total, bulk))
+    return 0
+
+
+# ======================================================================================
+# delegate-progress — PreToolUse on Skill
+# ======================================================================================
+# Pure observer, never blocks: resets self-lines the moment the agent actually routes work
+# out, so delegate_wall()'s cumulative advisory clears instead of ratcheting forever.
+#
+# Deliberately NOT matched on Agent/Task too. A Task subagent inherits this same wall under
+# the SAME AF_AGENT identity (_deny_text/spawn_gate/the entrypoint brief all say so, three
+# times over: "NOT a way out... will be blocked identically"). Resetting on a bare Task/Agent
+# tool_use would reward exactly the workaround this wall exists to prevent — fire a trivial
+# subagent call to zero the counter, then keep self-writing. Only a real
+# Skill(delegate-to-local-model) call earns the reset.
+def delegate_progress() -> int:
+    try:
+        payload = _stdin_json()
+    except ValueError:
+        return 0
+    if str(payload.get("tool_name") or "") != "Skill":
+        return 0
+    tin = payload.get("tool_input")
+    tin = tin if isinstance(tin, dict) else {}
+    if str(tin.get("skill") or "") == "delegate-to-local-model":
+        _reset_self_lines(_env("AF_AGENT", "orchestrator"), _state_paths())
     return 0
 
 
@@ -999,6 +1067,7 @@ def escalation_stop() -> int:
 HOOKS = {
     "role-reminder": role_reminder,
     "delegate-wall": delegate_wall,
+    "delegate-progress": delegate_progress,
     "spawn-gate": spawn_gate,
     "read-wall": read_wall,
     "limit-hook": limit_hook,
