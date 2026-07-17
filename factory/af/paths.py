@@ -86,6 +86,15 @@ class Paths:
     def limited(self, agent: str) -> Path:
         return self.state / f"limited-{agent}"
 
+    def self_lines(self, agent: str) -> Path:
+        # Cumulative "lines self-written outside work/ since last real delegation" —
+        # advisory-only counter for delegate_wall()'s `advised` level. Deliberately a plain
+        # per-agent file, not a roster.Station field: postmaster holds a long-lived, stale
+        # copy of Station in memory and round-trips it every tick, silently dropping any
+        # field a hook writes until the daemon restarts. A hook-only file has no daemon in
+        # its write path at all.
+        return self.state / f"self-lines-{agent}"
+
     @property
     def limits_json(self) -> Path:
         return self.state / "limits.json"

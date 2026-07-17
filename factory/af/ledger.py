@@ -2,9 +2,9 @@
 
 tmux for aliveness, the session log for context size AND for the model that actually
 answered the last turn, the mailbox for unread and for busy/idle, squad.json for the
-compact count — derived on read, so it cannot drift from reality the way a cached status
-table would. The specs supply only what the live world cannot say: role, chain of command,
-which wall.
+compact count, delegate_wall's own state file for the self-write counter — derived on
+read, so it cannot drift from reality the way a cached status table would. The specs
+supply only what the live world cannot say: role, chain of command, which wall.
 
 Two rules this view exists to keep:
 
@@ -25,11 +25,12 @@ from __future__ import annotations
 from . import hooks, mailbox, roster, spec as specmod, warden
 from .drive import resolve_thresholds
 from .manifest import session_log_exists
+from .nums import intish
 from .paths import Paths, paths
 from .probe import probe
 
 HEADER = (f"{'NAME':<10} {'ROLE':<14} {'MODEL':<26} {'PARENT':<8} {'CTX':>8} {'MAIL':>5} "
-          f"{'STATE':<6} {'CMP':>3} SESSION")
+          f"{'STATE':<6} {'CMP':>3} {'SELF':>4} SESSION")
 
 
 def _wall(delegate: str, settings: str) -> str:
@@ -104,9 +105,21 @@ def ledger(p: Paths | None = None) -> int:
         model = pr.model or sp.model or "default"
         compacts = (squad.agents.get(name).compacts if squad.agents.get(name) else 0)
 
+        # delegate_wall()'s cumulative advisory counter — read straight off the file the
+        # hook itself writes, never through roster/Station (see module docstring: no daemon
+        # staleness risk this way). "-" for a station with no delegate level configured, same
+        # as _wall() staying silent on delegate=="".
+        if sp.delegate in ("advised", "required"):
+            try:
+                self_lines = str(intish(p.self_lines(name).read_text(encoding="utf-8").strip(), 0))
+            except OSError:
+                self_lines = "0"
+        else:
+            self_lines = "-"
+
         print(f"{name:<10} {sp.role or '-':<14} {model:<26} "
               f"{sp.parent or '-':<8} {ctx or '-':>8} {unread:>5} {state or '-':<6} "
-              f"{compacts:>3} {alive}{_wall(sp.delegate, sp.settings)}")
+              f"{compacts:>3} {self_lines:>4} {alive}{_wall(sp.delegate, sp.settings)}")
 
     print()
     if fat:
