@@ -39,6 +39,17 @@ def _user(text="hi"):
     return {"type": "user", "message": {"role": "user", "content": text}}
 
 
+def _asst_toolcall(name: str, stop_reason: str = "tool_use", tool_input: dict | None = None):
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "stop_reason": stop_reason,
+            "content": [{"type": "tool_use", "name": name, "input": tool_input or {}}],
+        },
+    }
+
+
 class TestScanLog(TempFactory):
     def _write(self, records, trailing: str = "") -> "object":
         f = self.root / "session.jsonl"
@@ -115,6 +126,50 @@ class TestScanLog(TempFactory):
             "message": {"stop_reason": "end_turn", "usage": {"input_tokens": 12}},
         }) + "\n", encoding="utf-8")
         self.assertEqual(probe._scan_log(f), (12, 1))
+
+
+class TestHasBackground(TempFactory):
+    """has_background: true only when the transcript's LAST assistant record ended on an
+    unresolved Task/Agent dispatch — that tool_use blocks the turn until it returns, so this
+    can only be the tail, never a mid-file scan. Deliberately NOT true for a run_in_background
+    Bash shell: CC closes that tool_use pair immediately with a "running" handle result, so
+    there is nothing left in the transcript to detect it by (see Probe.has_background)."""
+
+    def _write(self, records) -> "object":
+        f = self.root / "session.jsonl"
+        f.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        return f
+
+    def test_ending_on_an_unresolved_task_dispatch_is_background(self):
+        f = self._write([
+            _asst(stop_reason="end_turn"),
+            _asst_toolcall("Task"),
+        ])
+        _, _, _, has_background = probe._scan_log_full(f)
+        self.assertTrue(has_background)
+
+    def test_ending_on_an_unresolved_agent_dispatch_is_background(self):
+        f = self._write([_asst_toolcall("Agent")])
+        _, _, _, has_background = probe._scan_log_full(f)
+        self.assertTrue(has_background)
+
+    def test_ending_on_end_turn_is_not_background(self):
+        f = self._write([_asst_toolcall("Task"), _asst(stop_reason="end_turn")])
+        _, _, _, has_background = probe._scan_log_full(f)
+        self.assertFalse(has_background)
+
+    def test_ending_on_a_run_in_background_bash_is_NOT_detected(self):
+        # Documented non-coverage: CC resolves a run_in_background Bash tool_use's result
+        # immediately (a "running" handle), so the pair is already closed in the transcript —
+        # there is nothing here to distinguish it from any other finished Bash call.
+        f = self._write([_asst_toolcall("Bash", tool_input={"run_in_background": True})])
+        _, _, _, has_background = probe._scan_log_full(f)
+        self.assertFalse(has_background)
+
+    def test_scan_log_thin_wrapper_ignores_model_and_has_background(self):
+        # _scan_log's 2-tuple contract must not change shape for its existing callers.
+        f = self._write([_asst_toolcall("Task")])
+        self.assertEqual(probe._scan_log(f), (None, 0))
 
 
 class TestPhasePrecedence(unittest.TestCase):

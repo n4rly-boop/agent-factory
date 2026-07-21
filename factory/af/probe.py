@@ -38,6 +38,13 @@ class Probe:
     # the spec's model, which is what was PASSED at spawn and never updates after a runtime
     # /model switch. "" when the transcript has no usage-bearing assistant record yet.
     model: str = ""
+    # True when the agent's own LAST turn ended on an unresolved Task/Agent subagent dispatch
+    # (stop_reason == "tool_use", no further assistant record since — a Task/Agent tool_use
+    # blocks the turn until it returns, so this can only be the tail of the file, never a
+    # whole-transcript scan). Deliberately NOT true for a `run_in_background` Bash shell: CC
+    # writes that tool_use's result immediately (a "running" handle), closing the pair in the
+    # transcript before the shell actually finishes — there is nothing to detect it by here.
+    has_background: bool = False
 
 
 def session_log(agent: str, p: Paths | None = None) -> Path | None:
@@ -88,29 +95,34 @@ _ASSISTANT = b'"assistant"'
 
 def _scan_log(f: Path) -> tuple[int | None, int]:
     """(ctx, endturns) — the 2-tuple contract every existing caller/test relies on. A thin
-    view over _scan_log_full(); see there for the real work and for `model`."""
-    ctx, endturns, _model = _scan_log_full(f)
+    view over _scan_log_full(); see there for the real work and for `model`/`has_background`."""
+    ctx, endturns, _model, _has_background = _scan_log_full(f)
     return ctx, endturns
 
 
-def _scan_log_full(f: Path) -> tuple[int | None, int, str]:
-    """(ctx, endturns, model) from one streaming pass over the transcript.
+def _scan_log_full(f: Path) -> tuple[int | None, int, str, bool]:
+    """(ctx, endturns, model, has_background) from one streaming pass over the transcript.
 
     ctx  = input + cache_read + cache_creation of the LAST assistant record that carries
            usage — i.e. the whole prompt the model last saw. Output tokens are not part of
            the next prompt; the cached buckets are.
     endturns = assistant records with stop_reason == "end_turn".
+    has_background = the LAST assistant record ended on an unresolved Task/Agent dispatch —
+           see `Probe.has_background`'s docstring for why the tail alone is enough (a
+           Task/Agent tool_use blocks the turn, so the file cannot contain a later assistant
+           record until it returns) and why this is deliberately NOT whole-file tool_use vs
+           tool_result reconciliation, which would cost a json.loads per tool record.
 
-    ONE json.loads per END_TURN LINE, and one for the ctx record — not one per assistant
-    record. The difference is the whole cost of this function, and this function is on the
-    hot path twice over: `sweep` calls it per agent on every `post`/`mail`, and the wait
-    loops call it every 0.5s tick. A mature agent's jsonl runs to tens of MB, and parsing
-    every assistant record in one was seconds per agent, per command — which is why bash
-    fed jq only a `tail -c` window (ai.sh:508). We cannot take that shortcut: the window is
-    anchored to the END of the file, so end_turns would silently drop out of it as the
-    transcript grew, and `ask`'s "a NEW end_turn since my baseline" would compare two counts
-    taken over different windows. Byte-scanning per line, and parsing only the few lines
-    that matter, is cheap AND whole-file honest.
+    ONE json.loads per END_TURN LINE, and one for the ctx record, and one for the tail record —
+    not one per assistant record. The difference is the whole cost of this function, and this
+    function is on the hot path twice over: `sweep` calls it per agent on every `post`/`mail`,
+    and the wait loops call it every 0.5s tick. A mature agent's jsonl runs to tens of MB, and
+    parsing every assistant record in one was seconds per agent, per command — which is why
+    bash fed jq only a `tail -c` window (ai.sh:508). We cannot take that shortcut for
+    ctx/endturns: the window is anchored to the END of the file, so end_turns would silently
+    drop out of it as the transcript grew, and `ask`'s "a NEW end_turn since my baseline" would
+    compare two counts taken over different windows. Byte-scanning per line, and parsing only
+    the few lines that matter, is cheap AND whole-file honest.
 
     The torn final line (the file is being appended to as we read it) is dropped by the
     try/except, which is what bash reached for `grep` to avoid.
@@ -119,11 +131,13 @@ def _scan_log_full(f: Path) -> tuple[int | None, int, str]:
     model = ""
     endturns = 0
     last_usage: bytes | None = None
+    last_assistant: bytes | None = None
     try:
         with f.open("rb") as fh:
             for raw in fh:
                 if _ASSISTANT not in raw:
                     continue
+                last_assistant = raw   # remembered, not parsed: only the LAST one is read
                 if _USAGE in raw:
                     last_usage = raw   # remembered, not parsed: only the LAST one is read
                 if _END_TURN not in raw:
@@ -141,7 +155,7 @@ def _scan_log_full(f: Path) -> tuple[int | None, int, str]:
                 if isinstance(msg, dict) and msg.get("stop_reason") == "end_turn":
                     endturns += 1
     except OSError:
-        return None, 0, ""
+        return None, 0, "", False
 
     if last_usage is not None:
         try:
@@ -159,7 +173,24 @@ def _scan_log_full(f: Path) -> tuple[int | None, int, str]:
             model = str(msg.get("model") or "")
         except Exception:
             ctx = None
-    return ctx, endturns, model
+
+    has_background = False
+    if last_assistant is not None:
+        try:
+            rec = json.loads(last_assistant)
+        except Exception:
+            rec = None
+        if isinstance(rec, dict) and rec.get("type") == "assistant":
+            msg = rec.get("message") or {}
+            if isinstance(msg, dict) and msg.get("stop_reason") == "tool_use":
+                content = msg.get("content") or []
+                if isinstance(content, list):
+                    has_background = any(
+                        isinstance(c, dict) and c.get("type") == "tool_use"
+                        and c.get("name") in ("Task", "Agent")
+                        for c in content
+                    )
+    return ctx, endturns, model, has_background
 
 
 def _phase(pane: str) -> Phase:
@@ -189,13 +220,13 @@ def probe(agent: str, p: Paths | None = None) -> Probe:
     # endturns is a COUNT: its zero is 0, not None. Every caller compares it with an
     # integer (`> base` to decide a turn landed), and a fresh agent whose log does not
     # exist yet is the common case, not the exotic one.
-    ctx, endturns, model = _scan_log_full(log) if log else (None, 0, "")
+    ctx, endturns, model, has_background = _scan_log_full(log) if log else (None, 0, "", False)
 
     if pane is None:
         # A down agent still has a transcript, and its size is exactly what `ledger` and
         # `revive` want to know before bringing it back.
         return Probe(alive=False, phase="idle", ctx=ctx, endturns=endturns, inputbox=None,
-                      model=model)
+                      model=model, has_background=has_background)
 
     phase = _phase(pane)
     ctxpct = patterns.context_pct(pane)
@@ -206,7 +237,7 @@ def probe(agent: str, p: Paths | None = None) -> Probe:
     box = patterns.input_box(pane) if phase in ("idle", "generating") else None
 
     return Probe(alive=True, phase=phase, ctx=ctx, endturns=endturns, inputbox=box,
-                 ctxpct=ctxpct, model=model)
+                 ctxpct=ctxpct, model=model, has_background=has_background)
 
 
 def probe_target(target: str, sid: str | None = None) -> Probe:
@@ -218,23 +249,23 @@ def probe_target(target: str, sid: str | None = None) -> Probe:
     """
     pane = tmux.capture_pane(target)
     # For standalone targets, we can optionally read the log if we have a sid
-    ctx, endturns, model = None, 0, ""
+    ctx, endturns, model, has_background = None, 0, "", False
     if sid:
         from .paths import PROJECTS
         # Find the log file for this sid
         for root, _dirs, files in os.walk(PROJECTS):
             if f'{sid}.jsonl' in files:
                 log_path = Path(root) / f'{sid}.jsonl'
-                ctx, endturns, model = _scan_log_full(log_path)
+                ctx, endturns, model, has_background = _scan_log_full(log_path)
                 break
 
     if pane is None:
         return Probe(alive=False, phase='idle', ctx=ctx, endturns=endturns, inputbox=None,
-                      model=model)
+                      model=model, has_background=has_background)
 
     phase = _phase(pane)
     ctxpct = patterns.context_pct(pane)
     box = patterns.input_box(pane) if phase in ('idle', 'generating') else None
 
     return Probe(alive=True, phase=phase, ctx=ctx, endturns=endturns, inputbox=box,
-                 ctxpct=ctxpct, model=model)
+                 ctxpct=ctxpct, model=model, has_background=has_background)

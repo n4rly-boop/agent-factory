@@ -213,6 +213,19 @@ class DoorbellDedup(TempFactory):
         self.assertEqual(mailbox.read("worker", p=self.p), [])     # empty box
         self.assertFalse(self.p.ring_pending("worker").is_file())
 
+    def test_ring_dedups_off_the_live_input_box_with_no_fresh_marker_at_all(self):
+        # Real-state dedup: the box still holds our own doorbell text — the ground truth for
+        # the one window the age-bounded marker cannot see (a turn outliving RING_DEBOUNCE
+        # with the first doorbell still visibly queued). No marker exists here (expired or
+        # never written) — the box alone must still stop a re-send.
+        queued = "banner\n! bash $AF_MAIL read\n"
+        self.assertFalse(self.p.ring_pending("worker").is_file())
+        with mock.patch("af.tmux.has_session", return_value=True), \
+             mock.patch("af.tmux.capture_pane", return_value=queued), \
+             mock.patch("af.tmux.send_keys") as sk:
+            self.assertTrue(drive.ring("worker", self.p))
+        sk.assert_not_called()   # nothing retyped — it was already sitting there
+
 
 class WaitTurn(TempFactory):
     """DONE requires BOTH a NEW end_turn in the transcript AND the live timer gone."""
@@ -318,6 +331,30 @@ class Compact(TempFactory):
             self.assertFalse(drive.compact("ghost", p=self.p))
         say.assert_not_called()
 
+    def test_force_mid_turn_lets_a_hard_breach_proceed_while_generating(self):
+        # The slash command queues to the turn boundary like any other input — the
+        # generating-refusal was never a safety requirement for THIS one case. nowait=True:
+        # without it this would fall into wait_idle's real poll loop against a probe mocked
+        # to stay "generating" forever.
+        with mock.patch("af.drive.probemod.probe", return_value=_p("generating", ctx=600000)), \
+             mock.patch("af.drive.say", return_value=True) as say:
+            self.assertTrue(drive.compact("w", nowait=True, p=self.p, force_mid_turn=True))
+        say.assert_called_once()
+
+    def test_force_mid_turn_does_not_touch_the_permission_refusal(self):
+        # A keystroke there answers the prompt, not compacts — real unsafety, unaffected by
+        # force_mid_turn (which only ever skips the generating check).
+        with mock.patch("af.drive.probemod.probe", return_value=_p("permission")), \
+             mock.patch("af.drive.say") as say:
+            self.assertFalse(drive.compact("w", p=self.p, force_mid_turn=True))
+        say.assert_not_called()
+
+    def test_force_mid_turn_does_not_touch_the_limited_refusal(self):
+        with mock.patch("af.drive.probemod.probe", return_value=_p("limited")), \
+             mock.patch("af.drive.say") as say:
+            self.assertFalse(drive.compact("w", p=self.p, force_mid_turn=True))
+        say.assert_not_called()
+
     def test_a_compaction_stamps_the_cooldown_file(self):
         # The stamp, not the size, is what says "this one has been dealt with": the log keeps
         # the OLD size until the compaction turn lands, so without it the next sweep sees a
@@ -327,6 +364,26 @@ class Compact(TempFactory):
             self.assertTrue(drive.compact("w", nowait=True, p=self.p))
         self.assertEqual(say.call_args.args[1], "/compact")
         self.assertTrue(self.p.compacted("w").read_text().isdigit())
+
+
+class MaybeAutocompact(TempFactory):
+    """maybe_autocompact() must pass force_mid_turn=True ONLY for its hard branch — a hard
+    breach must not wait for the agent to go idle on its own; a soft-only breach still defers
+    exactly as before (see compact()'s docstring)."""
+
+    def test_hard_forces_mid_turn(self):
+        with mock.patch("af.drive.ctx", return_value=600000), \
+             mock.patch("af.drive.compact", return_value=True) as compact:
+            d = drive.maybe_autocompact("w", soft=200000, hard=500000, nowait=True, p=self.p)
+        self.assertEqual(d, "hard")
+        compact.assert_called_once_with("w", nowait=True, p=self.p, force_mid_turn=True)
+
+    def test_soft_does_not_force_mid_turn(self):
+        with mock.patch("af.drive.ctx", return_value=300000), \
+             mock.patch("af.drive.compact", return_value=True) as compact:
+            d = drive.maybe_autocompact("w", soft=200000, hard=500000, nowait=True, p=self.p)
+        self.assertEqual(d, "soft")
+        compact.assert_called_once_with("w", nowait=True, p=self.p)
 
 
 class CompactTarget(unittest.TestCase):

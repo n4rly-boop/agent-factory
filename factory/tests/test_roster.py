@@ -9,6 +9,7 @@ is what the running code actually calls.
 
 from __future__ import annotations
 
+import json
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -364,6 +365,135 @@ class TestReconcilePartialProgress(TempFactory):
         self.assertEqual(sq.agents["ok"].live_sid, "stale")
         # "boom" survived the raise (its status fell back to its ALIVE/LIMITED prior).
         self.assertIn("boom", sq.agents)
+
+
+# --- the stable/volatile split: squad.json + state.json -----------------------------
+class TestSchemaSplit(TempFactory):
+    """A fresh team, written by any of the ordinary short-lived mutators (upsert/mark_up/…,
+    all going through `_write` via `edit()`): squad.json ends up schema-stamped and holding
+    ONLY the stable fields; state.json holds the volatile ones."""
+
+    def test_a_fresh_squad_splits_stable_and_volatile_across_two_files(self):
+        roster.upsert(self.p, name="qa", role="qa", parent="orc", model="opus",
+                     delegate="advised", spawn_flags="--x", settings_path="/s.json",
+                     status=roster.ALIVE, live_sid="sid-1", spawned=100,
+                     ctx_tokens=500, unread=2, compacts=1)
+
+        stable = json.loads(self.p.squad_file.read_text(encoding="utf-8"))
+        self.assertEqual(stable.get("schema"), roster.SCHEMA_VERSION)
+        agent_stable = stable["agents"]["qa"]
+        for k in roster.VOLATILE_KEYS:
+            self.assertNotIn(k, agent_stable, f"{k!r} is volatile — must not be in squad.json")
+        for k in roster.STABLE_KEYS:
+            self.assertIn(k, agent_stable)
+        self.assertEqual(agent_stable["role"], "qa")
+
+        volatile = json.loads(self.p.state_file.read_text(encoding="utf-8"))
+        agent_vol = volatile["qa"]
+        for k in roster.VOLATILE_KEYS:
+            self.assertIn(k, agent_vol)
+        self.assertEqual(agent_vol["status"], roster.ALIVE)
+        self.assertEqual(agent_vol["live_sid"], "sid-1")
+        self.assertEqual(agent_vol["ctx_tokens"], 500)
+        self.assertEqual(agent_vol["unread"], 2)
+        self.assertEqual(agent_vol["compacts"], 1)
+
+        # And the round-trip through load() still hands back one whole Station.
+        st = roster.load(self.p).agents["qa"]
+        self.assertEqual(st.role, "qa")
+        self.assertEqual(st.status, roster.ALIVE)
+        self.assertEqual(st.ctx_tokens, 500)
+
+
+class TestOldFormatCompat(TempFactory):
+    """An old, unmigrated squad.json — single file, no "schema" key, volatile fields embedded
+    directly in each station's dict (today's real on-disk format before this change)."""
+
+    def _write_old_format(self, agents: dict) -> None:
+        self.p.specdir.mkdir(parents=True, exist_ok=True)
+        doc = {"slug": self.p.slug, "blueprint": "bp.json", "created": 111, "agents": agents}
+        self.p.squad_file.write_text(json.dumps(doc), encoding="utf-8")
+
+    def test_old_format_reads_back_with_all_fields_intact(self):
+        self._write_old_format({"qa": {
+            "name": "qa", "role": "qa", "parent": "orc", "model": "opus",
+            "delegate": "advised", "spawn_flags": "--x", "settings_path": "/s.json",
+            "live_sid": "sid-1", "status": roster.ALIVE, "spawned": 100,
+            "ctx_tokens": 4000, "unread": 2, "compacts": 3,
+        }})
+        st = roster.load(self.p).agents["qa"]
+        self.assertEqual(st.role, "qa")
+        self.assertEqual(st.status, roster.ALIVE)
+        self.assertEqual(st.live_sid, "sid-1")
+        self.assertEqual(st.ctx_tokens, 4000)
+        self.assertEqual(st.unread, 2)
+        self.assertEqual(st.compacts, 3)
+        # A plain load is read-only: it must not write state.json into existence.
+        self.assertFalse(self.p.state_file.exists())
+
+    def test_patch_volatile_migrates_an_old_format_file_on_first_touch(self):
+        self._write_old_format({"qa": {
+            "name": "qa", "role": "qa", "status": roster.ALIVE, "live_sid": "sid-1",
+            "ctx_tokens": 4000, "unread": 2, "compacts": 3, "spawned": 100,
+        }})
+        roster._patch_volatile(self.p, {"qa": {"ctx_tokens": 9000}})
+
+        self.assertTrue(self.p.state_file.exists())
+        stable = json.loads(self.p.squad_file.read_text(encoding="utf-8"))
+        self.assertEqual(stable.get("schema"), roster.SCHEMA_VERSION)
+        agent_stable = stable["agents"]["qa"]
+        for k in roster.VOLATILE_KEYS:
+            self.assertNotIn(k, agent_stable)
+        self.assertEqual(agent_stable["role"], "qa")            # stable data preserved
+
+        volatile = json.loads(self.p.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(volatile["qa"]["ctx_tokens"], 9000)    # the update applied
+        self.assertEqual(volatile["qa"]["status"], roster.ALIVE)   # migrated baseline preserved
+        self.assertEqual(volatile["qa"]["live_sid"], "sid-1")
+        self.assertEqual(volatile["qa"]["compacts"], 3)
+
+
+class TestPatchVolatile(TempFactory):
+    """_patch_volatile is reconcile()'s own write path — the fix for a stale long-running
+    daemon silently dropping a field it doesn't know about on a full-object round-trip. It
+    must patch ONLY the keys it was told to, never re-serialize the whole station."""
+
+    def test_a_field_the_caller_does_not_mention_survives(self):
+        # Simulates a newer hook writing a field this "stale" call site's `updates` never
+        # mentions. This is THE regression: a Station.to_dict() round-trip here would erase it.
+        roster.upsert(self.p, name="qa", role="qa", status=roster.ALIVE, ctx_tokens=111)
+        state = json.loads(self.p.state_file.read_text(encoding="utf-8"))
+        state["qa"]["some_future_field"] = "written-by-a-newer-hook"
+        self.p.state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        roster._patch_volatile(self.p, {"qa": {"unread": 5}})
+
+        after = json.loads(self.p.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(after["qa"]["some_future_field"], "written-by-a-newer-hook")  # survived
+        self.assertEqual(after["qa"]["unread"], 5)              # the requested update applied
+        self.assertEqual(after["qa"]["ctx_tokens"], 111)        # untouched field also survives
+
+    def test_a_blank_live_sid_in_the_update_does_not_regress_the_stored_one(self):
+        # A reconcile tick computing a transiently-blank live_sid (agent not found alive at
+        # the moment of the pre-lock snapshot) must never blank out a fresher sid a hook wrote
+        # in the meantime.
+        roster.upsert(self.p, name="qa", live_sid="sid-real", status=roster.ALIVE)
+        roster._patch_volatile(self.p, {"qa": {"live_sid": "", "status": roster.DOWN}})
+
+        st = roster.load(self.p).agents["qa"]
+        self.assertEqual(st.live_sid, "sid-real")               # not blanked
+        self.assertEqual(st.status, roster.DOWN)                # other keys in the same call DO apply
+
+    def test_a_real_live_sid_in_the_update_does_advance(self):
+        roster.upsert(self.p, name="qa", live_sid="sid-old", status=roster.ALIVE)
+        roster._patch_volatile(self.p, {"qa": {"live_sid": "sid-new"}})
+        self.assertEqual(roster.load(self.p).agents["qa"].live_sid, "sid-new")
+
+    def test_an_unknown_station_in_updates_is_skipped_not_created(self):
+        # Removed between reconcile's pre-lock snapshot and the lock actually being acquired.
+        roster.upsert(self.p, name="qa", role="qa")
+        roster._patch_volatile(self.p, {"ghost": {"unread": 3}})
+        self.assertNotIn("ghost", roster.load(self.p).agents)
 
 
 if __name__ == "__main__":

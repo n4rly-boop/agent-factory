@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from . import drive
+from . import drive, mailbox
 from .paths import Paths, paths
 from .probe import Probe, probe
 from .nums import intish
@@ -178,17 +178,39 @@ def sweep(skip: str = "", p: Paths | None = None) -> int:
     try:
         for name in p.boxes():
             pr = probe(name, p)
+
+            # MAIL-PING: an idle agent sitting on unread mail may simply have missed its one
+            # doorbell (a popup ate the Enter, whatever) — postmaster's own ring-catch
+            # deliberately does NOT re-ring a STAGNANT unread count (only a growing one), so
+            # nothing else will ever nudge it again. `ring_pending_fresh` skips the tmux
+            # round-trip when a doorbell is already known in flight; ring() itself dedups
+            # against the input box (see drive.ring) so this cannot pile on a spam pattern.
+            if (name not in ("orchestrator", me) and pr.alive and pr.phase != "generating"
+                    and mailbox.unread(name, p) > 0
+                    and not drive.ring_pending_fresh(name, p)):
+                drive.ring(name, p)
+
             reason = skip_reason(
                 name, pr, me=me, skip=skip,
                 last_compacted=_last_compacted(name, p), cooldown=cooldown,
             )
+            soft, hard = drive.spec_thresholds(name, p)
+            if reason == "generating":
+                # A hard-cap breach must reach a busy agent too — `/compact` safely queues to
+                # the turn boundary like any other input (Claude Code docs: slash commands
+                # queue mid-generation except an explicit immediate-run whitelist `/compact`
+                # is not on) — only SOFT keeps deferring to the next tick on a busy agent.
+                # `maybe_autocompact` itself sets `force_mid_turn` only for its `hard` branch,
+                # so calling it here unconditionally is safe: a soft-only breach still no-ops
+                # on a generating agent exactly as before.
+                drive.maybe_autocompact(name, soft, hard, nowait=True, p=p)
+                continue
             if reason == "limited":
                 print(f"[af] '{name}' is out of quota (usage limit) — not compacting; "
                       f"the warden will wake it on reset")
                 continue
             if reason:
                 continue
-            soft, hard = drive.spec_thresholds(name, p)
             # nowait: /compact is keystrokes, and the agent compacts on its own time.
             # Blocking here would put a 300s wait inside every `af post` — per agent.
             drive.maybe_autocompact(name, soft, hard, nowait=True, p=p)

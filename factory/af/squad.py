@@ -138,6 +138,7 @@ class Station:
     hard: str
     peers: str
     brief: str
+    cwd: str = ""   # the blueprint's declared project dir; "" falls back to AF_CWD/getcwd()
 
 
 def plan(bp: str | Path, cwd: str | None = None) -> list[Station]:
@@ -151,7 +152,22 @@ def plan(bp: str | Path, cwd: str | None = None) -> list[Station]:
     doc = load(bp)
     if not isinstance(doc, dict):
         raise SquadSpecError("blueprint is not a mapping")
-    cwd = cwd or os.environ.get("AF_CWD") or os.getcwd()
+    # The blueprint may declare its own project directory — so agents spawn where the squad
+    # actually works, not wherever `af squad up` happened to be invoked from. Optional: a
+    # blueprint without "cwd" behaves exactly as before (env/getcwd fallback).
+    if not cwd:
+        declared = doc.get("cwd")
+        if declared:
+            # Resolved relative to the BLUEPRINT FILE's own directory, NOT the invoking
+            # shell's — a relative "../proj" must name the same project dir every time this
+            # blueprint is used, regardless of which directory `squad up`/`add`/`status`/
+            # `heal` happens to run from today. (Plain os.path.abspath() would resolve it
+            # against the invoking shell instead, silently reintroducing the exact
+            # invocation-dependent behavior this field exists to remove.)
+            cwd = os.path.join(os.path.dirname(os.path.abspath(str(bp))), str(declared))
+        else:
+            cwd = os.environ.get("AF_CWD") or os.getcwd()
+    cwd = os.path.abspath(cwd)
     slug = doc.get("slug") or os.path.basename(cwd)
     # The delegate-wall compares Claude's ALWAYS-ABSOLUTE file_path against this, so a
     # relative "./work" would block every agent from writing its own report — and then tell
@@ -201,7 +217,7 @@ def plan(bp: str | Path, cwd: str | None = None) -> list[Station]:
         peers = ",".join(p for p in allnames if p != nm)
         out.append(Station(slug=str(slug), work=work, name=nm, role=role, parent=parent,
                            model=model, delegate=delegate, caveman=caveman, soft=soft,
-                           hard=hard, peers=peers, brief=brief))
+                           hard=hard, peers=peers, brief=brief, cwd=cwd))
     return out
 
 
@@ -480,10 +496,16 @@ def _resolve_slug(base: str, bp_resolved: str) -> str:
 
 def _effective_paths(bp: str, stations: list[Station]) -> Paths:
     """The Paths the LIVE team uses — base slug resolved to its bumped variant if `up` moved
-    it. Every command past `up` goes through here so they all address the same squad."""
+    it. Every command past `up` goes through here so they all address the same squad — which
+    is also why the blueprint's declared cwd (if any) is applied here rather than only in
+    `cmd_up`: `cmd_add`/`heal` can spawn a station too, and it must land in the same project
+    directory as the rest of the team, not wherever this particular command was invoked from."""
     if not stations:
         return paths()
-    return _p(_resolve_slug(stations[0].slug, str(Path(bp).resolve())))
+    p = _p(_resolve_slug(stations[0].slug, str(Path(bp).resolve())))
+    if stations[0].cwd:
+        p = replace(p, cwd=Path(stations[0].cwd))
+    return p
 
 
 def cmd_plan(bp: str) -> int:
@@ -603,6 +625,8 @@ def cmd_up(bp: str, resume: bool = False) -> int:
               f"team gets its own mailboxes, specs and state.")
         stations = [replace(st, slug=slug) for st in stations]
     p = _p(slug)
+    if stations[0].cwd:
+        p = replace(p, cwd=Path(stations[0].cwd))
     n = skipped = 0
 
     for st in stations:

@@ -9,6 +9,7 @@ into a temp dir.
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -143,6 +144,39 @@ class Plan(TempFactory):
     def test_a_non_mapping_agent_value_is_fatal(self):
         with self.assertRaises(squad.SquadSpecError):
             self.plan({"slug": "s", "agents": {"w": "not a mapping"}})
+
+
+class PlanCwd(TempFactory):
+    """The blueprint may declare its own project directory (`cwd:`), so a squad spawns where
+    it actually works rather than wherever `af squad up` happened to be invoked from. An
+    explicit `cwd=` argument to plan() still wins over everything (cmd_add/heal reuse it to
+    keep every station on one team in the same directory); a blueprint with no "cwd" behaves
+    exactly as before (AF_CWD, then getcwd())."""
+
+    def test_blueprint_cwd_overrides_AF_CWD(self):
+        declared = self.root / "declared-project"
+        declared.mkdir()
+        # AF_CWD is what plan() would fall back to if the blueprint said nothing — TempFactory
+        # already points it at self.root, which must NOT win here.
+        self.assertEqual(os.environ.get("AF_CWD"), str(self.root))
+        bp = _bp(self.root, {"slug": "s", "cwd": str(declared), "agents": {"w": {"role": "worker"}}})
+        st = squad.plan(bp)
+        self.assertEqual(st[0].cwd, str(declared))
+        self.assertEqual(st[0].work, str(declared / "work"))   # "work" resolved relative to it
+
+    def test_an_explicit_cwd_argument_still_wins_over_the_blueprints_own(self):
+        declared = self.root / "declared"
+        declared.mkdir()
+        explicit = self.root / "explicit"
+        explicit.mkdir()
+        bp = _bp(self.root, {"slug": "s", "cwd": str(declared), "agents": {"w": {"role": "worker"}}})
+        st = squad.plan(bp, cwd=str(explicit))
+        self.assertEqual(st[0].cwd, str(explicit))
+
+    def test_no_declared_cwd_falls_back_to_AF_CWD_exactly_as_before(self):
+        bp = _bp(self.root, {"slug": "s", "agents": {"w": {"role": "worker"}}})
+        st = squad.plan(bp)
+        self.assertEqual(st[0].cwd, str(self.root))    # AF_CWD, set by TempFactory
 
 
 class BulkLines(TempFactory):

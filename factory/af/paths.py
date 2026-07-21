@@ -163,12 +163,22 @@ class Paths:
 
     @property
     def squad_file(self) -> Path:
-        """The one mutable source of truth for a team — durable (under the spec home, NOT
-        /tmp, so a purge cannot erase the roster) and flock-guarded. It is the sole record of
-        which blueprint a team came from, when it was created, and who is on it (replacing the
-        scattered sid-/state- files and a separate line.json that used to duplicate the same
-        two facts). See af.roster."""
+        """The STABLE half of the roster — durable (under the spec home, NOT /tmp, so a purge
+        cannot erase it) and flock-guarded. Blueprint, created-at, and per-station config that
+        is set once at spawn and barely ever changes again (role/parent/model/delegate/
+        spawn_flags/settings_path). See af.roster."""
         return self.specdir / "squad.json"
+
+    @property
+    def state_file(self) -> Path:
+        """The VOLATILE half of the roster — same directory and lock as `squad_file`, but
+        touched every reconcile tick by the postmaster daemon (status/live_sid/ctx_tokens/
+        unread/compacts). Split OUT of squad.json on purpose: a long-running daemon holding a
+        stale in-memory Station schema can silently drop a field it doesn't know about on a
+        full-object round-trip — keeping the fast-churning half in its own file, patched by
+        raw dict key rather than re-serialized as a whole object, is what makes that
+        impossible instead of just less likely. See af.roster.reconcile/_patch_volatile."""
+        return self.specdir / "state.json"
 
     @property
     def squad_lock(self) -> Path:

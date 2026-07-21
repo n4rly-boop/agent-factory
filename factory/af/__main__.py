@@ -47,7 +47,7 @@ def cmd_probe(a: argparse.Namespace) -> int:
     print(f"ctx      : {p.ctx if p.ctx is not None else '-'}")
     print(f"endturns : {p.endturns if p.endturns is not None else '-'}")
     print(f"inputbox : {p.inputbox!r}" if p.inputbox is not None else "inputbox : -")
-    print(f"task     : {mailbox.task_state(a.agent)} "
+    print(f"task     : {'background' if p.has_background else 'idle'} "
           f"(flag file says: {mailbox.state_flag(a.agent) or '-'})")
     return 0 if p.alive else 1
 

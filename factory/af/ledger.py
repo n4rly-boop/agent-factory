@@ -79,11 +79,10 @@ def ledger(p: Paths | None = None) -> int:
         if pr.alive:
             alive = "● alive"
             ctx = str(pr.ctx or 0)
-            # task_state() folds the answer out of the mail log itself on every read, so a
-            # dead agent's stale busy flag (nothing reaps it anymore — see af.sweep) cannot
-            # pin this display on "task" forever the way reading the raw flag would.
-            state = ("busy" if pr.phase == "generating"
-                     else ("task" if mailbox.task_state(name, p) == "busy" else "idle"))
+            # has_background reads straight off the agent's OWN transcript tail (an unresolved
+            # Task/Agent dispatch), not a fold of the mail log — "task" now means "this agent
+            # is actually running something in the background", not "someone mailed it once".
+            state = "busy" if pr.phase == "generating" else ("task" if pr.has_background else "idle")
         else:
             alive = "○ down"
             ctx = ""
